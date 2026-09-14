@@ -187,6 +187,18 @@ def _refresh_model_token(isaac: str) -> None:
         )
 
 
+def _real_home() -> Path:
+    """The user's actual home, not the per-run sandbox HOME.
+
+    Remediation text is for a human to paste into their own shell, and inside the
+    outer Seatbelt `Path.home()` resolves to the run-scoped directory, so the
+    printed command pointed at a path that vanishes with the run. The launcher
+    already exports the real one.
+    """
+
+    return Path(os.environ.get("TRIPLE_STAMP_REAL_HOME") or Path.home())
+
+
 def _preflight_cursor(root: Path) -> None:
     wrapper = str(root / ".omnigent/cursor-via-login")
     status = _run([wrapper, "status"], timeout=30)
@@ -211,7 +223,7 @@ def _preflight_cursor(root: Path) -> None:
         raise PreflightError(
             "Cursor",
             detail,
-            f"{Path.home() / '.local/bin/cursor-agent'} login",
+            f"{_real_home() / '.local/bin/cursor-agent'} login",
         )
 
 

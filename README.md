@@ -1,5 +1,18 @@
 # Omnigent triple-stamp
 
+> **Status: reference implementation, not a clone-and-run tool.**
+>
+> This runs inside Databricks and depends on internal infrastructure. Step one
+> of the quick start below resolves `omnigent` from an internal package proxy,
+> the Opus auditor reaches Glean, Jira, Slack, Confluence and SAFE through the
+> internal `dbexec` CLI, and Stage 1 needs a Cursor account entitled to Grok 4.6
+> Extra High. Outside that environment the install will not complete.
+>
+> The design is the point, and it is all readable here: `config.yaml` is the
+> routing contract, `agents/*/config.yaml` are the three worker prompts, and the
+> enforcement lives in `.omnigent/isaac-launcher/triple_stamp_isaac_launcher.py`
+> and `.omnigent/runtime-python/triple_stamp_supervisor_runtime.py`.
+
 Three models look at every request, they have deliberately different reach, and
 only the third one gets to talk to you.
 

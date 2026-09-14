@@ -147,7 +147,14 @@ def main() -> None:
     # starts it until the profile's positive and negative probes have passed.
     shutil.rmtree(runtime_bundle, ignore_errors=True)
     shutil.copytree(root / "agents", runtime_bundle / "agents")
-    shutil.copytree(root / "tools", runtime_bundle / "tools")
+    # `tools/` is optional. It held nothing but stale bytecode for a module that
+    # no longer exists, so a fresh clone does not carry it at all: git cannot
+    # track an empty directory. Copying it unconditionally made every clone fail
+    # with FileNotFoundError before the profile was even built.
+    if (root / "tools").is_dir():
+        shutil.copytree(root / "tools", runtime_bundle / "tools")
+    else:
+        (runtime_bundle / "tools").mkdir(parents=True, exist_ok=True)
     shutil.copy2(root / "config.yaml", runtime_bundle / "config.yaml")
     for config_path in runtime_bundle.glob("**/config.yaml"):
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
