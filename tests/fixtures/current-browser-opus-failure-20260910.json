@@ -1,0 +1,91 @@
+{
+  "captured_at": "2026-09-10T15:05:00-05:00",
+  "screenshot": {
+    "source_name": "Screenshot_2026-09-10_at_3.04.11_PM-1eafee19-9444-40bd-850c-6d6178af5618.png",
+    "sha256": "f6b932339e3e0ea8d2bc974e63ddd5d08bdb1e0ab9ebdd08502618298b8e307e",
+    "pixel_width": 1024,
+    "pixel_height": 874,
+    "visible_error": "PIPELINE_INFRASTRUCTURE_ERROR: opus_auditor/audit-cycle-1 (web-hop-1 continuation) — sub-agent turn failed: inner executor error: Claude Code terminal did not become ready within 30.0s (input prompt never rendered in 181 polls, 0 empty captures). The message was not delivered."
+  },
+  "live_server": {
+    "url": "http://127.0.0.1:6767",
+    "pid": 20337,
+    "parent_pid": 20321,
+    "started_at": "2026-09-10T14:50:28-05:00",
+    "run_dir": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-5gi15eto",
+    "database": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-5gi15eto/state/chat.db"
+  },
+  "sessions": {
+    "parent": "0c030de123c4450285509ec92e651ffa",
+    "cursor_cycle_1": "f7bec57b5a3e409dbc366e7284f567f6",
+    "opus_audit_cycle_1": "a97ba90ad9ac4466aaadc75c92d20fbc",
+    "cursor_web_opus_1_1": "3dfa2d827eb6481da7ae98f62c24106c",
+    "claude_external_session": "2b574e67-c949-42b1-a7ce-17112b82b107",
+    "claude_bridge": "1026abc000dff2becdc9753e04af8109",
+    "claude_transcript": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-5gi15eto/home/.claude/projects/-Users-ryan-cicak-Documents-omnigent/2b574e67-c949-42b1-a7ce-17112b82b107.jsonl"
+  },
+  "first_opus_process": {
+    "logical_title": "audit-cycle-1",
+    "command": "/usr/local/bin/isaac",
+    "terminal": "claude:main",
+    "terminal_id": "terminal_claude_main",
+    "tmux_socket": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-5gi15eto/tmp/omnigent-terminal-y3d35mpv/tmux.sock",
+    "tmux_target": "main",
+    "pane_pid": 50843,
+    "claude_status_pid": 51118,
+    "terminal_args_count": 21,
+    "preflight_argv_count": 19,
+    "preflight_argv_sha256": "48f8f778aaf76647c6aa8057ea64a1adbf51bdb4d2409ed523b7957527ef035e",
+    "model": "system.ai.claude-opus-5[1m]",
+    "effort": "max",
+    "strict_mcp_config": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-5gi15eto/opus-mcp.json",
+    "permission_mode": "dontAsk",
+    "built_in_tools": "",
+    "prompt_rendered_at": "2026-09-10T14:58:28-05:00",
+    "completed_at": "2026-09-10T15:01:42-05:00",
+    "verdict": "NEEDS_WEB",
+    "cost_usd": 0.441193
+  },
+  "mcp_startup": {
+    "health_mode": "concurrent",
+    "health_elapsed_ms": 13137,
+    "glean_elapsed_ms": 13137,
+    "slack_elapsed_ms": 11403,
+    "jira_elapsed_ms": 11312,
+    "all_auth_probes": "ok",
+    "attestation_ttl_seconds": 3600,
+    "attestation_refresh_lead_seconds": 900,
+    "config_sha256": "d8c33949f13fd82af54afe370db6439a3575e3a646fd5463f9c0a382606ce09e",
+    "readiness_startup_ms": 6467,
+    "readiness_prompt_rendered": true,
+    "readiness_draft_submitted": false,
+    "readiness_model_request_sent": false
+  },
+  "failed_continuation": {
+    "logical_title": "audit-cycle-1",
+    "same_child_session_reused": true,
+    "same_terminal_resource_reused": true,
+    "same_claude_external_session_targeted": true,
+    "send_started_at": "2026-09-10T15:02:27-05:00",
+    "timeout_at": "2026-09-10T15:03:00-05:00",
+    "polls": 181,
+    "empty_captures": 0,
+    "message_delivered": false,
+    "new_transcript_user_message_created": false,
+    "native_observations": [
+      "Claude terminal ensure returning existing resource",
+      "input box still occupied (an overlay) after 3.0s; proceeding",
+      "Cooked for 3m 14s · done 3:01 PM",
+      "tmux capture-pane failed: no current target",
+      "required terminal claude exited"
+    ],
+    "root_cause": "sys_session_send selected the prior child because the same (agent,title) tuple was reused. Omnigent returned terminal_claude_main instead of creating a process. The first Claude turn had already completed and its tmux target was exiting; native prompt injection waited on that stale lifecycle, never observed a prompt, and timed out without appending the web-evidence message to the only Claude transcript."
+  },
+  "bounds": {
+    "cycles": 4,
+    "web_hops_per_requester_per_cycle": 2,
+    "budget_usd": 50,
+    "legacy_max_calls_at_capture": 188,
+    "one_failed_fresh_launch_is_terminal": true
+  }
+}

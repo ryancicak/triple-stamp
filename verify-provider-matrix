@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python3"
+fi
+if [ ! -x "$PYTHON" ]; then
+  echo "triple-stamp: Omnigent 0.12 Python runtime is unavailable" >&2
+  exit 127
+fi
+
+cd "$ROOT"
+
+echo "== outside Seatbelt: direct (provider unset) =="
+env -u TRIPLE_STAMP_PROVIDER \
+  "$PYTHON" -I -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+
+echo "== outside Seatbelt: databricks =="
+TRIPLE_STAMP_PROVIDER=databricks \
+  "$PYTHON" -I -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+
+echo "== exact Seatbelt: direct + databricks validators/tests =="
+TRIPLE_STAMP_PROVIDER=databricks TRIPLE_STAMP_PROFILE_MATRIX=1 \
+  "$ROOT/run-with-isaac" --self-test

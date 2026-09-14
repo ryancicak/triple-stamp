@@ -1,0 +1,6 @@
+# Project-local native harness wrapper. Keeping it here makes the bundle's
+# Cursor launch contract explicit; provider-specific Claude and Codex launch
+# behavior is selected by TRIPLE_STAMP_PROVIDER in the outer launcher.
+harness:
+  cursor-native:
+    command: ./.omnigent/cursor-via-login

@@ -1,0 +1,8 @@
+{
+  "agent": "codex_judge",
+  "child_session_id": "0d7d8fb784424902aa97bab16d0ab465",
+  "work_id": "subagent_678d150615b1",
+  "title": "judge-cycle-1",
+  "status": "completed",
+  "output": "{\"verdict\": \"STAMP\", \"needs_web\": false, \"needs_internal\": false, \"gap_materiality\": \"none\", \"limitations\": [], \"citations_that_hold\": [\"https://cursor.com/docs/cli/using\", \"https://cursor.com/docs/cli/headless\", \"https://cursor.com/docs/cli/reference/parameters\"], \"voice_profile_check\": {\"source_path\": \"__VOICE_PROFILE__\", \"sha256\": \"fcc569f619dcecec793ec285f397d307508bfd76e97ea949dd266714dae93c0f\"}, \"shippable_answer\": \"The short answer: `-f` / `--force` is Cursor Agent CLI’s documented approval-bypass flag for unattended command execution.\", \"evidence_appendix\": []}"
+}

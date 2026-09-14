@@ -1,0 +1,191 @@
+{
+  "run_id": "run-00jfpj73",
+  "retained_run_dir": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-00jfpj73",
+  "provider": "databricks",
+  "parent_session_id": "ccea36ebd6ce47f9acc9669af15a7a2b",
+  "claude_sdk_session_id": "ff3b2131-9da1-4af4-95f4-617e241de090",
+  "models": {
+    "supervisor": "system.ai.claude-sonnet-4-6[1m]",
+    "cursor_workhorse": "cursor-grok-4.6-xhigh",
+    "opus_auditor": "system.ai.claude-opus-5[1m]",
+    "codex_judge": "gpt-5.6-sol"
+  },
+  "timeline": [
+    {
+      "title": "cursor-cycle-1",
+      "agent": "cursor_workhorse",
+      "child_session_id": "a6e965ae100a48a691a845836a8fef1f",
+      "dispatched_at": "2026-09-11T04:44:11.298974Z",
+      "collected_at": "2026-09-11T04:53:02Z",
+      "status": "completed",
+      "output_bytes": 12529,
+      "output_sha256": "7cbe59e32f925c540a6534919efa5223ef32638a225fd96605f2eb649e2f7d41"
+    },
+    {
+      "title": "audit-cycle-1",
+      "agent": "opus_auditor",
+      "child_session_id": "63ed9757075d46228b4a402a8278d1b5",
+      "dispatched_at": "2026-09-11T04:53:29.718618Z",
+      "collected_at": "2026-09-11T05:00:04Z",
+      "status": "completed",
+      "verdict": "PASS_WITH_GAPS",
+      "output_bytes": 24623,
+      "output_sha256": "d25defa8708364dfd5eefd5a4797cf197700934647e13e96fab041b99df3e06d"
+    },
+    {
+      "title": "judge-cycle-1",
+      "agent": "codex_judge",
+      "child_session_id": "b490bfe30d024eba9caad7e3b98f890f",
+      "dispatched_at": "2026-09-11T05:01:39.031281Z",
+      "collected_at": "2026-09-11T05:02:23Z",
+      "status": "completed",
+      "verdict": "REWORK",
+      "output_bytes": 1341,
+      "output_sha256": "de665194fa24a6a5c9dbe7a066325c9d05dcac61e38a9aa97a67019da2578be7"
+    },
+    {
+      "title": "cursor-cycle-2",
+      "agent": "cursor_workhorse",
+      "child_session_id": "c47727c9c08c4d749b5f4f0f49b69921",
+      "dispatched_at": "2026-09-11T05:02:47.201956Z",
+      "collected_at": "2026-09-11T05:02:51Z",
+      "status": "premature_stale_collection",
+      "output_bytes": 12529,
+      "output_sha256": "7cbe59e32f925c540a6534919efa5223ef32638a225fd96605f2eb649e2f7d41",
+      "retained_own_transcript_turn_ended": false,
+      "borrowed_completed_turn_id": "948b8435e9599d85f241c02f4d6c4c526ed93ac168ef5ebd1f998252d2063005"
+    },
+    {
+      "title": "audit-cycle-2",
+      "agent": "opus_auditor",
+      "child_session_id": "a0b3bf4d41e84d4d9fd393bc7f7da19b",
+      "dispatched_at": "2026-09-11T05:03:23.052178Z",
+      "collected_at": "2026-09-11T05:10:20Z",
+      "status": "completed",
+      "verdict": "PASS_WITH_GAPS",
+      "output_bytes": 33605,
+      "output_sha256": "28799e4f8d890b439e67d5bdf8f79f31b97e5517536587ce21d909a1b180e22b"
+    },
+    {
+      "title": "judge-cycle-2",
+      "agent": "codex_judge",
+      "child_session_id": "d0bdddb2131646c0ac6b720962fe55eb",
+      "dispatched_at": "2026-09-11T05:11:50.803329Z",
+      "collected_at": "2026-09-11T05:12:27Z",
+      "status": "completed",
+      "verdict": "REWORK",
+      "needs_web": false,
+      "needs_internal": false,
+      "output_bytes": 1324,
+      "output_sha256": "f1706b411793561a7c3f74782a89274b41647583c0275149370230741da44d58"
+    },
+    {
+      "title": "cursor-cycle-3",
+      "agent": "cursor_workhorse",
+      "child_session_id": "25918f70c1174312a51219cc00810ebe",
+      "dispatched_at": "2026-09-11T05:12:49.662867Z",
+      "terminated_at": "2026-09-11T05:14:15.065Z",
+      "status": "active_when_headless_timeout_fired",
+      "collected": false
+    }
+  ],
+  "judge_cycle_2": {
+    "verdict": "REWORK",
+    "why": "The evidence supports AWS and Azure availability, but the Opus audit ledger is structurally noncompliant. All five internal_coverage receipts use `allowed_routes` instead of the required `routes` field, and their values are tool names rather than the permitted `native` or `glean_facet` routes. Protocol forbids STAMP with malformed coverage receipts.",
+    "expected_next_route": {
+      "status": "dispatch",
+      "cycle": 3,
+      "agent": "cursor_workhorse",
+      "title": "cursor-cycle-3"
+    },
+    "corrected_expected_next_route": {
+      "status": "dispatch",
+      "cycle": 2,
+      "agent": "codex_judge",
+      "title": "judge-convergence-2"
+    },
+    "stamp_attestation_should_exist": false
+  },
+  "cursor_receipts": {
+    "startup_models": [
+      "cursor-grok-4.6-xhigh",
+      "cursor-grok-4.6-xhigh",
+      "cursor-grok-4.6-xhigh"
+    ],
+    "conversation_reported_model": "grok-4.6",
+    "cycle_1_turn_ended_success": true,
+    "cycle_2_turn_ended_success": false,
+    "cycle_3_turn_ended_success": false
+  },
+  "opus_observations": [
+    {
+      "title": "audit-cycle-1",
+      "claude_session_id": "97583e93-680a-457e-a187-4710914483a5",
+      "assistant_rows": 47,
+      "effort_values": ["max"],
+      "stop_reasons": {"tool_use": 45, "end_turn": 2},
+      "toolsearch_count": 7,
+      "mcp_counts": {
+        "glean": 9,
+        "jira": 3,
+        "slack": 3,
+        "confluence": 3,
+        "safe": 5
+      },
+      "receipt_statuses": {
+        "glean": "evidence_found",
+        "jira": "evidence_found",
+        "slack": "evidence_found",
+        "confluence": "evidence_found",
+        "safe": "searched_no_hits"
+      },
+      "runtime_appended_observer_status": "not_observed"
+    },
+    {
+      "title": "audit-cycle-2",
+      "claude_session_id": "bcdb7c2e-a7a8-4bca-9195-26b781b40a2d",
+      "assistant_rows": 50,
+      "effort_values": ["max"],
+      "stop_reasons": {"tool_use": 48, "end_turn": 2},
+      "toolsearch_count": 8,
+      "mcp_counts": {
+        "glean": 7,
+        "jira": 4,
+        "slack": 2,
+        "confluence": 3,
+        "safe": 7
+      },
+      "receipt_statuses": {
+        "glean": "evidence_found",
+        "jira": "evidence_found",
+        "slack": "evidence_found",
+        "confluence": "evidence_found",
+        "safe": "evidence_found"
+      },
+      "runtime_appended_observer_status": "not_observed"
+    }
+  ],
+  "codex_verdicts": [
+    {"title": "judge-cycle-1", "verdict": "REWORK"},
+    {"title": "judge-cycle-2", "verdict": "REWORK"}
+  ],
+  "cost_observation": {
+    "live_budget_state_present": false,
+    "provider_reported_usd": 6.19115445,
+    "conservative_unpriced_estimate_usd": 14.2446645,
+    "observed_lower_bound_usd": 20.43581895,
+    "unavailable_sessions": [
+      "cursor_workhorse:cursor-cycle-2",
+      "cursor_workhorse:cursor-cycle-3"
+    ]
+  },
+  "termination": {
+    "omnigent_headless_timeout_seconds": 1800,
+    "timeout_logged_at": "2026-09-11T05:14:15.065Z",
+    "runner_received_signal": "SIGTERM",
+    "runner_exit_code_from_signal": 143,
+    "inner_cli_return_code": 0,
+    "outer_launcher_return_code": 70,
+    "external_signal_attestation_present": false
+  }
+}

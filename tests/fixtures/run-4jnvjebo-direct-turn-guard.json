@@ -1,0 +1,213 @@
+{
+  "run_id": "run-4jnvjebo",
+  "retained_run_dir": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-4jnvjebo",
+  "provider": "direct",
+  "claude_namespace": "databricks_gateway",
+  "models": {
+    "supervisor": "system.ai.claude-sonnet-4-6[1m]",
+    "cursor_workhorse": "cursor-grok-4.6-xhigh",
+    "opus_auditor": "system.ai.claude-opus-5[1m]",
+    "codex_judge": "gpt-5.6-sol"
+  },
+  "timeline": [
+    {
+      "title": "cursor-cycle-1",
+      "agent": "cursor_workhorse",
+      "child_session_id": "9631b8099a0b41549be045833b81303c",
+      "dispatched_at": "2026-09-11T13:59:38.031445Z",
+      "status": "completed",
+      "output_bytes": 13327
+    },
+    {
+      "title": "audit-cycle-1",
+      "agent": "opus_auditor",
+      "child_session_id": "a4bcee37a03848f0881f6dfd2fb86a70",
+      "dispatched_at": "2026-09-11T14:05:56.506832Z",
+      "status": "completed",
+      "verdict": "PASS_WITH_GAPS",
+      "output_bytes": 25939
+    },
+    {
+      "title": "judge-cycle-1",
+      "agent": "codex_judge",
+      "child_session_id": "e2be309dff964dcb984af644395878a0",
+      "dispatched_at": "2026-09-11T14:12:55.945682Z",
+      "status": "completed",
+      "verdict": "REWORK",
+      "output_bytes": 1527
+    },
+    {
+      "title": "cursor-cycle-2",
+      "agent": "cursor_workhorse",
+      "child_session_id": "508fa818587c4671a42df7da018c7656",
+      "dispatched_at": "2026-09-11T14:13:55.498158Z",
+      "status": "completed",
+      "output_bytes": 10589
+    },
+    {
+      "title": "audit-cycle-2",
+      "agent": "opus_auditor",
+      "child_session_id": "2b5832ba24554772ad939dd49f3b9fd3",
+      "dispatched_at": "2026-09-11T14:18:26.046357Z",
+      "status": "completed",
+      "verdict": "PASS_WITH_GAPS",
+      "output_bytes": 26827
+    },
+    {
+      "title": "judge-cycle-2",
+      "agent": "codex_judge",
+      "child_session_id": "a0056a77ffde4857b9e1092a2c9c68fd",
+      "dispatched_at": "2026-09-11T14:25:59.475251Z",
+      "status": "completed",
+      "verdict": "REWORK",
+      "output_bytes": 1432
+    },
+    {
+      "title": "cursor-cycle-3",
+      "agent": "cursor_workhorse",
+      "child_session_id": "ebf30d34fc754fa09e27a45f335094bc",
+      "dispatched_at": "2026-09-11T14:27:03.429568Z",
+      "status": "completed",
+      "output_bytes": 11181
+    },
+    {
+      "title": "audit-cycle-3",
+      "agent": "opus_auditor",
+      "child_session_id": "1ffbbb6bf5444ce9abb6f6407d95778b",
+      "dispatched_at": "2026-09-11T14:33:28.058976Z",
+      "status": "completed",
+      "verdict": "PASS_WITH_GAPS",
+      "output_bytes": 28324
+    },
+    {
+      "title": "judge-cycle-3",
+      "agent": "codex_judge",
+      "child_session_id": "b1fcc1b6fe19484880eed09ef39d5ac7",
+      "dispatched_at": "2026-09-11T14:43:11.724695Z",
+      "status": "completed",
+      "verdict": "NEEDS_WEB",
+      "output_bytes": 2745
+    },
+    {
+      "title": "cursor-web-codex-3-1",
+      "agent": "cursor_workhorse",
+      "child_session_id": "0fd088b113eb4317981cd236e6fd7855",
+      "work_id": "subagent_735efd716919",
+      "external_session_id": "4072e298-fe9b-49b5-916a-490c3fa1086e",
+      "cursor_pid": 5843,
+      "dispatched_at": "2026-09-11T14:44:31.172849Z",
+      "status": "active_when_headless_turn_guard_fired",
+      "collected": false,
+      "completed_turn_id": "",
+      "last_transcript_event": "WebSearch tool_use",
+      "terminal_result_recoverable": false,
+      "partial_tool_evidence_recoverable": true
+    }
+  ],
+  "opus_observations": [
+    {
+      "title": "audit-cycle-1",
+      "claude_session_id": "3f568a3a-5851-4a1a-9e72-7420f2d5ed3e",
+      "assistant_rows": 42,
+      "effort_values": ["max"],
+      "toolsearch_count": 7,
+      "mcp_counts": {
+        "glean": 7,
+        "jira": 6,
+        "slack": 3,
+        "confluence": 3,
+        "safe": 3
+      }
+    },
+    {
+      "title": "audit-cycle-2",
+      "claude_session_id": "14797fd6-941d-480b-b91a-ddc858671816",
+      "assistant_rows": 36,
+      "effort_values": ["max"],
+      "toolsearch_count": 5,
+      "mcp_counts": {
+        "glean": 6,
+        "jira": 4,
+        "slack": 2,
+        "confluence": 4,
+        "safe": 4
+      }
+    },
+    {
+      "title": "audit-cycle-3",
+      "claude_session_id": "0a6fe58e-c065-43c7-bd08-c1decbe578e1",
+      "assistant_rows": 46,
+      "effort_values": ["max"],
+      "toolsearch_count": 10,
+      "mcp_counts": {
+        "glean": 7,
+        "jira": 4,
+        "slack": 2,
+        "confluence": 3,
+        "safe": 4
+      }
+    }
+  ],
+  "headless_guard": {
+    "configured_extra_turn_limit": 30,
+    "guard_logged_at": "2026-09-11T14:50:32.935Z",
+    "seconds_from_inner_cli_start": 3079.194,
+    "supervisor_conversation_items": 71,
+    "supervisor_message_items": 28,
+    "supervisor_tool_calls": 21,
+    "supervisor_tool_results": 21
+  },
+  "deadline_checks": {
+    "omnigent_loop_timeout_seconds": null,
+    "cursor_stage_absolute_limit_seconds": 900.0,
+    "cursor_stage_inactivity_limit_seconds": 300.0,
+    "cursor_stage_elapsed_at_guard_seconds": 361.762,
+    "cursor_stage_inactivity_at_guard_seconds": 10.922,
+    "native_pane_idle_reaper_seconds": 3600.0,
+    "host_lease_present": false,
+    "tmux_session_present": false,
+    "provider_max_duration_observed": false
+  },
+  "authentication": {
+    "managed_api_key_helper": "jq -r '.access_token' ~/.databricks/model-serving-token.json",
+    "api_key_source_receipts": 11,
+    "api_key_helper_invocation_count_logged": false,
+    "model_token_file_mtime": "2026-09-11T12:35:17.973527Z",
+    "model_token_expires_at_raw": "2026-09-12T07:35:17.972062",
+    "seconds_remaining_at_guard_if_raw_is_utc": 60285.037,
+    "seconds_remaining_at_guard_if_raw_is_america_chicago": 78285.037,
+    "model_gateway_401_or_403_count": 0,
+    "refresh_attempted_by_direct_profile": false,
+    "unrelated_cursor_slack_mcp_401_count": 1
+  },
+  "processes": {
+    "outer_launcher_pid": 16653,
+    "inner_cli_pid": 19753,
+    "server_pid": 20004,
+    "runner_pid": 20005,
+    "cursor_pids": [86177, 21856, 47370, 5843],
+    "isaac_process_observed": false,
+    "marked_processes_after_cleanup": 0
+  },
+  "termination": {
+    "inner_cli_return_code": 0,
+    "outer_launcher_return_code": 70,
+    "external_signal_attestation_present": false,
+    "runner_signal": "SIGTERM",
+    "runner_signal_at": "2026-09-11T14:50:33.013Z",
+    "in_flight_cursor_signal": "SIGHUP",
+    "in_flight_cursor_signal_at": "2026-09-11T14:50:38.641Z",
+    "in_flight_cursor_return_code": -1,
+    "other_cursor_return_codes": [143, 143, 143]
+  },
+  "cost_observation": {
+    "provider_reported_usd": 7.35171415,
+    "conservative_unpriced_estimate_usd": 30.459996,
+    "observed_partial_lower_bound_usd": 37.81171015,
+    "remaining_usd": 12.18828985,
+    "max_cost_usd": 50.0,
+    "failure_attestation_calls": 107,
+    "unavailable_sessions": ["cursor_workhorse:cursor-web-codex-3-1"],
+    "budget_caused_termination": false
+  }
+}

@@ -1,0 +1,21 @@
+# Launcher profiles select binaries. Claude model namespaces are resolved
+# independently: explicit TRIPLE_STAMP_*_MODEL, then a profile mapping below,
+# then the detected namespace default.
+namespaces:
+  public_anthropic:
+    supervisor: claude-sonnet-4-6
+    opus_auditor: claude-opus-5
+  databricks_gateway:
+    supervisor: "system.ai.claude-sonnet-4-6[1m]"
+    opus_auditor: "system.ai.claude-opus-5[1m]"
+
+profiles:
+  # Plain launchers may still be externally routed through the Databricks
+  # gateway, so direct intentionally leaves Claude models to detection.
+  direct:
+    codex_judge: gpt-5.6-sol
+  # Preserve the existing Isaac/Databricks launch profile exactly.
+  databricks:
+    supervisor: "system.ai.claude-sonnet-4-6[1m]"
+    opus_auditor: "system.ai.claude-opus-5[1m]"
+    codex_judge: gpt-5.6-sol

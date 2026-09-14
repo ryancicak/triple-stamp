@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+# Native Codex deliberately scrubs custom environment markers before starting
+# its app-server. Prove the inherited kernel sandbox directly instead: the
+# outer profile never grants writes to the top level of /tmp.
+PROBE="/tmp/triple-stamp-codex-seatbelt-probe.$$"
+if (umask 077 && : >"$PROBE") 2>/dev/null; then
+  rm -f "$PROBE"
+  echo "triple-stamp: Codex wrapper is not inside the inherited outer Seatbelt" >&2
+  exit 78
+fi
+
+CODEX_BIN="${TRIPLE_STAMP_CODEX_BIN:-codex}"
+command -v "$CODEX_BIN" >/dev/null 2>&1 || {
+  echo "triple-stamp: codex executable is unavailable" >&2
+  exit 127
+}
+exec "$CODEX_BIN" -c 'model_reasoning_effort="ultra"' "$@"

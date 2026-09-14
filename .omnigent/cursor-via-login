@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+# CURSOR_AUTH_TOKEN is minted from the host login keychain before entering the
+# outer sandbox. --trust prevents the native CLI from trying to persist
+# workspace trust through the read-only isolated HOME.
+if [ "${TRIPLE_STAMP_OUTER_SANDBOX:-0}" != 1 ] ||
+  [ -z "${TRIPLE_STAMP_RUN_ID:-}" ]
+then
+  echo "triple-stamp: Cursor wrapper requires the inherited outer Seatbelt" >&2
+  exit 78
+fi
+if [ -z "${CURSOR_AUTH_TOKEN:-}" ] ||
+  [ -z "${CURSOR_AGENT_BIN:-}" ] ||
+  [ ! -x "$CURSOR_AGENT_BIN" ]
+then
+  echo "triple-stamp: verified Cursor login/executable is unavailable" >&2
+  exit 77
+fi
+PROBE="/tmp/triple-stamp-cursor-seatbelt-probe.$$"
+if (umask 077 && : >"$PROBE") 2>/dev/null; then
+  rm -f "$PROBE"
+  echo "triple-stamp: Cursor wrapper is not inside the inherited outer Seatbelt" >&2
+  exit 78
+fi
+SCRIPT=$0
+if [ -L "$SCRIPT" ]; then
+  LINK=$(/usr/bin/readlink "$SCRIPT")
+  case "$LINK" in
+    /*) SCRIPT=$LINK ;;
+    *) SCRIPT=$(dirname -- "$SCRIPT")/$LINK ;;
+  esac
+fi
+ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")" && pwd)
+PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  echo "triple-stamp: stable Omnigent Python is unavailable to Cursor" >&2
+  exit 127
+fi
+exec "$PYTHON" -I "$ROOT/cursor_via_login.py" "$@"

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Triple-stamp launcher. Run ./triple-stamp with no arguments to start.
+#
+# Voice rendering is off unless TRIPLE_STAMP_VOICE_PROFILE names a readable
+# markdown file, which most people will never set.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python3"
+fi
+if [ ! -x "$PYTHON" ]; then
+  cat >&2 <<'MISSING'
+triple-stamp: the Omnigent 0.12 Python runtime is not installed.
+
+Install it, then run this script again:
+
+  uv tool install omnigent==0.12.0
+
+MISSING
+  exit 127
+fi
+
+# Default to the browser UI. `./triple-stamp` alone is the whole startup for a
+# normal run; every flag below stays available for the cases that need one.
+if [ "$#" -eq 0 ]; then
+  set -- --no-session
+fi
+
+cd "$ROOT"
+exec "$PYTHON" -I "$ROOT/.omnigent/launcher.py" "$@"

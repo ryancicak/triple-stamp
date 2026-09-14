@@ -1,0 +1,125 @@
+{
+  "run_id": "run-7zcykg11",
+  "retained_path": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-7zcykg11",
+  "parent_session_id": "e6c10efced6241fc92f37b585fd046b0",
+  "child_session_id": "4902cf33f25746228c76ab20b9e23f19",
+  "cursor_session_id": "65abc050-6a6a-4395-a9d7-d808e948ff9e",
+  "bridge_id": "42dd4633483305256434064e7b316d42",
+  "timeline": [
+    {
+      "at": "2026-09-09T11:53:25.405-05:00",
+      "event": "cursor_process_started",
+      "pid": 62127
+    },
+    {
+      "at": "2026-09-09T11:53:30.980-05:00",
+      "event": "cursor_worker_server_failed",
+      "pid": 62842,
+      "error": "listen EPERM: operation not permitted /tmp/.cursor/Users-ryan-cicak-Documents-omnigent/worker.sock"
+    },
+    {
+      "at": "2026-09-09T11:53:36.661-05:00",
+      "event": "cursor_paid_turn_started"
+    },
+    {
+      "at": "2026-09-09T11:58:25.386-05:00",
+      "event": "cursor_paid_turn_succeeded",
+      "request_attempt": 0,
+      "tools_used": 23
+    },
+    {
+      "at": "2026-09-09T12:02:45.521-05:00",
+      "event": "second_cursor_turn_end_marker"
+    },
+    {
+      "at": "2026-09-09T12:03:29.670-05:00",
+      "event": "cursor_recovery_inactivity_timeout",
+      "elapsed_seconds": 300.021
+    },
+    {
+      "at": "2026-09-09T12:03:35.252-05:00",
+      "event": "runner_received_parent_sigterm"
+    }
+  ],
+  "path_split": {
+    "runner_home": "run-7zcykg11/home",
+    "cursor_home": "run-7zcykg11/cursor-home",
+    "forwarder_searched": "run-7zcykg11/home/.cursor/chats",
+    "cursor_wrote_transcript_under": "run-7zcykg11/cursor-home/.cursor/projects",
+    "forwarder_present": false,
+    "startup_present": true
+  },
+  "child_conversation": {
+    "created_at_epoch": 1788972804,
+    "updated_at_epoch": 1788972805,
+    "item_count": 1,
+    "only_item_type": "session.resource.created",
+    "assistant_output_chars": 0
+  },
+  "local_cursor_transcript": {
+    "prompt_seen": true,
+    "assistant_final_seen": true,
+    "turn_ended_status": "success",
+    "resource_exhaustion_retry_seen": false,
+    "nal_request_attempt": 0
+  },
+  "cursor_usage": {
+    "model": "gpt-5.6-sol-xhigh",
+    "generation_count": 2,
+    "input_tokens_inclusive": 2689375,
+    "noncache_input_tokens": 74461,
+    "cache_read_tokens": 2614914,
+    "output_tokens": 12072,
+    "provider_reported_usd": 1.5852496
+  },
+  "cursor_configuration": {
+    "home_mode": "0700",
+    "auth_mode": "0600",
+    "auth_keys": [
+      "accessToken",
+      "refreshToken"
+    ],
+    "auth_values_retained": false,
+    "base_model": "gpt-5.6-sol",
+    "effective_alias": "gpt-5.6-sol-xhigh",
+    "context": "1m",
+    "reasoning": "xhigh",
+    "fast": "false",
+    "cross_provider_claude_home_present": false,
+    "cursor_plugin_bytes": 1175552
+  },
+  "resource_evidence": {
+    "rlimit_nofile_soft": 1048575,
+    "rlimit_nproc_soft": 8000,
+    "address_space": "unlimited",
+    "memory_exhaustion_seen": false,
+    "file_descriptor_exhaustion_seen": false
+  },
+  "failure": {
+    "status": "failed",
+    "output_prefix": "CURSOR_WORKER_STALLED",
+    "diagnostic": "cursor bridge=42dd4633483305256434064e7b316d42 forwarder_present=False startup_present=True",
+    "terminal_result": "PIPELINE_INFRASTRUCTURE_ERROR",
+    "never_started": [
+      "audit-cycle-1",
+      "judge-cycle-1"
+    ]
+  },
+  "cleanup_observation_before_manual_fixture_retention": {
+    "launcher_pid_alive": false,
+    "known_child_pids_alive": false,
+    "workspace_lock_exists": false,
+    "workspace_cursor_hooks_exist": false,
+    "outer_tmux_server_alive": false,
+    "stale_outer_tmux_socket_existed": true
+  },
+  "cleanup_verification": {
+    "raw_retained_run_removed": true,
+    "outer_tmux_socket_removed": true,
+    "short_cursor_alias_removed": true,
+    "worker_socket_removed": true,
+    "workspace_lock_absent": true,
+    "workspace_cursor_hooks_absent": true,
+    "related_processes_absent": true
+  }
+}

@@ -1,0 +1,128 @@
+{
+  "run_id": "run-qcani6mk",
+  "retained_path": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-qcani6mk",
+  "timeline": [
+    {
+      "at": "2026-09-09T11:05:21-05:00",
+      "event": "run_directory_created"
+    },
+    {
+      "at": "2026-09-09T11:06:28-05:00",
+      "event": "validator_budget_boundary_wrote_production_terminal_failure",
+      "value_usd": 50.0
+    },
+    {
+      "at": "2026-09-09T11:06:49-05:00",
+      "event": "supervisor_session_started",
+      "session_id": "95e69cec6fa540f4825a2fefde686a9d"
+    },
+    {
+      "at": "2026-09-09T11:07:05-05:00",
+      "event": "cursor_cycle_1_dispatched",
+      "session_id": "5f0751713c3e483f915fbd387f940a54"
+    },
+    {
+      "at": "2026-09-09T11:07:17-05:00",
+      "event": "cursor_initial_resource_exhausted"
+    },
+    {
+      "at": "2026-09-09T11:07:23-05:00",
+      "event": "cursor_automatic_retry"
+    },
+    {
+      "at": "2026-09-09T11:12:40-05:00",
+      "event": "cursor_recovery_inactivity_timeout"
+    },
+    {
+      "at": "2026-09-09T11:12:45-05:00",
+      "event": "supervisor_emitted_cursor_stall"
+    },
+    {
+      "at": "2026-09-09T11:12:47-05:00",
+      "event": "pipeline_child_exited"
+    },
+    {
+      "at": "2026-09-09T11:26:21-05:00",
+      "event": "late_cursor_stop_hook_recorded_usage"
+    }
+  ],
+  "terminal_artifact": {
+    "created_before_supervisor": true,
+    "text": "PIPELINE_INFRASTRUCTURE_ERROR: triple-stamp cumulative reported/conservative cost $50.00 reached the $50.00 hard cap",
+    "attested_cost_usd": 50.0,
+    "stage": "cursor-cycle-1",
+    "cycle": 1
+  },
+  "budget_state_after_real_policy_evaluation": {
+    "cost_usd": 0.1781,
+    "denied": false,
+    "max_cost_usd": 50.0
+  },
+  "database_sessions": [
+    {
+      "id": "95e69cec6fa540f4825a2fefde686a9d",
+      "parent_id": null,
+      "agent": null,
+      "session_usage": {
+        "input_tokens": 14,
+        "output_tokens": 1010,
+        "total_tokens": 1024,
+        "cache_read_input_tokens": 19167,
+        "cache_creation_input_tokens": 18162,
+        "total_cost_usd": 0.0890496,
+        "by_model": {
+          "claude-sonnet-4-6": {
+            "input_tokens": 14,
+            "output_tokens": 1010,
+            "total_tokens": 1024,
+            "cache_read_input_tokens": 19167,
+            "cache_creation_input_tokens": 18162,
+            "total_cost_usd": 0.0890496
+          }
+        }
+      }
+    },
+    {
+      "id": "5f0751713c3e483f915fbd387f940a54",
+      "parent_id": "95e69cec6fa540f4825a2fefde686a9d",
+      "agent": "cursor_workhorse",
+      "session_usage": {}
+    }
+  ],
+  "late_cursor_usage": {
+    "generation_id": "640e8540-f49b-475d-b613-702f31638a33",
+    "model": "gpt-5.6-sol-xhigh",
+    "input_tokens_inclusive": 909695,
+    "output_tokens": 1482,
+    "cache_read_tokens": 605030,
+    "cache_write_tokens": 304656,
+    "noncache_input_tokens": 9,
+    "provider_reported_usd": null,
+    "conservative_estimated_usd": 13.5067875
+  },
+  "context_material": {
+    "cursor_handoff_bytes": 1899,
+    "cursor_input_tokens": 909695,
+    "isolated_home": {
+      "cursor_skill_files": 31,
+      "cursor_skill_bytes": 206298,
+      "codex_skill_files": 133,
+      "codex_skill_bytes": 1558538,
+      "claude_skill_files": 5344,
+      "claude_skill_bytes": 79080405
+    }
+  },
+  "actual_sequence": [
+    "validator-budget-boundary",
+    "supervisor-request",
+    "cursor-cycle-1",
+    "cursor-resource-exhausted",
+    "cursor-retry",
+    "cursor-stall",
+    "supervisor-infrastructure-error"
+  ],
+  "never_started": [
+    "audit-cycle-1",
+    "judge-cycle-1"
+  ]
+}

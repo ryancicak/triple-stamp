@@ -1,0 +1,58 @@
+{
+  "fixture_version": 1,
+  "sanitized": true,
+  "run": "run-u9demmy7",
+  "retained_root": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-u9demmy7",
+  "database_relative_path": "tmp/ap-chat-data-tw771esq/chat.db",
+  "parent_session_id": "f03fa18beaf4449fa7f4a0a6c71fbaeb",
+  "cursor_child_session_id": "054c495724c54842bc6a843fce060412",
+  "cursor_work_id": "subagent_7ecea7c1f0f2",
+  "cursor_result": {
+    "characters": 10401,
+    "inbox_wrapper_bytes": 12696,
+    "title": "cursor-cycle-1"
+  },
+  "denied_dispatches": [
+    {
+      "position": 16,
+      "created_at": 1788975467,
+      "outer_agent": "triple-stamp",
+      "call_id": "toolu_bdrk_01SiRFnc88wJU7HVqE48Trbn"
+    },
+    {
+      "position": 18,
+      "created_at": 1788975467,
+      "outer_agent": "resp_f7d74adc32d048a78a275309",
+      "call_id": "toolu_bdrk_01Qq9saLkCgRFgkVefTzVLHW"
+    }
+  ],
+  "recorded_arguments": {
+    "agent": "opus_auditor",
+    "title": "audit-cycle-1",
+    "args": {
+      "input": "<sanitized: original 11,058-character handoff>"
+    }
+  },
+  "recorded_input": {
+    "characters": 11058,
+    "bytes": 11072,
+    "sha256": "9d83100d8f25af01dc5bd610dd5f8630ad6b1c892983b6fad4aaf126503bcc4e",
+    "cursor_cycle_1_literal_count": 0,
+    "canonical_inbox_wrapper_prefix": false,
+    "two_dispatch_inputs_were_identical": true
+  },
+  "observed_denial": "handoff must contain cursor-cycle-1 exactly once; use its canonical packet without summaries or duplicates",
+  "policy_probe_call": {
+    "type": "tool_call",
+    "data": {
+      "name": "sys_session_send",
+      "arguments": {
+        "agent": "opus_auditor",
+        "title": "audit-cycle-1",
+        "args": {
+          "input": "Sanitized run-u9 handoff. cursor-cycle-1 appears in provenance and cursor-cycle-1 appears again in evidence."
+        }
+      }
+    }
+  }
+}

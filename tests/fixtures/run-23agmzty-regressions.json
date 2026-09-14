@@ -1,0 +1,64 @@
+{
+  "run_id": "run-23agmzty",
+  "parent_session_id": "a28a7a43c1df4460ac70dfe497d78def",
+  "opus_cycles": [
+    {
+      "title": "audit-cycle-1",
+      "child_session_id": "d0b5515603db40c68742a00eb40c2c80",
+      "toolsearch_count": 6,
+      "calls": [
+        ["c1-01", "mcp__glean__search"],
+        ["c1-02", "mcp__glean__search"],
+        ["c1-03", "mcp__glean__glean_chat"],
+        ["c1-04", "mcp__glean__get_document_content"],
+        ["c1-05", "mcp__glean__get_document_content"],
+        ["c1-06", "mcp__glean__get_document_content"],
+        ["c1-07", "mcp__confluence__get_confluence_page_content"]
+      ],
+      "expected_by_system": {
+        "glean": 6,
+        "jira": 0,
+        "slack": 0,
+        "confluence": 1,
+        "safe": 0
+      }
+    },
+    {
+      "title": "audit-cycle-2",
+      "child_session_id": "65d2fb8b16aa411e821c86dd53b6f90d",
+      "toolsearch_count": 4,
+      "calls": [
+        ["c2-01", "mcp__glean__search"],
+        ["c2-02", "mcp__glean__get_document_content"],
+        ["c2-03", "mcp__glean__get_document_content"],
+        ["c2-04", "mcp__glean__get_document_content"],
+        ["c2-05", "mcp__confluence__get_confluence_page_content"],
+        ["c2-06", "mcp__glean__search"]
+      ],
+      "expected_by_system": {
+        "glean": 5,
+        "jira": 0,
+        "slack": 0,
+        "confluence": 1,
+        "safe": 0
+      }
+    }
+  ],
+  "false_observation": {
+    "available": false,
+    "count": 0,
+    "tools": []
+  },
+  "false_budget_artifact": {
+    "stage": "cursor-cycle-1",
+    "reported_usd": "Infinity",
+    "session_id": "static-policy-check"
+  },
+  "stale_cursor_cycle": {
+    "cycle_1_child": "d2f7172d7e804eb59ed47aa6719c5bb8",
+    "cycle_2_child": "d7011f8408db4cdcbbca298a4f0a22e2",
+    "cycle_1_cursor_session": "sanitized-cursor-session-cycle-1",
+    "cycle_2_cursor_session": "sanitized-cursor-session-cycle-2",
+    "retained_completed_turn_id": "33e96fb96aadd785acf0eb283411b85ae47b7e4c05da598a9bc0f08043e411da"
+  }
+}

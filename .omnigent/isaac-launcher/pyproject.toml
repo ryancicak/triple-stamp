@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triple-stamp-isaac-launcher"
+version = "0.4.0"
+description = "Project-owned fail-closed Isaac launcher for Omnigent."
+requires-python = ">=3.12,<3.14"
+
+[project.entry-points."omnigent.claude_launcher"]
+isaac = "triple_stamp_isaac_launcher:IsaacClaudeLauncher"
+
+[tool.setuptools]
+py-modules = [
+  "triple_stamp_isaac_launcher",
+  "triple_stamp_opus_mcp",
+  "triple_stamp_runtime_state",
+]

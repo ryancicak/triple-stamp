@@ -1,0 +1,29 @@
+{
+  "alias": "cursor-grok-4.6-xhigh",
+  "model": {
+    "modelId": "grok-4.6",
+    "displayModelId": "grok-4.6",
+    "displayName": "Cursor Grok 4.6 Extra High",
+    "displayNameShort": "Cursor Grok 4.6 Extra High",
+    "aliases": [],
+    "maxMode": false
+  },
+  "selectedModel": {
+    "modelId": "grok-4.6",
+    "parameters": [
+      {"id": "effort", "value": "xhigh"},
+      {"id": "fast", "value": "false"}
+    ]
+  },
+  "modelParameters": {
+    "grok-4.6": [
+      {"id": "effort", "value": "xhigh"},
+      {"id": "fast", "value": "false"}
+    ]
+  },
+  "context": {
+    "parameter_reported": false,
+    "numeric_size_reported": false,
+    "note": "Cursor persisted no context parameter; this is not a 1M selection."
+  }
+}

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Compatibility shim. `./triple-stamp` is the current entry point; this name is
+# kept so existing muscle memory, scripts, and docs keep working.
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$ROOT/triple-stamp" "$@"

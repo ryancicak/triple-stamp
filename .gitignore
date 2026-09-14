@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local agent tooling state
+.cursor/
+.claude/
+
+# Container and VM state. Colima keeps multi-gigabyte disk images here, and a
+# single cache blob under Library/ is over 300 MB.
+.colima/
+Library/
+
+# Local credential and lock artifacts. Never commit these.
+*.lock
+!package-lock.json
+databricks-cli-oauth-port.lock
+auth_tokens.json
+.install.lock
+
+# Voice profiles are personal by definition. The checked-in example under
+# tests/fixtures/ is the template; a real one stays out of the repository.
+*voice*profile*.md
+*Voice*Profile*.md
+!tests/fixtures/example-voice-profile.md
+
+# Unrelated local experiment output that happens to live in this directory.
+.lakebase-*/
+lakebase_*.sh
+postgresql-*.log
+
+# Per-run scratch. Runs live under $TMPDIR, but never commit a stray copy.
+run-*/
+omnigent-triple-stamp-*/
+
+# Hackathon presentation material. Not code, and it carries internal research
+# counts and system names that do not belong in a public repository.
+*Presenter Guide*.html
+*.screenstudio/
+omnigent_submit_video*.mp4

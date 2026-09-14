@@ -1,0 +1,26 @@
+{
+  "child_code": 0,
+  "last_collection": {
+    "agent": "cursor_workhorse",
+    "child_session_id": "126bacba47164aaeac8270ec7fc287f1",
+    "status": "completed",
+    "title": "cursor-cycle-3",
+    "work_id": "subagent_4717b731743e"
+  },
+  "cycle_3_cursor_observation": {
+    "assistant_prose_before_turn_ended": true,
+    "active_reasoning_after_prose": true,
+    "resident_process_state": "ready",
+    "turn_ended_success_at_collection": false
+  },
+  "external_signal": {
+    "signal": "SIGTERM",
+    "signal_number": 15,
+    "source": "parent_shell_runner"
+  },
+  "expected_result": "PIPELINE_INFRASTRUCTURE_ERROR: stage cursor-cycle-3, cycle 3; provider-reported unavailable + conservative unpriced estimate unavailable = unavailable; remaining unavailable of unavailable; continuation denied: external SIGTERM interrupted the pipeline before audit-cycle-3 after collecting cursor-cycle-3",
+  "observed_runner_runtime_seconds": 1819.375,
+  "observed_shell_elapsed_seconds": 2012.294,
+  "observed_sigterm_after_shell_start_seconds": 2008.631,
+  "observed_terminal_signal": "SIGTERM"
+}
