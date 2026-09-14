@@ -57,3 +57,7 @@ omnigent-triple-stamp-*/
 *Presenter Guide*.html
 *.screenstudio/
 omnigent_submit_video*.mp4
+
+# Scratch left behind by mtime probes during the test suite. These leaked into
+# the first push because `git add -A` was run without reading the staged list.
+mtime-test-*/
