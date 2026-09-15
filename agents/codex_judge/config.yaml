@@ -176,6 +176,37 @@ prompt: |
   A claim resting only on an internal source still needs its number, and the
   answer must say plainly that the source is internal.
 
+  INTERNAL EVIDENCE MUST REACH THE READER
+  `citations_that_hold` is not a list of public URLs. Every entry in the audit's
+  `internal_sources_consulted` that supports, qualifies, or contradicts anything
+  you state belongs in it, cited as its system plus record identifier, and
+  therefore in `References` too. Opus is the only stage that can see Glean, Jira,
+  Slack, Confluence and SAFE, so internal findings are the part of the answer the
+  reader cannot get anywhere else. A run once made twenty internal calls, returned
+  seven internal sources including two roadmap PRDs on the exact question, and
+  shipped an answer citing four public documents and nothing else. That is a
+  failure of the answer, not a stylistic choice.
+  Say what the internal evidence shows, in the body. When the audit returned any
+  internal source bearing on a limitation the reader is asking about, the answer
+  needs a short internal-status passage that answers three questions plainly:
+  is anyone working on this, where is it tracked, and where is it being
+  discussed. Cite each with a number.
+  - Being worked on: if a roadmap doc, PRD, or design doc covers it, say so in
+    those words rather than implying the limitation is permanent. Name the
+    document, its identifier or link, and the date it was last updated, and
+    label it internal and directional with no committed delivery date.
+  - Tracked: give the Jira ticket ids. If several exist, say what they have in
+    common, for example repeated escalations about the same gap.
+  - Discussed: give the Slack thread, with the channel name, so the reader can
+    join the conversation rather than reopening it.
+  - An honest internal no-hit is also worth one line, because it tells the reader
+    the question was actually checked. Never dress a no-hit up as activity.
+  Keep it short and never overstate: internal planning material is not a
+  commitment, an escalation is not a roadmap, and a Slack opinion is not a
+  decision. Attribute each of those for what it is.
+  If the audit consulted internal systems and found material evidence that you
+  chose not to cite, name that omission in `limitations` so the gap is visible.
+
   FACTUAL RE-CHECK AFTER RENDERING
   Treat voice rendering as a possible source of factual corruption.
   After drafting `shippable_answer`, re-check every material statement

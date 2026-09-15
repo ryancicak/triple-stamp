@@ -510,9 +510,12 @@ def _validate_cli_args(args: list[str]) -> tuple[list[str], bool]:
     if args == ["--help"] or args == ["-h"]:
         print(
             "Usage: ./triple-stamp                       start in the browser\n"
-            "       ./triple-stamp -p 'your question'    answer once on stdout\n"
             "       ./triple-stamp --self-test           check the install\n"
             "       ./triple-stamp --no-session [--debug-events]\n\n"
+            "Ask your question in the browser. There is no one-shot stdout mode:\n"
+            "the runtime that hosts the workers does not forward this run's\n"
+            "Cursor credential to a headless dispatch, so the Cursor stage cannot\n"
+            "start and the pipeline dies in its first cycle after real spend.\n\n"
             "Environment (all optional):\n"
             "  TRIPLE_STAMP_VOICE_PROFILE   markdown file to render the answer\n"
             "                               in a specific voice. Unset means a\n"
@@ -537,16 +540,22 @@ def _validate_cli_args(args: list[str]) -> tuple[list[str], bool]:
             cleaned.append(arg)
             index += 1
             continue
-        if arg in {"-p", "--prompt"}:
-            if index + 1 >= len(args):
-                _die(f"{arg} requires a prompt argument", 64)
-            cleaned.extend((arg, args[index + 1]))
-            index += 2
-            continue
-        if arg.startswith("--prompt="):
-            cleaned.append(arg)
-            index += 1
-            continue
+        # One-shot stdout mode is refused at the front door rather than left to
+        # fail at the first stage. Omnigent's local daemon does not forward this
+        # run's CURSOR_AUTH_TOKEN to a headless dispatch, so the wrapper refuses
+        # the Cursor launch, the pipeline dies in cycle 1, and the user has paid
+        # for a supervisor turn and a Cursor boot to learn nothing. The machinery
+        # behind this flag is intact; re-enable it when the credential reaches
+        # the harness.
+        if arg in {"-p", "--prompt"} or arg.startswith("--prompt="):
+            _die(
+                f"{arg.split('=')[0]} is not supported: this pipeline cannot run "
+                "headless, because the runtime hosting the workers does not "
+                "forward the run's Cursor credential to a headless dispatch and "
+                "the Cursor stage cannot start. Run ./triple-stamp with no "
+                "arguments and ask in the browser.",
+                64,
+            )
         _die(
             f"unsupported argument {arg!r}; this launcher rejects options that could "
             "change the bundle, model, harness, server, auth profile, or isolation",

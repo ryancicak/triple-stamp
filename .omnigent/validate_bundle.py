@@ -589,6 +589,12 @@ def validate_spec(
             # with the URL list living only in a sibling field.
             "NUMBERED REFERENCES IN THE ANSWER",
             "`References` section",
+            # Opus is the only stage with internal reach, so an answer that cites
+            # only public URLs has dropped the pipeline's whole reason to exist.
+            "INTERNAL EVIDENCE MUST REACH THE READER",
+            "not a list of public URLs",
+            # is anyone working on it, where is it tracked, where is it discussed
+            "internal-status passage",
         ):
             if marker not in codex_prompt:
                 fail(f"Codex voice/factual contract is missing {marker!r}")
