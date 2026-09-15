@@ -516,6 +516,32 @@ def _write_startup_preflight(
             pass
 
 
+def _probe_workspace() -> Path:
+    """A neutral, run-scoped cwd for the two non-inference startup probes.
+
+    Cursor blocks its own startup on project MCP initialization, so probing from
+    the real workspace makes prompt-loop readiness depend on whichever
+    `.cursor/mcp.json` happens to be on disk. Two ordinary situations leave one
+    there: a managed file from an earlier run that is still alive or died
+    uncleanly (the launcher only reclaims it after this preflight), and a user's
+    own Cursor MCP servers. Neither has anything to do with what this preflight
+    attests, and either one fails it closed on every later launch until somebody
+    deletes the file by hand. Probe from an empty directory instead. The worker
+    socket is still derived from CURSOR_DATA_DIR, so its isolation is still
+    proved here, and the pipeline session itself keeps the real workspace.
+    """
+
+    raw = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
+    if raw:
+        path = Path(raw).resolve() / "cursor-probe"
+        try:
+            path.mkdir(mode=0o700, exist_ok=True)
+            return path
+        except OSError:
+            pass
+    return Path(tempfile.mkdtemp(prefix="triple-stamp-cursor-probe."))
+
+
 def _file_sizes(root: Path, pattern: str) -> dict[Path, int]:
     result: dict[Path, int] = {}
     for path in root.glob(pattern):
@@ -540,6 +566,7 @@ def _file_deltas(root: Path, pattern: str, baseline: dict[Path, int]) -> str:
 def _run_interactive_startup_probe(
     cursor: str,
     chat_id: str,
+    workspace: Path,
 ) -> tuple[bool, str, int, int | None, dict[str, object]]:
     """Start the exact interactive TUI without submitting a paid prompt."""
 
@@ -562,6 +589,7 @@ def _run_interactive_startup_probe(
                 EXPECTED_ALIAS,
             ],
             env=env,
+            cwd=str(workspace),
             start_new_session=True,
             stdin=slave,
             stdout=slave,
@@ -655,6 +683,7 @@ def _run_interactive_startup_probe(
                 else ""
             ),
             "paid_request_seen": "cli.request.create" in debug_delta,
+            "probe_workspace": str(workspace),
         }
         return ok, diagnostic, process.pid, process.poll(), details
     except OSError as exc:
@@ -683,10 +712,12 @@ def _run_interactive_startup_probe(
 def _run_startup_preflight(cursor: str) -> int:
     """Start the real CLI and require its non-inference empty-chat ack."""
 
+    workspace = _probe_workspace()
     try:
         process = subprocess.Popen(
             [cursor, "create-chat"],
             env=_cursor_env(),
+            cwd=str(workspace),
             start_new_session=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -769,7 +800,7 @@ def _run_startup_preflight(cursor: str) -> int:
         )
         return fail(reason, 77)
     interactive_ok, interactive_diagnostic, interactive_pid, interactive_code, details = (
-        _run_interactive_startup_probe(cursor, chat_id)
+        _run_interactive_startup_probe(cursor, chat_id, workspace)
     )
     if not interactive_ok:
         reason = "Cursor interactive startup preflight failed before prompt-loop readiness"

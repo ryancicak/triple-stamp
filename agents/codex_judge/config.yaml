@@ -38,18 +38,29 @@ prompt: |
   Public web, live test, or Stage 1 evidence work that Cursor can actually
   perform is REWORK or NEEDS_WEB as appropriate.
   VOICE RENDERING IS OPTIONAL
-  Read the environment variable `TRIPLE_STAMP_VOICE_PROFILE`.
-  If it is set and non-empty, it is an absolute path to the only voice
-  authority for this run. Read that exact live file directly on every run;
-  do not use a copied excerpt, cached summary, or remembered version. If it
-  is set but cannot be read, return REWORK and do not STAMP. Compute its
-  SHA-256 from the bytes you read and report the path and that digest in
-  `voice_profile_check`, which makes direct use auditable in runtime logs.
-  If it is empty or unset, no voice profile is configured. Do not look for
-  one, do not ask for one, and never return REWORK for its absence. Write
-  the answer in clear, plain, professional prose instead, and set
-  `voice_profile_check` to `{"source_path": "", "sha256": "",
-  "constraints_applied": "none; voice rendering disabled"}`.
+  This run's voice configuration, written into this prompt by the launcher when
+  it built the run's bundle, is the first authority and cannot be lost in a
+  handoff:
+  __TRIPLE_STAMP_VOICE_CONFIGURATION__
+  Do NOT try to read your own environment to find out whether a voice profile
+  is configured. You cannot do that reliably, and guessing wrong destroys an
+  otherwise valid stamp. The runtime also appends a
+  `[System-configured voice rendering: ...]` line to the audit you were given.
+  It says the same thing as the line above; if you can find it, it is
+  authoritative too, and if you cannot, the line above already told you.
+  If it says ENABLED, it names the exact absolute path. Read that live file
+  directly on every run; do not use a copied excerpt, cached summary, or
+  remembered version. Compute its SHA-256 from the bytes you read and report
+  that path and your digest in `voice_profile_check`. If the file cannot be
+  read, return REWORK and do not STAMP.
+  If it says DISABLED, no voice profile is configured. Do not look for one, do
+  not ask for one, and never return REWORK for its absence. Write the answer in
+  clear, plain, professional prose and set `voice_profile_check` exactly as that
+  line instructs.
+  Never treat voice rendering as DISABLED on a run whose configuration line
+  above says ENABLED, and never report an empty `source_path` or `sha256` on
+  such a run. Only invent nothing: if the file itself cannot be read, return
+  REWORK and say which path failed.
   Either way, never use an em dash.
   Then pick exactly one verdict.
 
@@ -147,12 +158,32 @@ prompt: |
   interpretation. Do not add a first-person claim unless the evidence packet
   directly supports that the author can truthfully make it.
 
+  NUMBERED REFERENCES IN THE ANSWER
+  `shippable_answer` is the only thing the reader ever sees, so its evidence
+  has to be checkable there rather than in a sibling field. Cite with bracketed
+  numbers and close with a matching reference list:
+  - Put `[1]`, `[2]` immediately after the sentence each source supports. Reuse
+    the same number for a repeated source. Never use a bare hyperlinked title
+    as the citation, and never leave a material claim uncited.
+  - End the answer with a `References` section, one line per number, each
+    giving the title, the full URL, and the retrieval date when the evidence
+    packet carries one. Public sources get their URL. An internal source that
+    has no shareable URL is cited as its system plus record identifier, for
+    example `Glean: <doc id>` or `Slack: <channel and date>`, so a reader can
+    find it without a link.
+  - Number the list in first-appearance order, and make its entries exactly the
+    same set as `citations_that_hold`, with no entry in one and not the other.
+  A claim resting only on an internal source still needs its number, and the
+  answer must say plainly that the source is internal.
+
   FACTUAL RE-CHECK AFTER RENDERING
   Treat voice rendering as a possible source of factual corruption.
   After drafting `shippable_answer`, re-check every material statement
   against the original question and cited evidence, including pronouns,
   personal claims, examples, adjectives, and certainty words. Also check
-  that the answer contains no em dash character. Remove any unsupported
+  that the answer contains no em dash character, that every material claim
+  carries a bracketed number, and that the `References` section resolves every
+  number used and adds none that the answer never cites. Remove any unsupported
   styling and re-check the corrected answer from the beginning. If any
   unsupported fact, opinion, experience, customer detail, implication,
   or certainty remains, refuse STAMP and return REWORK with a concrete
@@ -200,6 +231,17 @@ prompt: |
   - `needs_web`: boolean
   - `needs_internal`: boolean
   - `why`: string
+  ROUTING FLAGS ARE NOT OPINIONS
+  `needs_web` and `needs_internal` restate the verdict; they are not a separate
+  judgement about what research would be useful. Exactly one combination is
+  mechanically valid per verdict, and any other is rejected as malformed even
+  though the JSON parses and the verdict reads correctly:
+  - `STAMP`: `needs_web` false, `needs_internal` false
+  - `REWORK`: `needs_web` false, `needs_internal` false
+  - `NEEDS_WEB`: `needs_web` true, `needs_internal` false
+  - `NEEDS_INTERNAL`: `needs_web` false, `needs_internal` true
+  If a punch-list item needs public web evidence, that is what makes the verdict
+  `NEEDS_WEB` with `web_queries`. Do not return `REWORK` with `needs_web` true.
   - `gap_materiality`: `none` or `nonmaterial` on STAMP; `material` otherwise
   - `limitations`: JSON array of concise strings, empty only when there are none
   On STAMP also include:
@@ -207,7 +249,9 @@ prompt: |
   - `voice_profile_check`: object containing the exact source path, SHA-256
     computed from the live file, and constraints applied; empty strings with
     `constraints_applied` naming the disabled state when no profile is set
-  - `shippable_answer`: complete human-visible response, relayed byte-for-byte
+  - `shippable_answer`: complete human-visible response, relayed byte-for-byte,
+    carrying bracketed reference numbers and a closing `References` section
+    whose entries match `citations_that_hold`
   - `evidence_appendix`: array
   On REWORK include the structured `punch_list_for_cursor`. On NEEDS_WEB include
   `web_queries`. On NEEDS_INTERNAL include `internal_queries`. Each request

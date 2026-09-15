@@ -66,7 +66,10 @@ class AuthPreflightTests(unittest.TestCase):
         self.assertEqual(raised.exception.stage, "Cursor")
         self.assertEqual(
             raised.exception.remediation,
-            f"{Path.home() / '.local/bin/cursor-agent'} login",
+            # Must match the source the code uses. Path.home() inside the
+            # Seatbelt is the per-run HOME, which is the whole reason
+            # _real_home() exists.
+            f"{preflight._real_home() / '.local/bin/cursor-agent'} login",
         )
 
     def test_direct_preflight_uses_plain_binary_round_trips(self) -> None:

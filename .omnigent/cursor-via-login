@@ -1,28 +1,50 @@
 #!/bin/sh
 set -eu
 
-# CURSOR_AUTH_TOKEN is minted from the host login keychain before entering the
-# outer sandbox. --trust prevents the native CLI from trying to persist
-# workspace trust through the read-only isolated HOME.
-if [ "${TRIPLE_STAMP_OUTER_SANDBOX:-0}" != 1 ] ||
-  [ -z "${TRIPLE_STAMP_RUN_ID:-}" ]
-then
-  echo "triple-stamp: Cursor wrapper requires the inherited outer Seatbelt" >&2
-  exit 78
-fi
-if [ -z "${CURSOR_AUTH_TOKEN:-}" ] ||
-  [ -z "${CURSOR_AGENT_BIN:-}" ] ||
-  [ ! -x "$CURSOR_AGENT_BIN" ]
-then
-  echo "triple-stamp: verified Cursor login/executable is unavailable" >&2
-  exit 77
-fi
-PROBE="/tmp/triple-stamp-cursor-seatbelt-probe.$$"
-if (umask 077 && : >"$PROBE") 2>/dev/null; then
-  rm -f "$PROBE"
-  echo "triple-stamp: Cursor wrapper is not inside the inherited outer Seatbelt" >&2
-  exit 78
-fi
+# Refuse loudly enough to be diagnosable. Callers that only read the exit code
+# cannot tell a wrapper refusal from a missing CLI: omnigent's harness gate
+# probes `cursor-agent --version`, discards stderr, and reports the binary as
+# "missing or outdated" whatever the real reason was. Leave a breadcrumb in the
+# run dir. Reasons are fixed strings, never argv, so no prompt text or
+# credential can reach the log.
+refuse() {
+  echo "triple-stamp: $1" >&2
+  # A refusal caused by missing env cannot log to TRIPLE_STAMP_RUN_DIR, since
+  # that is one of the vars that may be missing; TMPDIR is run-scoped too and
+  # is the only other reliably writable place inside the Seatbelt.
+  for dir in "${TRIPLE_STAMP_RUN_DIR:-}" "${TMPDIR:-}"; do
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      (umask 077 && printf '%s pid=%s %s [asked:%s] [absent:%s]\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$1" "$REQUESTED" "$(absent_env)" \
+        >>"$dir/cursor-wrapper-refusals.log") 2>/dev/null && break
+    fi
+  done
+  exit "$2"
+}
+
+# What the caller asked for, bounded so a prompt can never reach the log: only
+# a leading flag or a known management verb is recorded verbatim.
+case "${1:-}" in
+  "") REQUESTED="none" ;;
+  # A flag can carry a value (--resume=<chat-id>, --token=...), so keep only the
+  # name up to the first '=' and drop the rest.
+  -*) REQUESTED="${1%%=*}/$#" ;;
+  models | mcp | status | whoami | about | create-chat | ls)
+    REQUESTED="$1/$#" ;;
+  *) REQUESTED="opaque/$#" ;;
+esac
+
+# Names only, never values: which required inputs the caller did not provide.
+absent_env() {
+  missing=
+  for name in TRIPLE_STAMP_OUTER_SANDBOX TRIPLE_STAMP_RUN_ID \
+    TRIPLE_STAMP_RUN_DIR CURSOR_AUTH_TOKEN CURSOR_AGENT_BIN HOME TMPDIR; do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] || missing="$missing $name"
+  done
+  [ -n "$missing" ] && printf '%s' "${missing# }" || printf 'none'
+}
+
 SCRIPT=$0
 if [ -L "$SCRIPT" ]; then
   LINK=$(/usr/bin/readlink "$SCRIPT")
@@ -32,9 +54,92 @@ if [ -L "$SCRIPT" ]; then
   esac
 fi
 ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")" && pwd)
+SELF="$ROOT/cursor-via-login"
+
+# `--version` is answered without the sandbox on purpose. It starts no session,
+# spends nothing, and discloses only the installed build string. Omnigent's
+# harness gate probes it before dispatch with a scrubbed environment, and the
+# run PATH puts this wrapper ahead of the real CLI under the same name, so
+# refusing here makes the gate report `cursor-agent` as "missing or outdated"
+# and kills the pipeline at cycle 0 with a wrong diagnosis. Every other
+# argument, including the auth-revealing `status`/`whoami`/`models` queries,
+# still requires the full isolated environment below.
+case "${1:-}" in
+  --version | -v)
+    # Guard re-entry BEFORE any exec. $CURSOR_AGENT_BIN is often resolved by the
+    # caller from PATH, where this wrapper shadows the real CLI under the same
+    # name, so that branch is the one most likely to point back here.
+    if [ -n "${TRIPLE_STAMP_CURSOR_VERSION_PROBE:-}" ]; then
+      refuse "version query re-entered the Cursor wrapper" 127
+    fi
+    export TRIPLE_STAMP_CURSOR_VERSION_PROBE=1
+    # Strip runner-only state before handing control to the third-party CLI.
+    # Answering in the shell skips _cursor_env() in cursor_via_login.py, which is
+    # what normally scrubs these, and OMNIGENT_REMOTE_AUTH_TOKEN is a bearer
+    # token that must never reach cursor-agent. Keep in step with
+    # _RUNNER_ONLY_ENV there.
+    unset OMNIGENT_CLAUDE_LAUNCHER OMNIGENT_CODEX_PATH OMNIGENT_REMOTE_AUTH_TOKEN
+    unset OMNIGENT_RUNNER_ENV_PASSTHROUGH ISAAC_BIN ISAAC_DEFAULT_UCODE
+    unset ISAAC_DISABLE_MAC_MANAGED_SETTINGS_UPDATE ISAAC_LAUNCH_MODE
+    unset ISAAC_OMNIGENT_BIN ISAAC_OMNI_PY TRIPLE_STAMP_CODEX_BIN
+    unset TRIPLE_STAMP_CODEX_MODEL TRIPLE_STAMP_OPUS_MODEL TRIPLE_STAMP_PROVIDER
+    unset TRIPLE_STAMP_SUPERVISOR_MODEL
+    if [ -n "${CURSOR_AGENT_BIN:-}" ] && [ -x "${CURSOR_AGENT_BIN}" ]; then
+      exec "$CURSOR_AGENT_BIN" --version
+    fi
+    # The launcher stages this dotted sibling beside its shadow entry so the
+    # real CLI stays reachable for a version query without being reachable by
+    # name. The sandbox PATH carries no other cursor-agent.
+    if [ -n "${HOME:-}" ] && [ -x "$HOME/.local/bin/.cursor-agent-real" ]; then
+      exec "$HOME/.local/bin/.cursor-agent-real" --version
+    fi
+    OLD_IFS=$IFS
+    IFS=:
+    set -f
+    set -- $PATH
+    set +f
+    IFS=$OLD_IFS
+    for dir in "$@"; do
+      CANDIDATE="$dir/cursor-agent"
+      [ -n "$dir" ] && [ -x "$CANDIDATE" ] || continue
+      # Compare inode identity, not path strings: a hard link, a multi-hop
+      # symlink chain, or a relative target with ./ or ../ all spell this same
+      # file differently, and every one of those would make the wrapper exec
+      # itself and exit 127 -- read by the harness gate as "CLI missing", the
+      # exact wrong diagnosis this branch exists to prevent.
+      if [ ! "$CANDIDATE" -ef "$SELF" ]; then
+        exec "$CANDIDATE" --version
+      fi
+      # Skipping our own shadow: the real CLI may be staged beside it.
+      if [ -x "$dir/.cursor-agent-real" ]; then
+        exec "$dir/.cursor-agent-real" --version
+      fi
+    done
+    refuse "no real cursor-agent CLI is reachable for a version query" 127
+    ;;
+esac
+
+# CURSOR_AUTH_TOKEN is minted from the host login keychain before entering the
+# outer sandbox. --trust prevents the native CLI from trying to persist
+# workspace trust through the read-only isolated HOME.
+if [ "${TRIPLE_STAMP_OUTER_SANDBOX:-0}" != 1 ] ||
+  [ -z "${TRIPLE_STAMP_RUN_ID:-}" ]
+then
+  refuse "Cursor wrapper requires the inherited outer Seatbelt" 78
+fi
+if [ -z "${CURSOR_AUTH_TOKEN:-}" ] ||
+  [ -z "${CURSOR_AGENT_BIN:-}" ] ||
+  [ ! -x "$CURSOR_AGENT_BIN" ]
+then
+  refuse "verified Cursor login/executable is unavailable" 77
+fi
+PROBE="/tmp/triple-stamp-cursor-seatbelt-probe.$$"
+if (umask 077 && : >"$PROBE") 2>/dev/null; then
+  rm -f "$PROBE"
+  refuse "Cursor wrapper is not inside the inherited outer Seatbelt" 78
+fi
 PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python"
 if [ ! -x "$PYTHON" ]; then
-  echo "triple-stamp: stable Omnigent Python is unavailable to Cursor" >&2
-  exit 127
+  refuse "stable Omnigent Python is unavailable to Cursor" 127
 fi
 exec "$PYTHON" -I "$ROOT/cursor_via_login.py" "$@"

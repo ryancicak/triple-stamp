@@ -633,8 +633,11 @@ class OrchestrationContractTests(unittest.TestCase):
         # Installed Codex documents --add-dir as an additional writable root,
         # so the voice profile must instead remain a read-only outer grant.
         self.assertNotIn("--add-dir", wrapper)
-        self.assertIn("TRIPLE_STAMP_VOICE_PROFILE", codex["prompt"])
-        self.assertIn("no voice profile is configured", codex["prompt"])
+        # Codex must be told the voice state, never asked to introspect it.
+        self.assertIn("[System-configured voice rendering:", codex["prompt"])
+        self.assertIn("If it says ENABLED", codex["prompt"])
+        self.assertIn("If it says DISABLED", codex["prompt"])
+        self.assertNotIn("Read the environment variable", codex["prompt"])
         self.assertIn("str(voice_profile)", builder)
         self.assertIn(
             "outer profile grants voice profile writes", builder
@@ -4851,13 +4854,21 @@ print("exact temp boundary: PASS")
         with mock.patch.dict(os.environ, off, clear=False):
             self.assertEqual(plugin._valid_stamp(payload), answer)
 
-        # A stamp claiming a profile that the run never configured is still
-        # rejected, so this is a real branch rather than a blanket bypass.
+        # An unproven receipt no longer discards the answer, because the note
+        # that tells Codex the profile cannot be guaranteed to reach it. The
+        # answer stands and the run reports the receipt as unproven instead.
         lying = {**payload, "voice_profile_check": {"source_path": "/nope"}}
         with mock.patch.dict(
             os.environ, _voice_env("expected"), clear=False
         ):
-            self.assertIsNone(plugin._valid_stamp(lying))
+            self.assertEqual(plugin._valid_stamp(lying), answer)
+            self.assertIn(
+                "did not prove it read the profile",
+                plugin.unproved_voice_receipt(lying),
+            )
+        # With the profile proved, nothing is reported.
+        with mock.patch.dict(os.environ, off, clear=False):
+            self.assertEqual(plugin.unproved_voice_receipt(payload), "")
 
         # The attestation records the disabled mode and the launcher's exit
         # validator agrees with it.

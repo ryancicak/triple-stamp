@@ -11,6 +11,13 @@ from typing import Any
 
 OPUS_MODEL = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5")
 OPUS_MCP_NAMES = ("glean", "slack", "confluence", "jira", "safe")
+# The exact prefix the judge prompt is told to look for. The runtime emits it and
+# validate_bundle asserts both halves against this one constant, because the two
+# drifting apart is not a hypothetical: rewording the runtime line to
+# "voice rendering." while the prompt still said "voice rendering:" made Codex
+# miss the marker, report voice as disabled on a voice-enabled run, and lose a
+# complete STAMP to a format repair that could not fix it.
+VOICE_NOTE_PREFIX = "[System-configured voice rendering:"
 OPUS_STARTUP_ENV = {
     # Claude Code 2.1.263 documents these controls. They disable background
     # updates, non-essential traffic, and telemetry without changing model or
@@ -19,6 +26,22 @@ OPUS_STARTUP_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "DISABLE_TELEMETRY": "1",
     "DBEXEC_NO_CERT_REFRESH": "1",
+    # MCP schemas are deferred behind ToolSearch, which the audit prompt depends
+    # on to discover the exact read tool per family. On this host the flag lives
+    # only in Claude's managed settings, and the Opus launch excludes those with
+    # `--setting-sources ""`, so it has to be supplied here or Opus starts with
+    # no way to reach any internal system.
+    "ENABLE_TOOL_SEARCH": "true",
+    # Same reason, and the other half of the same bug. These five servers are
+    # `dbexec` shims that unpack a pex runtime on first use, which takes far
+    # longer than Claude's default 30s connect budget; a cold run then reports
+    # every family as `MCP error -32000: Connection closed`, ToolSearch answers
+    # "no matching deferred tools", and the audit records zero internal coverage
+    # while a warm run on the same code reaches all five. Managed settings carry
+    # a 420000ms tool timeout that `--setting-sources ""` discards, and there is
+    # no managed value at all for the connect budget, so both are set here.
+    "MCP_TIMEOUT": "120000",
+    "MCP_TOOL_TIMEOUT": "420000",
 }
 if os.environ.get("TRIPLE_STAMP_PROVIDER", "direct") == "databricks":
     OPUS_STARTUP_ENV.update(
@@ -29,14 +52,28 @@ if os.environ.get("TRIPLE_STAMP_PROVIDER", "direct") == "databricks":
         }
     )
 
-# `dontAsk` denies anything not pre-approved. ToolSearch is required for deferred
-# schemas, and managed settings omit these three read-only research tools. Writes
-# stay blocked by WRITE_TOOLS_DENIED because deny beats allow.
+# `dontAsk` denies anything not pre-approved, and the Opus launch passes
+# `--setting-sources ""`, so managed settings contribute nothing: not their
+# `permissions.allow` list and not their env. This tuple is therefore the whole
+# allowlist, not a supplement to a host allowlist, and it has to name every read
+# tool the audit protocol in agents/opus_auditor/config.yaml tells Opus to call.
+# Listing only the tools managed settings happened to omit left four of the five
+# families with no callable tool, so every audit reported zero internal coverage
+# and failed mechanical validation. Writes stay blocked by WRITE_TOOLS_DENIED
+# because deny beats allow. Keep this in step with that config's selector list.
 READ_ONLY_ALLOWED_TOOLS = (
     "ToolSearch",
-    "mcp__glean__glean_chat",
     "mcp__confluence__get_confluence_page_comments",
+    "mcp__confluence__get_confluence_page_content",
     "mcp__confluence__list_confluence_page_versions",
+    "mcp__confluence__search_confluence_pages",
+    "mcp__glean__get_document_content",
+    "mcp__glean__glean_chat",
+    "mcp__glean__search",
+    "mcp__jira__jira_read_api_call",
+    "mcp__safe__safe_read_api_call",
+    "mcp__slack__slack_batch_read_api_call",
+    "mcp__slack__slack_read_api_call",
 )
 
 WRITE_TOOLS_DENIED = (

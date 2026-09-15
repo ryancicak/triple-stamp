@@ -339,12 +339,95 @@ class CursorStartupTests(unittest.TestCase):
                 cursor._run_interactive_startup_probe(
                     "/verified/cursor-agent",
                     "01234567-89ab-cdef-0123-456789abcdef",
+                    Path(value),
                 )
             )
         self.assertFalse(ok)
         self.assertIn("worker.sock", diagnostic)
         self.assertFalse(details["worker_socket_isolated"])
         self.assertTrue(process.terminated)
+
+    def test_startup_probes_ignore_project_cursor_mcp_config(self) -> None:
+        """Readiness must not depend on whatever .cursor/mcp.json is on disk.
+
+        Cursor blocks its startup on project MCP initialization, so probing from
+        the real workspace let a leftover managed config from an unclean run, or
+        a user's own Cursor MCP servers, fail every later preflight closed.
+        """
+
+        with tempfile.TemporaryDirectory() as value:
+            run = Path(value)
+            home = run / "cursor-home"
+            (home / ".cursor").mkdir(parents=True)
+            workspace = run / "workspace"
+            (workspace / ".cursor").mkdir(parents=True)
+            (workspace / ".cursor/mcp.json").write_text(
+                json.dumps({"mcpServers": {"omnigent": {"command": "/stale"}}}),
+                encoding="utf-8",
+            )
+            real_popen = subprocess.Popen
+            spawned: list[object] = []
+            probed: list[Path] = []
+
+            def spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                del args
+                spawned.append(kwargs.get("cwd"))
+                return real_popen(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        "printf '01234567-89ab-cdef-0123-456789abcdef\\n'; sleep 60",
+                    ],
+                    **kwargs,
+                )
+
+            def probe(
+                _cursor: str, _chat_id: str, given: Path
+            ) -> tuple[bool, str, int, int | None, dict[str, object]]:
+                probed.append(given)
+                return (
+                    True,
+                    "",
+                    4343,
+                    None,
+                    {
+                        "interactive_startup_seen": True,
+                        "worker_server_seen": True,
+                        "worker_socket_isolated": True,
+                        "paid_request_seen": False,
+                        "probe_workspace": str(given),
+                    },
+                )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "TRIPLE_STAMP_RUN_DIR": str(run),
+                        "TRIPLE_STAMP_CURSOR_HOME": str(home),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(cursor, "model_config_is_exact", return_value=True),
+                mock.patch.object(cursor.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(
+                    cursor, "_run_interactive_startup_probe", side_effect=probe
+                ),
+                mock.patch.object(os, "getcwd", return_value=str(workspace)),
+            ):
+                result = cursor._run_startup_preflight("/verified/cursor-agent")
+
+            self.assertEqual(result, 0)
+            # Both probes share one neutral, run-scoped workspace.
+            self.assertEqual(len(probed), 1)
+            self.assertEqual(spawned, [str(probed[0])])
+            probe_dir = probed[0]
+            self.assertEqual(probe_dir.parent.resolve(), run.resolve())
+            self.assertTrue(probe_dir.is_dir())
+            self.assertFalse((probe_dir / ".cursor").exists())
+            status = json.loads((run / "cursor-startup-preflight.json").read_text())
+            self.assertEqual(status["state"], "passed")
+            self.assertEqual(status["details"]["probe_workspace"], str(probe_dir))
 
 
 if __name__ == "__main__":

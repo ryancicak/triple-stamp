@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -532,12 +533,44 @@ def validate_spec(
             if marker not in worker_rule:
                 fail(f"Cursor workspace rule is missing {marker!r}")
 
+        from triple_stamp_opus_mcp import VOICE_NOTE_PREFIX
+        from triple_stamp_runtime_state import _voice_configuration_note
+
+        # Assert the runtime's real output, not just the prompt's expectation.
+        # Pinning one side only is what let the emitted line become
+        # "voice rendering." while the prompt still matched "voice rendering:".
+        for label, env in (
+            ("disabled", {"TRIPLE_STAMP_VOICE_PROFILE": "",
+                          "TRIPLE_STAMP_VOICE_PROFILE_SHA256": ""}),
+            ("enabled", {"TRIPLE_STAMP_VOICE_PROFILE": "/tmp/probe-voice.md",
+                         "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "d" * 64}),
+        ):
+            previous = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            try:
+                emitted = _voice_configuration_note().strip()
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+            want = f"{VOICE_NOTE_PREFIX} {label.upper()}."
+            if not emitted.startswith(want):
+                fail(
+                    "runtime voice note does not open with the literal the judge"
+                    f" prompt matches: expected {want!r}, got {emitted[:80]!r}"
+                )
+
         codex_prompt = agents["codex_judge"].instructions
         for marker in (
-            # The prompt must carry BOTH branches so one static prompt serves a
-            # configured profile and voice rendering being off.
-            "TRIPLE_STAMP_VOICE_PROFILE",
-            "no voice profile is configured",
+            # The prompt must NOT tell Codex to read its own environment, and
+            # must carry both branches of the runtime-supplied voice line. The
+            # literal itself comes from VOICE_NOTE_PREFIX and is asserted against
+            # the runtime's real output below, so the two cannot drift.
+            VOICE_NOTE_PREFIX,
+            "If it says ENABLED",
+            "If it says DISABLED",
             "Never use an em dash.",
             "voice_profile_check",
             "SHA-256 from the bytes you read",
@@ -550,6 +583,12 @@ def validate_spec(
             "SUBSTANCE VS FORM",
             "gap_materiality",
             "Never put",
+            # The reader only ever sees `shippable_answer`, so its citations have
+            # to be numbered and resolvable inside it. A run STAMPED with five
+            # real sources that reached the reader as bare hyperlinked titles,
+            # with the URL list living only in a sibling field.
+            "NUMBERED REFERENCES IN THE ANSWER",
+            "`References` section",
         ):
             if marker not in codex_prompt:
                 fail(f"Codex voice/factual contract is missing {marker!r}")
@@ -892,12 +931,43 @@ def validate_launchers(
     )
     expected_read_allow = (
         "ToolSearch",
-        "mcp__glean__glean_chat",
         "mcp__confluence__get_confluence_page_comments",
+        "mcp__confluence__get_confluence_page_content",
         "mcp__confluence__list_confluence_page_versions",
+        "mcp__confluence__search_confluence_pages",
+        "mcp__glean__get_document_content",
+        "mcp__glean__glean_chat",
+        "mcp__glean__search",
+        "mcp__jira__jira_read_api_call",
+        "mcp__safe__safe_read_api_call",
+        "mcp__slack__slack_batch_read_api_call",
+        "mcp__slack__slack_read_api_call",
     )
     if _OPUS_ALLOWED_TOOLS != expected_read_allow:
         fail("Opus read-only pre-approval gaps drifted")
+    # `--setting-sources ""` means managed settings grant Opus nothing, so the
+    # allowlist above is the only thing standing between the audit prompt's
+    # selectors and `dontAsk`. Pinning the literal alone let the two drift apart:
+    # four of the five families had no callable tool, every audit reported zero
+    # internal coverage, and the run died with a format-repair failure that named
+    # nothing about permissions. Derive the requirement from the prompt instead.
+    auditor_prompt = (root / "agents/opus_auditor/config.yaml").read_text(
+        encoding="utf-8"
+    )
+    directed = {
+        name
+        for selector in re.findall(r"select:(mcp__[\w,__]+)", auditor_prompt)
+        for name in selector.split(",")
+        if name.startswith("mcp__")
+    }
+    if not directed:
+        fail("Opus audit prompt declares no internal MCP selectors to pre-approve")
+    missing = sorted(directed - set(_OPUS_ALLOWED_TOOLS))
+    if missing:
+        fail(
+            "Opus audit prompt directs tools that dontAsk will deny: "
+            + ", ".join(missing)
+        )
     if _option_after(auditor_args, "--allowedTools") != ",".join(_OPUS_ALLOWED_TOOLS):
         fail("Opus internal MCP allowlist drifted")
     if _option_after(auditor_args, "--disallowedTools") != ",".join(_OPUS_DENIED_TOOLS):

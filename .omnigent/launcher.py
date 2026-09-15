@@ -71,6 +71,28 @@ def _resolve_voice_profile() -> Path | None:
 
 
 VOICE_PROFILE = _resolve_voice_profile()
+VOICE_CONFIGURATION_PLACEHOLDER = "__TRIPLE_STAMP_VOICE_CONFIGURATION__"
+
+
+def _voice_configuration_clause() -> str:
+    """State this run's voice configuration for the generated judge prompt."""
+
+    profile = _resolve_voice_profile()
+    if profile is None:
+        return (
+            "Voice rendering is DISABLED for this run. No profile is configured."
+            ' Set voice_profile_check to {"source_path": "", "sha256": "",'
+            ' "constraints_applied": "none; voice rendering disabled"} and write'
+            " the answer in clear, plain, professional prose."
+        )
+    digest = hashlib.sha256(profile.read_bytes()).hexdigest()
+    return (
+        "Voice rendering is ENABLED for this run. The profile is exactly"
+        f" {profile} and the launcher computed its SHA-256 as {digest}. Read"
+        " that live file, apply its style, and report that exact path in"
+        " voice_profile_check.source_path together with the SHA-256 you compute"
+        " from the bytes you read."
+    )
 PROVIDER_ENV = "TRIPLE_STAMP_PROVIDER"
 PROVIDERS = frozenset({"direct", "databricks"})
 MODEL_ENV = {
@@ -1126,6 +1148,18 @@ def _seed_isolated_home(root: Path, real_home: Path, isolated_home: Path) -> Non
     (isolated_home / ".local/bin/cursor-agent").symlink_to(
         root / ".omnigent/cursor-via-login"
     )
+    # Shadowing the real CLI under its own name is what keeps every Cursor
+    # session inside the sandbox, but it also means a generic `cursor-agent
+    # --version` probe reaches the wrapper. Omnigent's harness gate runs exactly
+    # that probe with a scrubbed environment before dispatching the worker, and
+    # reads any non-zero exit as "the CLI is missing or outdated", which kills
+    # the pipeline at cycle 0 with a wrong diagnosis. Give the wrapper a dotted
+    # sibling it can answer that one question from: a PATH lookup for
+    # `cursor-agent` can never resolve this name, and the wrapper uses it for
+    # nothing else.
+    (isolated_home / ".local/bin/.cursor-agent-real").symlink_to(
+        real_home / ".local/bin/cursor-agent"
+    )
 
 
 def _seed_cursor_home(run_dir: Path, harness_tmp: Path | None = None) -> Path:
@@ -1228,6 +1262,9 @@ def _runtime_env(
         "DISABLE_AUTOUPDATER",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "DISABLE_TELEMETRY",
+        "ENABLE_TOOL_SEARCH",
+        "MCP_TIMEOUT",
+        "MCP_TOOL_TIMEOUT",
         "AGENT_CLI_CREDENTIAL_STORE",
         "TRIPLE_STAMP_VOICE_PROFILE",
         "TRIPLE_STAMP_VOICE_PROFILE_SHA256",
@@ -1289,6 +1326,17 @@ def _runtime_env(
         "DISABLE_AUTOUPDATER": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_TELEMETRY": "1",
+        # Opus reaches Glean/Slack/Jira/Confluence/SAFE through ToolSearch-deferred
+        # MCP schemas, and its launch passes `--setting-sources ""`, so the flag
+        # cannot come from Claude's managed settings. Must stay in step with
+        # OPUS_STARTUP_ENV, which validate_bundle requires to be present here.
+        "ENABLE_TOOL_SEARCH": "true",
+        # The five internal MCP servers are dbexec shims that unpack a pex
+        # runtime, so a cold start overruns Claude's default connect budget and
+        # every family comes back as "Connection closed". Managed settings cannot
+        # supply these because the Opus launch excludes them.
+        "MCP_TIMEOUT": "120000",
+        "MCP_TOOL_TIMEOUT": "420000",
         "PYTHONWARNINGS": "ignore:resource_tracker:UserWarning",
         "PYTHONPATH": str(root / ".omnigent/runtime-python"),
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -1427,6 +1475,24 @@ def _apply_provider_to_bundle(
         ),
     )
     documents["supervisor"]["prompt"] = supervisor_prompt
+
+    # Per-run facts belong in the generated spec, not in message text a model has
+    # to carry. Codex used to learn its voice configuration only from a runtime
+    # note appended to the Opus packet, which reaches it through the supervisor's
+    # own prose; when that line went missing Codex reported voice as disabled and
+    # a complete stamp was rejected. Neither omnigent example orchestrator relies
+    # on injected metadata surviving a handoff, and the runtime cannot inject at
+    # dispatch either, because the tool-call event it sees is a read-only view of
+    # arguments already serialized. So write it here, where Codex reads it as its
+    # own instructions every turn.
+    judge_prompt = documents["codex_judge"].get("prompt")
+    if not isinstance(judge_prompt, str):
+        _die("runtime codex_judge prompt is not text")
+    if VOICE_CONFIGURATION_PLACEHOLDER not in judge_prompt:
+        _die("runtime codex_judge prompt lost its voice-configuration placeholder")
+    documents["codex_judge"]["prompt"] = judge_prompt.replace(
+        VOICE_CONFIGURATION_PLACEHOLDER, _voice_configuration_clause()
+    )
     try:
         cap_arguments = documents["supervisor"]["guardrails"]["policies"][  # type: ignore[index]
             "cap_calls"
@@ -2780,9 +2846,20 @@ def _retain_runtime_diagnostics(
     models_started: bool,
     keep_runtime: bool,
     return_code: int,
+    preflight_diagnostics: bool = False,
 ) -> bool:
-    """Retain every model-started failure and its terminal attestation."""
+    """Retain every model-started failure and its terminal attestation.
 
+    Also retain a preflight failure that wrote diagnostics. Gating only on
+    `models_started` meant a preflight failure deleted the very evidence that
+    explains it: on 2026-09-14 the Cursor interactive probe failed repeatedly and
+    its `cursor-startup-preflight.json`, which records exactly which of its four
+    readiness checks failed, was destroyed on every attempt. That turned a
+    one-glance diagnosis into reverse-engineering from source.
+    """
+
+    if preflight_diagnostics and return_code != 0:
+        return True
     return models_started and (keep_runtime or return_code != 0)
 
 
@@ -2905,6 +2982,7 @@ def _outer_main(root: Path, args: list[str]) -> int:
             models_started=models_started,
             keep_runtime=keep_runtime,
             return_code=run_return_code,
+            preflight_diagnostics=(run_dir / "cursor-startup-preflight.json").is_file(),
         ):
             _eprint(f"triple-stamp: retained private diagnostics at {run_dir}")
         else:

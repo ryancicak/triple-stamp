@@ -865,6 +865,24 @@ def _valid_judgment(text: object) -> dict[str, Any] | None:
     verdict = payload["verdict"]
     if not _valid_materiality(payload, verdict):
         return None
+    # The verdict is the authority; `needs_web` and `needs_internal` only restate
+    # it. A contradiction is therefore corrected here rather than handed to a
+    # model to fix, which is the same deterministic normalization the
+    # REWORK -> NEEDS_INTERNAL reroute below already performs. Rejecting instead
+    # cost two runs: a judgment reading REWORK with needs_web true was called
+    # malformed, and the single authorized repair never learns the reason -- the
+    # runtime's defect note only reaches it through the supervisor's own prose --
+    # so it re-emitted a byte-identical body and the run died terminal.
+    want_web = verdict == "NEEDS_WEB"
+    want_internal = verdict == "NEEDS_INTERNAL"
+    if (
+        payload["needs_web"] is not want_web
+        or payload["needs_internal"] is not want_internal
+    ):
+        payload = dict(payload)
+        payload["needs_web"] = want_web
+        payload["needs_internal"] = want_internal
+        payload["mechanically_normalized_routing_flags"] = True
     if verdict == "STAMP":
         return payload if _valid_stamp(payload) is not None else None
     field = {
@@ -873,10 +891,6 @@ def _valid_judgment(text: object) -> dict[str, Any] | None:
         "REWORK": "punch_list_for_cursor",
     }[verdict]
     if not isinstance(payload.get(field), list) or not payload[field]:
-        return None
-    if payload["needs_web"] is not (verdict == "NEEDS_WEB"):
-        return None
-    if payload["needs_internal"] is not (verdict == "NEEDS_INTERNAL"):
         return None
     if verdict == "REWORK":
         normalized = _normalized_codex_punch_list(payload)
@@ -1478,17 +1492,42 @@ def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
         return None
     if not isinstance(citations, list) or not citations:
         return None
-    # Voice rendering is optional. When a profile is configured the stamp must
-    # prove Codex read that exact file; when it is not, there is nothing to
-    # prove and requiring a digest would reject every otherwise valid stamp.
-    if expected_path or expected_digest:
-        if (
-            not expected_digest
-            or not _contains_text(check, expected_path)
-            or not _contains_text(check, expected_digest)
-        ):
-            return None
+    # Voice rendering is optional, and an unproven receipt must not destroy a
+    # finished answer. Codex only learns the configured profile from a runtime
+    # note appended to the Opus packet, and nothing guarantees that line survives
+    # the supervisor's handoff into the Codex child: the runtime cannot inject it
+    # at dispatch either, because the tool-call event it sees is a read-only view
+    # of arguments already serialized. Three runs produced a complete STAMP whose
+    # voice_profile_check read "no configured voice profile was identified";
+    # rejecting them yielded no answer at all, and the one authorized repair,
+    # forbidden from making new claims, could only echo the same receipt. So the
+    # answer stands and `voice_rendering_proved` on the attestation carries the
+    # truth. `unproved_voice_receipt` names the same condition for callers that
+    # need to surface it as a limitation.
+    del check, expected_digest, expected_path
     return answer
+
+
+def unproved_voice_receipt(payload: dict[str, Any] | None) -> str:
+    """Return why a stamp's voice receipt is unproven, or "" when it holds."""
+
+    if not isinstance(payload, dict):
+        return ""
+    expected_digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
+    expected_path = _voice_profile_path()
+    if not (expected_path or expected_digest):
+        return ""
+    check = payload.get("voice_profile_check")
+    if (
+        expected_digest
+        and _contains_text(check, expected_path)
+        and _contains_text(check, expected_digest)
+    ):
+        return ""
+    return (
+        "voice rendering was configured for this run but the judgment did not "
+        "prove it read the profile, so the answer may not carry that voice"
+    )
 
 
 def _has_terminal_worker_failure() -> bool:

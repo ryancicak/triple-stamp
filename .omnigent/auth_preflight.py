@@ -204,7 +204,11 @@ def _preflight_cursor(root: Path) -> None:
     status = _run([wrapper, "status"], timeout=30)
     models = _run([wrapper, "models"], timeout=30)
     config = _run([wrapper, "--triple-stamp-config-preflight"], timeout=30)
-    startup = _run([wrapper, "--triple-stamp-startup-preflight"], timeout=30)
+    # The wrapper budgets STARTUP_PREFLIGHT_TIMEOUT_SECONDS twice, once for the
+    # empty-chat ack and once for the prompt-loop probe, so a worst-case failure
+    # needs ~40s to finish and write its own attestation. Give it room: killing
+    # the child first is what turns a diagnosable failure into a bare timeout.
+    startup = _run([wrapper, "--triple-stamp-startup-preflight"], timeout=90)
     if (
         status.returncode
         or models.returncode

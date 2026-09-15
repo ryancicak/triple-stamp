@@ -116,6 +116,74 @@ def _route_snapshot(route: object) -> dict[str, Any]:
     }
 
 
+def _inject_voice_note(arguments: dict[str, object]) -> None:
+    """Put the run's voice configuration into the Codex handoff itself.
+
+    The note is appended to the Opus packet so it can travel onward, but that
+    journey runs through the supervisor's own prose and is not guaranteed. Two
+    runs lost a complete STAMP because Codex reported "the authoritative
+    configuration line could not be located", defaulted to disabled, and
+    `_valid_stamp` then correctly rejected the mismatch. The runtime knows the
+    answer for certain, so it states it where Codex cannot miss it, exactly as
+    it already does on the collected packets.
+    """
+
+    try:
+        from triple_stamp_runtime_state import _voice_configuration_note
+
+        note = _voice_configuration_note()
+    except Exception:
+        return
+    if not note:
+        return
+    payload = arguments.get("args")
+    if isinstance(payload, dict):
+        text = payload.get("input")
+        if isinstance(text, str) and note.strip() not in text:
+            payload["input"] = text + note
+    elif isinstance(payload, str) and note.strip() not in payload:
+        arguments["args"] = payload + note
+
+
+def _repair_defect(title: str) -> str:
+    """Return the exact defect a format repair has to correct, if it is one.
+
+    A repair that is only told "the previous output was malformed" cannot act,
+    and the note the runtime appends to the collected packet reaches the child
+    only through the supervisor's own prose, which is not guaranteed: an
+    inspection of what the Codex child actually received showed neither the
+    defect note nor the voice line present. The continuation prompt is authored
+    by the runtime and delivered straight to the supervisor, so it is the one
+    channel that cannot silently drop the reason.
+    """
+
+    if "format-repair" not in title:
+        return ""
+    try:
+        from triple_stamp_runtime_state import _judgment_defect, read_collections
+
+        agent = "codex_judge" if title.startswith("judge-") else "opus_auditor"
+        packets = [
+            record
+            for record in read_collections()
+            if record.get("agent") == agent
+            and isinstance(record.get("output"), str)
+        ]
+        if not packets:
+            return ""
+        if agent == "codex_judge":
+            return _judgment_defect(str(packets[-1]["output"]))
+        body = str(packets[-1]["output"]).split("\n\n[System")[0].strip()
+        if not body.startswith("{"):
+            return (
+                "the audit was prose rather than one JSON object; the whole "
+                "reply must be the audit object and nothing else"
+            )
+    except Exception:
+        return ""
+    return ""
+
+
 def _continuation_prompt(route: object) -> str:
     """Build one bounded prompt from the durable state-machine route."""
 
@@ -127,13 +195,22 @@ def _continuation_prompt(route: object) -> str:
             if snapshot["resume_child_session_id"]
             else ""
         )
+        defect = _repair_defect(str(snapshot["title"]))
+        correction = (
+            " That title is a format repair. Quote this exact defect to the "
+            f"child verbatim in the handoff, because it is the only reason the "
+            f"previous output was rejected and the child cannot see it "
+            f"otherwise: {defect}"
+            if defect
+            else ""
+        )
         return (
             f"{_CONTINUATION_PREFIX}: The previous supervisor response ended "
             "without executing the durable next route. Continue now by calling "
             f"sys_session_send exactly once for agent {snapshot['agent']!r} with "
             f"title {snapshot['title']!r}.{resume} Use the already collected "
             "packets and the original request in conversation history. Do not "
-            "emit status prose, poll, or answer the user."
+            f"emit status prose, poll, or answer the user.{correction}"
         )
     if status == "success":
         return (
@@ -475,6 +552,8 @@ def install_supervisor_continuation_guard() -> None:
                         arguments = event.args if isinstance(event.args, dict) else {}
                         sent_title = str(arguments.get("title") or "<missing>")
                         sent_titles.append(sent_title)
+                        if str(arguments.get("agent") or "") == "codex_judge":
+                            _inject_voice_note(arguments)
                         # Narrate the stage before its tool row, once per title.
                         # The UI otherwise shows only raw sys_session_send JSON
                         # for runs that take half an hour, because every attempt

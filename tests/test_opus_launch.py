@@ -128,11 +128,31 @@ class OpusLaunchTests(unittest.TestCase):
             mcp.READ_ONLY_ALLOWED_TOOLS,
             (
                 "ToolSearch",
-                "mcp__glean__glean_chat",
                 "mcp__confluence__get_confluence_page_comments",
+                "mcp__confluence__get_confluence_page_content",
                 "mcp__confluence__list_confluence_page_versions",
+                "mcp__confluence__search_confluence_pages",
+                "mcp__glean__get_document_content",
+                "mcp__glean__glean_chat",
+                "mcp__glean__search",
+                "mcp__jira__jira_read_api_call",
+                "mcp__safe__safe_read_api_call",
+                "mcp__slack__slack_batch_read_api_call",
+                "mcp__slack__slack_read_api_call",
             ),
         )
+        # Every family the audit protocol requires must have at least one
+        # callable read tool. `--setting-sources ""` means managed settings grant
+        # nothing, so a family missing here cannot be reached at all and its
+        # audit entry can only ever be unavailable_after_retry.
+        for family in mcp.OPUS_MCP_NAMES:
+            self.assertTrue(
+                any(
+                    tool.startswith(f"mcp__{family}__")
+                    for tool in mcp.READ_ONLY_ALLOWED_TOOLS
+                ),
+                f"{family} has no pre-approved read tool",
+            )
         self.assertFalse(
             set(mcp.READ_ONLY_ALLOWED_TOOLS).intersection(
                 mcp.WRITE_TOOLS_DENIED
