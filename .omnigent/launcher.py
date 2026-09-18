@@ -2422,6 +2422,18 @@ def _validated_best_effort_exit(
             for record in collections
             if record.get("parent_session_id") == attested_parent
         ]
+    try:
+        attempt_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+        collections = [
+            record
+            for record in collections
+            if int(record.get("attempt_generation") or 1)
+            == attempt_generation
+        ]
+    except (TypeError, ValueError):
+        return False
     sources = attestation.get("source_packets")
     if (
         attestation.get("verdict") != "BEST_EFFORT"

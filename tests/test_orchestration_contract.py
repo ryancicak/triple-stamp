@@ -8778,6 +8778,60 @@ print("exact temp boundary: PASS")
                 ),
             )
 
+            best_effort_parent = "same-chat-best-effort-parent"
+            runtime_state.activate_parent_attempt(
+                best_effort_parent,
+                runtime_state.attempt_request_identity("first request"),
+            )
+            best_effort_records = [
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        "bounded customer answer",
+                    ),
+                    "parent_session_id": best_effort_parent,
+                },
+                {
+                    **_route_packet(
+                        "opus_auditor",
+                        "audit-cycle-1",
+                        _audit("PASS_WITH_GAPS"),
+                    ),
+                    "parent_session_id": best_effort_parent,
+                },
+            ]
+            for record in best_effort_records:
+                runtime_state.append_collection(record)
+            self.assertEqual(
+                runtime_state.record_best_effort_answer(
+                    "bounded customer answer",
+                    best_effort_records,
+                    cycle=1,
+                    reason="final cycle exhausted",
+                    parent_session_id=best_effort_parent,
+                ),
+                "bounded customer answer",
+            )
+            best_effort_path = runtime_state._parent_artifact_path(
+                Path(value),
+                "best-effort-answer.bin",
+                best_effort_parent,
+            ).resolve()
+            immutable_best_effort = best_effort_path.read_bytes()
+            runtime_state.activate_parent_attempt(
+                best_effort_parent,
+                runtime_state.attempt_request_identity("second request"),
+            )
+            self.assertEqual(
+                runtime_state.read_best_effort_answer(best_effort_parent),
+                "",
+            )
+            self.assertEqual(
+                best_effort_path.read_bytes(),
+                immutable_best_effort,
+            )
+
     def test_same_chat_reask_invokes_model_before_old_failure_relay(
         self,
     ) -> None:
@@ -8899,6 +8953,74 @@ print("exact temp boundary: PASS")
                     if isinstance(event, TurnComplete)
                 ],
                 [""],
+            )
+
+    def test_request_policy_resets_same_question_before_old_budget_denial(
+        self,
+    ) -> None:
+        parent = "same-chat-policy-parent"
+        question = "repeat this exact question"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(
+                parent,
+                runtime_state.attempt_request_identity(question),
+            )
+            runtime_state.write_budget_state(
+                49.0,
+                50.0,
+                False,
+                reported_usd=49.0,
+                parent_session_id=parent,
+                observed_cost_usd=49.0,
+                observed_reported_usd=49.0,
+            )
+            runtime_state.record_terminal_failure(
+                "PIPELINE_INFRASTRUCTURE_ERROR",
+                "first attempt failed at the budget edge",
+                stage="cursor-cycle-1",
+                cycle=1,
+                parent_session_id=parent,
+            )
+            snapshot = {
+                "available": True,
+                "source": "conversation_store",
+                "total_usd": 51.0,
+                "reported_usd": 51.0,
+                "estimated_unpriced_usd": 0.0,
+                "sessions": [],
+            }
+            with mock.patch.object(
+                plugin,
+                "_stored_cost_snapshot",
+                return_value=snapshot,
+            ):
+                decision = plugin.strict_cost_budget(50.0)(
+                    {
+                        "type": "request",
+                        "data": {
+                            "user_content": question,
+                            "attachments": [],
+                        },
+                        "context": {
+                            "conversation_id": parent,
+                            "root_conversation_id": parent,
+                        },
+                    }
+                )
+
+            self.assertEqual(decision["result"], "ALLOW")
+            self.assertEqual(
+                runtime_state.current_attempt_generation(parent),
+                2,
+            )
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                runtime_state.read_budget_state(parent)["cost_usd"],
+                2.0,
             )
 
     def test_stamp_generation_publish_is_atomic_and_never_rewritten(

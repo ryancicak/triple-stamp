@@ -87,6 +87,8 @@ def _run_dir() -> Path | None:
 
 _ATTEMPTS_DIRECTORY = ".triple-stamp-attempts"
 _ATTEMPT_ARTIFACTS = (
+    "best-effort-answer.bin",
+    "best-effort-attestation.json",
     "budget-state.json",
     "failure-attestation.json",
     "pipeline-terminal",
@@ -97,6 +99,8 @@ _ATTEMPT_ARTIFACTS = (
 )
 _TERMINAL_ARTIFACTS = frozenset(
     {
+        "best-effort-answer.bin",
+        "best-effort-attestation.json",
         "failure-attestation.json",
         "stamp-attestation.json",
         "stamped-answer.bin",
@@ -1950,41 +1954,31 @@ def record_best_effort_answer(
         "quality_approved": False,
         "cycle": max(0, int(cycle)),
         "parent_session_id": parent_session_id,
+        "attempt_generation": current_attempt_generation(parent_session_id),
         "reason": " ".join(str(reason).replace("\x00", " ").split())[:2000],
         "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
         "answer_length": len(answer_bytes),
         "source_packets": source_packets,
     }
 
-    def create_once(path: Path, data: bytes) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
     try:
-        create_once(
-            _parent_artifact_path(
-                run_dir,
-                "best-effort-answer.bin",
-                parent_session_id,
-            ),
-            answer_bytes,
+        published = _publish_terminal_bundle(
+            parent_session_id,
+            {
+                "best-effort-answer.bin": answer_bytes,
+                "best-effort-attestation.json": (
+                    json.dumps(
+                        attestation,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            },
         )
-        create_once(
-            _parent_artifact_path(
-                run_dir,
-                "best-effort-attestation.json",
-                parent_session_id,
-            ),
-            (
-                json.dumps(attestation, sort_keys=True, separators=(",", ":"))
-                + "\n"
-            ).encode("utf-8"),
-        )
-    except FileExistsError:
+    except OSError:
+        return ""
+    if not published:
         return read_best_effort_answer(parent_session_id)
     return clean_answer
 
@@ -1995,25 +1989,33 @@ def read_best_effort_answer(parent_session_id: str = "") -> str:
     run_dir = _run_dir()
     if run_dir is None:
         return ""
+    generation = current_attempt_generation(parent_session_id)
     try:
         attestation = json.loads(
-            _parent_artifact_path(
+            _read_artifact_path(
                 run_dir,
                 "best-effort-attestation.json",
                 parent_session_id,
             ).read_text(encoding="utf-8")
         )
-        answer = _parent_artifact_path(
+        answer = _read_artifact_path(
             run_dir,
             "best-effort-answer.bin",
             parent_session_id,
         ).read_bytes()
     except (OSError, ValueError, json.JSONDecodeError):
         return ""
+    try:
+        attested_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ""
     if (
         not isinstance(attestation, dict)
         or attestation.get("verdict") != "BEST_EFFORT"
         or attestation.get("quality_approved") is not False
+        or attested_generation != generation
         or (
             parent_session_id
             and attestation.get("parent_session_id") != parent_session_id
