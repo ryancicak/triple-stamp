@@ -345,6 +345,10 @@ def _observe_dispatch_bookkeeping(
 ) -> object:
     """Observe a returned native send without changing its outcome."""
 
+    if isinstance(result, str) and result.startswith("Error:"):
+        # This is an explicit tool-level non-launch result, not a malformed
+        # successful handle and not a ledger-observer failure.
+        return result
     native_send_status = "returned"
     try:
         payload = json.loads(result)
@@ -1154,6 +1158,7 @@ def install_parent_inbox_guard() -> None:
         read_collections,
         read_cursor_lifecycle,
         read_dispatches,
+        release_retry_reservation,
         record_terminal_failure,
         record_tool_dispatch_exception,
     )
@@ -1670,6 +1675,27 @@ def install_parent_inbox_guard() -> None:
                     child_session_id=child_id,
                     child_state=child_state,
                     append_collection=append_collection,
+                )
+            if (
+                isinstance(result, str)
+                and result.startswith("Error:")
+                and parent_session_id
+                and parsed is not None
+                and parsed["stage_id"] in {"cursor_retry", "audit_retry"}
+            ):
+                # Omnigent returns Error: text only on paths that did not post
+                # the child turn (including paths that created then tore down a
+                # child). No paid worker launched, so the policy reservation
+                # may be retried. Exceptions and unknown outcomes stay latched.
+                release_retry_reservation(
+                    parent_session_id,
+                    int(parsed["cycle"]),
+                    stage=(
+                        "cursor"
+                        if parsed["stage_id"] == "cursor_retry"
+                        else "opus"
+                    ),
+                    native_send_status="not_launched",
                 )
             if result == _MISSING_PARENT_INBOX and conversation_id:
                 terminal = _parent_inbox_failures.setdefault(

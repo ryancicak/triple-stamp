@@ -31,9 +31,9 @@ _LOGGER = logging.getLogger(__name__)
 _TERMINAL_RELAY_ACTIONS = frozenset(
     {
         "deterministic_best_effort_relay",
-        "deterministic_stamp_relay",
         "judge_format_repair_best_effort_relay",
         "supervisor_failure_terminalized",
+        "terminal_stamp_delivered",
         "terminal_failure_relayed",
         "continuation_exhausted",
     }
@@ -777,6 +777,19 @@ def install_supervisor_continuation_guard() -> None:
                     parent_session_id=session_id,
                 )
                 yield TextChunk(text=attested_answer)
+                # A continuation record written before TextChunk is only relay
+                # intent: a crash at that boundary must replay the durable
+                # answer. Once the generator is resumed after TextChunk, the UI
+                # has consumed the bytes, so this marker may safely suppress
+                # stale wakes. A crash before this marker can duplicate text,
+                # but it cannot lose the answer.
+                _record(
+                    "terminal_stamp_delivered",
+                    route,
+                    attempt=continuation_attempt,
+                    reason="attested STAMP TextChunk was consumed",
+                    parent_session_id=session_id,
+                )
                 yield TurnComplete(
                     response=attested_answer,
                     modified_by_policy=True,
@@ -1120,6 +1133,13 @@ def install_supervisor_continuation_guard() -> None:
                 # parent conversation still held nothing but two ~200-byte
                 # messages, so the answer never reached the reader.
                 yield TextChunk(text=attested)
+                _record(
+                    "terminal_stamp_delivered",
+                    route,
+                    attempt=continuation_attempt,
+                    reason="attested STAMP TextChunk was consumed",
+                    parent_session_id=session_id,
+                )
                 yield TurnComplete(
                     response=attested,
                     modified_by_policy=True,

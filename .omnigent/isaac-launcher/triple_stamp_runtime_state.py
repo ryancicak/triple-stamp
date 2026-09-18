@@ -53,6 +53,10 @@ _TOOL_DISPATCH_EXCEPTIONS = (
 )
 
 
+class AttemptInFlightError(RuntimeError):
+    """A distinct top-level request arrived before its predecessor terminated."""
+
+
 def _validate_dispatch_title_patterns() -> None:
     """Fail at import if a parser row cannot satisfy its group contract."""
 
@@ -271,11 +275,11 @@ def _reserve_stage_retry(
 ) -> bool:
     """Atomically reserve one retry for this attempt, stage, and cycle.
 
-    The reservation is created before native dispatch and is intentionally
-    never released: a timeout or unknown completion may already have launched
-    the child. Generation-local exclusive files make duplicate policy
-    evaluations and concurrent sends converge on one winner without trusting
-    a dispatch observer that runs only after native launch returns.
+    The reservation is created before native dispatch. It remains spent after
+    any launch or unknown completion, and may be released only when the native
+    send returns explicit proof that it did not launch a child. Generation-local
+    exclusive files make duplicate policy evaluations and concurrent sends
+    converge on one winner without trusting a post-launch dispatch observer.
     """
 
     run_dir = _run_dir()
@@ -337,6 +341,60 @@ def _reserve_stage_retry(
             os.fsync(fd)
         finally:
             os.close(fd)
+        reservation_dir_fd = os.open(reservation_dir, os.O_RDONLY)
+        try:
+            os.fsync(reservation_dir_fd)
+        finally:
+            os.close(reservation_dir_fd)
+        return True
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def release_retry_reservation(
+    parent_session_id: str,
+    cycle: int,
+    *,
+    stage: str,
+    native_send_status: str,
+) -> bool:
+    """Release a reservation only after an explicit non-launch result."""
+
+    run_dir = _run_dir()
+    if (
+        run_dir is None
+        or not parent_session_id
+        or isinstance(cycle, bool)
+        or not isinstance(cycle, int)
+        or cycle < 1
+        or cycle > 4
+        or stage not in {"cursor", "opus"}
+        or native_send_status != "not_launched"
+    ):
+        return False
+    root = _attempt_root(run_dir, parent_session_id)
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+        try:
+            generation = max(1, int(state.get("current_generation") or 1))
+        except (TypeError, ValueError):
+            return False
+        reservation_dir = (
+            _attempt_generation_dir(
+                run_dir,
+                parent_session_id,
+                generation,
+            )
+            / "retry-reservations"
+        )
+        reservation = reservation_dir / f"{stage}-cycle-{cycle}.json"
+        try:
+            reservation.unlink()
+        except FileNotFoundError:
+            return False
         reservation_dir_fd = os.open(reservation_dir, os.O_RDONLY)
         try:
             os.fsync(reservation_dir_fd)
@@ -469,6 +527,16 @@ def activate_parent_attempt(
             parent_session_id,
             generation,
         ).joinpath("terminal").is_dir()
+        if (
+            new_request
+            and request_identity
+            and prior_identity
+            and request_identity != prior_identity
+            and not terminal_exists
+        ):
+            raise AttemptInFlightError(
+                "prior attempt still in flight; refusing to merge request identities"
+            )
         changed = bool(
             request_identity
             and prior_identity
@@ -1944,6 +2012,7 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
             _has_required_stage_chain,
             _mapping_candidates,
             _valid_stamp,
+            _valid_voice_profile_check,
         )
 
         stamp = next(
@@ -1966,7 +2035,6 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     check = stamp.get("voice_profile_check") if isinstance(stamp, dict) else None
     answer = stamp.get("shippable_answer") if isinstance(stamp, dict) else None
     expected_profile = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
-    expected_path = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE", "").strip()
     if (
         not isinstance(answer, str)
         or not answer
@@ -1975,11 +2043,7 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     ):
         return False
     # Voice rendering is optional; only demand the receipt when one is expected.
-    if (expected_path or expected_profile) and (
-        not isinstance(check, dict)
-        or check.get("source_path") != expected_path
-        or check.get("sha256") != expected_profile
-    ):
+    if not _valid_voice_profile_check(check):
         return False
     answer_bytes = answer.encode("utf-8")
     evidence_bytes = output.encode("utf-8")

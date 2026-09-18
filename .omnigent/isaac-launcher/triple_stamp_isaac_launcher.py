@@ -23,6 +23,7 @@ from triple_stamp_opus_mcp import (
     prepare_opus_mcp_config,
 )
 from triple_stamp_runtime_state import (
+    AttemptInFlightError,
     activate_parent_attempt,
     append_supervisor_tool_call,
     attempt_request_identity,
@@ -195,27 +196,20 @@ def _has_incomplete_stream_marker(text: object) -> bool:
 def _is_transient_opus_stream_error(record: dict[str, Any]) -> bool:
     """Classify one Opus record as a recoverable, transient stream death.
 
-    A semantically valid completed audit always wins over marker-shaped prose
-    inside its analysis. Otherwise a concrete marker must be present in output
-    or an explicit launch-error field. A failed record without such a marker
-    (for example a native timeout, a model/harness pin break, or empty output)
-    is a genuine worker failure and stays terminal.
+    Completed output is model-authored audit evidence, so marker-shaped prose
+    there is never a transport signal. A completed record retries only from an
+    explicit transport envelope. Non-completed records may carry the transport
+    marker in their partial output or envelope. A failed record without such a
+    marker (for example a native timeout, model/harness pin break, or empty
+    output) is a genuine worker failure and stays terminal.
     """
 
-    output = record.get("output")
-    observation = (
-        record.get("internal_mcp_observation")
-        if isinstance(record.get("internal_mcp_observation"), dict)
-        else None
-    )
-    if (
-        record.get("status") == "completed"
-        and _valid_audit(output, observation) is not None
-    ):
-        return False
+    fields = ("error", "launch_error", "stream_error")
+    if record.get("status") != "completed":
+        fields = ("output", *fields)
     return any(
         _has_incomplete_stream_marker(record.get(field))
-        for field in ("output", "error", "launch_error", "stream_error")
+        for field in fields
     )
 
 
@@ -1802,6 +1796,25 @@ def _contains_text(value: object, needle: str) -> bool:
     return False
 
 
+def _valid_voice_profile_check(check: object) -> bool:
+    """Validate the exact configured-profile load receipt.
+
+    The digest proves which profile bytes Codex reports loading; it does not
+    prove that the resulting answer follows every style constraint.
+    """
+
+    expected_path = _voice_profile_path()
+    expected_digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
+    if not expected_path and not expected_digest:
+        return True
+    if not expected_path or not expected_digest or not isinstance(check, dict):
+        return False
+    return (
+        check.get("source_path") == expected_path
+        and check.get("sha256") == expected_digest
+    )
+
+
 def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
     if payload is None or payload.get("verdict") != "STAMP":
         return None
@@ -1814,22 +1827,14 @@ def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
     answer = payload.get("shippable_answer")
     citations = payload.get("citations_that_hold")
     check = payload.get("voice_profile_check")
-    expected_digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
-    expected_path = _voice_profile_path()
     if not isinstance(answer, str) or not answer.strip() or "\u2014" in answer:
         return None
     if not isinstance(citations, list) or not citations:
         return None
     # Voice rendering is optional. When a profile is configured the stamp must
-    # prove Codex read that exact file; when it is not, there is nothing to
-    # prove and requiring a digest would reject every otherwise valid stamp.
-    if expected_path or expected_digest:
-        if (
-            not expected_digest
-            or not _contains_text(check, expected_path)
-            or not _contains_text(check, expected_digest)
-        ):
-            return None
+    # carry the canonical exact-file receipt accepted by persistence too.
+    if not _valid_voice_profile_check(check):
+        return None
     return answer
 
 
@@ -2875,11 +2880,20 @@ def strict_cost_budget(
             else ""
         )
         if request_identity:
-            activate_parent_attempt(
-                parent_session_id,
-                request_identity,
-                new_request=True,
-            )
+            try:
+                activate_parent_attempt(
+                    parent_session_id,
+                    request_identity,
+                    new_request=True,
+                )
+            except AttemptInFlightError:
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        "prior attempt still in flight; wait for it to finish "
+                        "before sending a new request"
+                    ),
+                }
         snapshot = _stored_cost_snapshot(event, parent_session_id)
         if snapshot.get("available") is False:
             # The runner cannot observe canonical usage in-process. Allow this
