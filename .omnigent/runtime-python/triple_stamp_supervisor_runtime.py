@@ -148,6 +148,13 @@ def _continuation_prompt(route: object) -> str:
             "STAMP. Relay only its shippable_answer byte-for-byte now, with "
             "nothing before or after it."
         )
+    if status == "best_effort":
+        return (
+            f"{_CONTINUATION_PREFIX}: The durable route reached bounded "
+            "customer finalization. Do not emit pipeline vocabulary or dispatch "
+            "more work. The runtime will relay the completed answer with its "
+            "remaining evidence gaps."
+        )
     if status == "validation_failed":
         return (
             f"{_CONTINUATION_PREFIX}: The durable route is terminal validation "
@@ -414,6 +421,11 @@ def _terminal_response_allowed(
     if status == "success":
         answer = _attested_stamp_answer(route, records)
         return answer is not None and response == answer
+    if status == "best_effort":
+        from triple_stamp_isaac_launcher import _best_effort_answer
+
+        answer = _best_effort_answer(records, route)
+        return answer is not None and response == answer
     if status == "validation_failed":
         return response.startswith(_VALIDATION_PREFIX)
     if status == "infrastructure_failed":
@@ -526,6 +538,7 @@ def install_supervisor_continuation_guard() -> None:
     )
     from triple_stamp_isaac_launcher import (
         _failure_metrics,
+        _best_effort_answer,
         _next_route,
         _route_dispatch_pending,
     )
@@ -533,9 +546,11 @@ def install_supervisor_continuation_guard() -> None:
         read_collections,
         read_dispatches,
         read_attested_answer,
+        read_best_effort_answer,
         read_last_tool_dispatch_exception,
         read_supervisor_continuations,
         read_terminal_failure,
+        record_best_effort_answer,
         record_terminal_failure,
     )
 
@@ -598,6 +613,30 @@ def install_supervisor_continuation_guard() -> None:
                 yield TextChunk(text=attested_answer)
                 yield TurnComplete(
                     response=attested_answer,
+                    modified_by_policy=True,
+                )
+                return
+            best_effort_answer = read_best_effort_answer(
+                parent_session_id=session_id
+            )
+            if best_effort_answer:
+                route = _next_route(
+                    read_collections(parent_session_id=session_id),
+                    parent_session_id=session_id,
+                )
+                _record(
+                    "deterministic_best_effort_relay",
+                    route,
+                    attempt=continuation_attempt,
+                    reason=(
+                        "parent already has an immutable completed answer "
+                        "with explicit evidence gaps"
+                    ),
+                    parent_session_id=session_id,
+                )
+                yield TextChunk(text=best_effort_answer)
+                yield TurnComplete(
+                    response=best_effort_answer,
                     modified_by_policy=True,
                 )
                 return
@@ -742,6 +781,34 @@ def install_supervisor_continuation_guard() -> None:
             response = completed.response
             if not isinstance(response, str):
                 response = "".join(event.text for event in buffered_text)
+
+            bounded_answer = _best_effort_answer(records, route)
+            if bounded_answer is not None:
+                persisted = record_best_effort_answer(
+                    bounded_answer,
+                    records,
+                    cycle=int(getattr(route, "cycle", 0) or 0),
+                    reason=str(getattr(route, "reason", "") or ""),
+                    parent_session_id=session_id,
+                )
+                if persisted:
+                    _record(
+                        "deterministic_best_effort_relay",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "bounded route preserved completed evidence and "
+                            "disclosed the judge's remaining gaps"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TextChunk(text=persisted)
+                    yield TurnComplete(
+                        response=persisted,
+                        modified_by_policy=True,
+                        usage=completed.usage,
+                    )
+                    return
 
             if _terminal_response_allowed(route, response, records):
                 for event in buffered_text:

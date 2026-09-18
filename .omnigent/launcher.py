@@ -90,6 +90,8 @@ PLUGIN_VERSION = "0.4.0"
 PLUGIN_ENTRY_NAME = "isaac"
 PLUGIN_ENTRY_VALUE = "triple_stamp_isaac_launcher:IsaacClaudeLauncher"
 _PIPELINE_OUTPUTS = (
+    "best-effort-answer.bin",
+    "best-effort-attestation.json",
     "budget-state.json",
     "codex-punch-lists.jsonl",
     "failure-attestation.json",
@@ -1431,14 +1433,10 @@ def _apply_provider_to_bundle(
     if not isinstance(supervisor_prompt, str):
         _die("runtime supervisor prompt is not text")
     supervisor_prompt = supervisor_prompt.replace(
-        (
-            "This run permits exactly 2 complete cycles. Cycle 3 is denied.\n"
-            "After 2 failed cycles,"
-        ),
+        "This run permits exactly 2 complete cycles. Cycle 3 is denied.",
         (
             f"This run permits exactly {cycles} complete cycles. "
-            f"Cycle {cycles + 1} is denied.\n"
-            f"After {cycles} failed cycles,"
+            f"Cycle {cycles + 1} is denied."
         ),
     )
     documents["supervisor"]["prompt"] = supervisor_prompt
@@ -2382,16 +2380,161 @@ def _parent_artifact_path(
     return run_dir / f"{path.stem}-{digest}{path.suffix}"
 
 
+def _validated_best_effort_exit(
+    run_dir: Path,
+    parent_session_id: str = "",
+) -> bool:
+    """Verify a complete non-STAMP answer and its available source packets."""
+
+    attestation_path = _parent_artifact_path(
+        run_dir,
+        "best-effort-attestation.json",
+        parent_session_id,
+    )
+    if not parent_session_id and not attestation_path.exists():
+        candidates = sorted(run_dir.glob("best-effort-attestation-*.json"))
+        if len(candidates) == 1:
+            attestation_path = candidates[0]
+    try:
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        if not isinstance(attestation, dict):
+            return False
+        attested_parent = str(
+            attestation.get("parent_session_id") or parent_session_id
+        )
+        answer = _parent_artifact_path(
+            run_dir,
+            "best-effort-answer.bin",
+            attested_parent,
+        ).read_bytes()
+        collections = [
+            json.loads(line)
+            for line in (run_dir / "routing-collections.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if attested_parent:
+        collections = [
+            record
+            for record in collections
+            if record.get("parent_session_id") == attested_parent
+        ]
+    sources = attestation.get("source_packets")
+    if (
+        attestation.get("verdict") != "BEST_EFFORT"
+        or attestation.get("quality_approved") is not False
+        or not answer
+        or answer.startswith(
+            (b"PIPELINE_VALIDATION_FAILED:", b"PIPELINE_INFRASTRUCTURE_ERROR:")
+        )
+        or attestation.get("answer_length") != len(answer)
+        or not isinstance(attestation.get("answer_sha256"), str)
+        or not secrets.compare_digest(
+            hashlib.sha256(answer).hexdigest(),
+            attestation["answer_sha256"],
+        )
+        or (
+            attested_parent
+            and attestation.get("parent_session_id") != attested_parent
+        )
+        or not isinstance(sources, list)
+        or len(sources) not in {2, 3}
+        or {
+            source.get("agent")
+            for source in sources
+            if isinstance(source, dict)
+        }
+        not in (
+            {"cursor_workhorse", "opus_auditor"},
+            {"cursor_workhorse", "opus_auditor", "codex_judge"},
+        )
+    ):
+        return False
+    cycle = attestation.get("cycle")
+    if not isinstance(cycle, int) or cycle not in {1, 2, 3, 4}:
+        return False
+    expected_titles = {
+        "cursor_workhorse": rf"cursor-cycle-{cycle}",
+        "opus_auditor": (
+            rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
+            rf"internal-{cycle}-[1-2]|format-repair-{cycle}(?:-web-[1-2])?)"
+        ),
+        "codex_judge": (
+            rf"judge-(?:cycle|convergence|format-repair)-{cycle}"
+        ),
+    }
+    for source in sources:
+        if not isinstance(source, dict):
+            return False
+        agent = str(source.get("agent") or "")
+        if (
+            re.fullmatch(
+                expected_titles.get(agent, r"(?!x)x"),
+                str(source.get("title") or ""),
+            )
+            is None
+        ):
+            return False
+        matching = next(
+            (
+                record
+                for record in collections
+                if record.get("agent") == source.get("agent")
+                and record.get("title") == source.get("title")
+                and str(record.get("child_session_id") or "")
+                == str(source.get("child_session_id") or "")
+                and str(record.get("work_id") or "")
+                == str(source.get("work_id") or "")
+                and record.get("status") == "completed"
+                and isinstance(record.get("output"), str)
+            ),
+            None,
+        )
+        if matching is None:
+            return False
+        output = str(matching["output"]).encode("utf-8")
+        if (
+            source.get("output_length") != len(output)
+            or not isinstance(source.get("output_sha256"), str)
+            or not secrets.compare_digest(
+                hashlib.sha256(output).hexdigest(),
+                source["output_sha256"],
+            )
+        ):
+            return False
+    return True
+
+
 def _validated_pipeline_exit(
     run_dir: Path,
     child_code: int,
     args: list[str],
     parent_session_id: str = "",
 ) -> int:
-    """Return zero only for self-test or an immutable collected STAMP."""
+    """Return zero only for self-test or an integrity-checked final answer."""
 
     if any(arg in SELF_TEST_FLAGS for arg in args):
         return child_code
+
+    stamp_path = _parent_artifact_path(
+        run_dir,
+        "stamp-attestation.json",
+        parent_session_id,
+    )
+    stamp_candidates = (
+        sorted(run_dir.glob("stamp-attestation-*.json"))
+        if not parent_session_id and not stamp_path.exists()
+        else []
+    )
+    if (
+        not stamp_path.exists()
+        and not stamp_candidates
+        and _validated_best_effort_exit(run_dir, parent_session_id)
+    ):
+        return 0
 
     try:
         attestation_path = _parent_artifact_path(

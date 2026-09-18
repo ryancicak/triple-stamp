@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import textwrap
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from triple_stamp_runtime_state import (
     read_budget_state,
     read_collections,
     read_dispatches,
+    record_best_effort_answer,
     record_terminal_failure,
     write_budget_state,
 )
@@ -879,6 +881,15 @@ def _valid_judgment(text: object) -> dict[str, Any] | None:
         return None
     if payload["needs_internal"] is not (verdict == "NEEDS_INTERNAL"):
         return None
+    best_supported = payload.get("best_supported_answer")
+    if best_supported is not None and (
+        not isinstance(best_supported, str)
+        or not best_supported.strip()
+        or best_supported.startswith(
+            ("PIPELINE_VALIDATION_FAILED:", "PIPELINE_INFRASTRUCTURE_ERROR:")
+        )
+    ):
+        return None
     if verdict == "REWORK":
         normalized = _normalized_codex_punch_list(payload)
         if len(normalized) != len(payload[field]):
@@ -1008,7 +1019,7 @@ def _internal_reaudit_route(
     )
     if used >= 2:
         return _Route(
-            "validation_failed",
+            "best_effort",
             cycle,
             requester="codex",
             hop=used,
@@ -1077,7 +1088,7 @@ def _verdict_route(
         )
         if used >= 2:
             return _Route(
-                "validation_failed",
+                "best_effort",
                 cycle,
                 requester=requester,
                 hop=used,
@@ -1132,7 +1143,7 @@ def _verdict_route(
             title = f"judge-convergence-{cycle}"
             if any(record.get("title") == title for record in records):
                 return _Route(
-                    "validation_failed",
+                    "best_effort",
                     cycle,
                     reason=(
                         "bounded convergence adjudication declined STAMP; "
@@ -1152,7 +1163,7 @@ def _verdict_route(
             )
         if cycle >= _MAX_CYCLES:
             return _Route(
-                "validation_failed",
+                "best_effort",
                 cycle,
                 reason=(
                     "Codex requested rework after configured final cycle "
@@ -1309,6 +1320,12 @@ def _next_route(
         )
     if parsed.kind == "judge_convergence":
         payload = _valid_judgment(last.get("output"))
+        if payload is None:
+            return _Route(
+                "infrastructure_failed",
+                cycle,
+                reason="Codex convergence judgment was incomplete or malformed",
+            )
         if payload is not None and payload.get("verdict") == "STAMP":
             return _Route("success", cycle)
         limitations = (
@@ -1318,7 +1335,7 @@ def _next_route(
             else []
         )
         return _Route(
-            "validation_failed",
+            "best_effort",
             cycle,
             reason=(
                 "bounded convergence adjudication did not STAMP"
@@ -1536,6 +1553,187 @@ def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
     return answer
 
 
+def _safe_customer_answer(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    answer = value.strip()
+    if not answer or answer.startswith(
+        (
+            "PIPELINE_VALIDATION_FAILED:",
+            "PIPELINE_INFRASTRUCTURE_ERROR:",
+            "CURSOR_FINALIZATION_REQUIRED:",
+            "CURSOR_WORKER_STALLED:",
+            "CURSOR_WORKER_FAILED:",
+            "CURSOR_WORKER_TIMEOUT:",
+            "TRIPLE_STAMP_NONTERMINAL_CONTINUATION",
+        )
+    ):
+        return ""
+    return answer
+
+
+def _cursor_answer_draft(output: object) -> str:
+    """Extract only Cursor's explicitly completed customer-answer draft."""
+
+    if not isinstance(output, str):
+        return ""
+    for payload in _mapping_candidates(output):
+        answer = _safe_customer_answer(
+            payload.get("suggested_customer_answer_draft")
+        )
+        if answer:
+            return answer
+    marker = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?suggested_customer_answer_draft\s*:\s*",
+        output,
+    )
+    if marker is None:
+        return ""
+    remainder = output[marker.end() :]
+    boundary = re.search(
+        (
+            r"(?im)^\s*(?:[-*]\s*)?"
+            r"(?:question_restated|purpose_run|findings|web_sources|unverified|"
+            r"weakest_part)\s*:"
+        ),
+        remainder,
+    )
+    draft = remainder[: boundary.start()] if boundary is not None else remainder
+    return _safe_customer_answer(textwrap.dedent(draft))
+
+
+def _judgment_gaps(payload: dict[str, Any]) -> list[str]:
+    """Render concrete unresolved evidence gaps without infrastructure prose."""
+
+    gaps: list[str] = []
+    limitations = payload.get("limitations")
+    if isinstance(limitations, list):
+        gaps.extend(
+            str(item).strip()
+            for item in limitations
+            if isinstance(item, str) and item.strip()
+        )
+    field = {
+        "REWORK": "punch_list_for_cursor",
+        "NEEDS_WEB": "web_queries",
+        "NEEDS_INTERNAL": "internal_queries",
+    }.get(str(payload.get("verdict")), "")
+    items = payload.get(field) if field else []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, str) and item.strip():
+                gaps.append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim") or "").strip()
+            proof = str(
+                item.get("requested_proof")
+                or item.get("prove_condition")
+                or item.get("where_to_look")
+                or ""
+            ).strip()
+            if claim and proof:
+                gaps.append(f"{claim} Required evidence: {proof}")
+            elif claim or proof:
+                gaps.append(claim or proof)
+    if not gaps:
+        why = str(payload.get("why") or "").strip()
+        if why:
+            gaps.append(why)
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for gap in gaps:
+        normalized = _normalize_gap_text(gap)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduplicated.append(gap)
+    return deduplicated
+
+
+def _best_effort_answer(
+    records: list[dict[str, Any]],
+    route: _Route,
+) -> str | None:
+    """Build a finished conclusion-plus-gaps answer from complete packets only."""
+
+    if route.status != "best_effort" or not _has_required_stage_chain(
+        records, route.cycle
+    ):
+        return None
+    complete_cursor = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("agent") == "cursor_workhorse"
+            and record.get("status") == "completed"
+            and record.get("title") == f"cursor-cycle-{route.cycle}"
+            and _safe_customer_answer(record.get("output"))
+        ),
+        None,
+    )
+    if complete_cursor is None:
+        return None
+    review: dict[str, Any] | None = None
+    for record in reversed(records):
+        parsed = _stage(record.get("title"))
+        if (
+            record.get("agent") != "codex_judge"
+            or record.get("status") != "completed"
+            or parsed is None
+            or parsed.cycle != route.cycle
+            or parsed.kind not in {"judge", "judge_repair", "judge_convergence"}
+        ):
+            continue
+        review = _valid_judgment(record.get("output"))
+        if review is not None and review.get("verdict") != "STAMP":
+            break
+        review = None
+    if review is None:
+        for record in reversed(records):
+            parsed = _stage(record.get("title"))
+            if (
+                record.get("agent") != "opus_auditor"
+                or record.get("status") != "completed"
+                or parsed is None
+                or parsed.cycle != route.cycle
+                or parsed.kind not in {"audit", "audit_web", "audit_repair_web"}
+            ):
+                continue
+            review = _valid_audit(record.get("output"))
+            if review is not None and review.get("verdict") == "NEEDS_WEB":
+                break
+            review = None
+    if review is None:
+        return None
+
+    conclusion = _safe_customer_answer(review.get("best_supported_answer"))
+    if not conclusion:
+        conclusion = _cursor_answer_draft(complete_cursor.get("output"))
+    if not conclusion:
+        conclusion = _safe_customer_answer(complete_cursor.get("output"))
+    if not conclusion:
+        why = _safe_customer_answer(review.get("why"))
+        if not why:
+            return None
+        conclusion = (
+            "Based on the completed review, the strongest supported conclusion "
+            f"is: {why}"
+        )
+
+    gaps = _judgment_gaps(review)
+    gap_lines = "\n".join(f"- {gap}" for gap in gaps)
+    if not gap_lines:
+        gap_lines = "- Final quality approval was not granted."
+    return (
+        f"{conclusion}\n\n"
+        "Remaining evidence gaps:\n"
+        f"{gap_lines}\n\n"
+        "These gaps are explicit because the completed evidence did not support "
+        "final quality approval."
+    )
+
+
 def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
     pin_markers = (
         "pin broke",
@@ -1566,7 +1764,7 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
 
 
 def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
-    count = 0
+    cycles: set[int] = set()
     records = (
         read_collections(parent_session_id=parent_session_id)
         if parent_session_id
@@ -1575,14 +1773,18 @@ def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
     for record in records:
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
-        payload = next(iter(_mapping_candidates(record["output"])), None)
+        title = str(record.get("title") or "")
+        match = re.fullmatch(r"judge-cycle-([1-4])", title)
+        if match is None:
+            continue
+        payload = _valid_judgment(record["output"])
         if payload is not None and payload.get("verdict") in {
             "REWORK",
             "NEEDS_WEB",
             "NEEDS_INTERNAL",
         }:
-            count += 1
-    return count >= _MAX_CYCLES
+            cycles.add(int(match.group(1)))
+    return len(cycles) >= _MAX_CYCLES
 
 
 def _failure_metrics(
@@ -1746,18 +1948,36 @@ def supervisor_contract(
         if (
             stamped is not None
             and _has_required_stage_chain(collections, cycle)
-            and response == stamped
         ):
-            _mark_terminal(
-                "STAMP",
-                stamped,
-                parent_session_id=parent_session_id,
-            )
-            return {"result": "ALLOW"}
+            if response == stamped:
+                _mark_terminal(
+                    "STAMP",
+                    stamped,
+                    parent_session_id=parent_session_id,
+                )
+                return {"result": "ALLOW"}
+            return {
+                "result": "DENY",
+                "reason": (
+                    "A valid Codex STAMP already exists and its byte-exact "
+                    "shippable_answer must be preserved."
+                ),
+            }
         route = _next_route(
             collections,
             parent_session_id=parent_session_id,
         )
+        best_effort = _best_effort_answer(collections, route)
+        if best_effort is not None and response == best_effort:
+            persisted = record_best_effort_answer(
+                best_effort,
+                collections,
+                cycle=route.cycle,
+                reason=route.reason,
+                parent_session_id=parent_session_id,
+            )
+            if persisted == best_effort:
+                return {"result": "ALLOW"}
         if (
             response == ""
             and _route_dispatch_pending(
@@ -1781,9 +2001,13 @@ def supervisor_contract(
                 parent_session_id=parent_session_id,
             )
             return {"result": "ALLOW"}
-        if response.startswith(_VALIDATION_PREFIX) and (
-            _max_unstamped_judgments(parent_session_id)
-            or route.status == "validation_failed"
+        if (
+            route.status != "best_effort"
+            and response.startswith(_VALIDATION_PREFIX)
+            and (
+                _max_unstamped_judgments(parent_session_id)
+                or route.status == "validation_failed"
+            )
         ):
             _mark_terminal(
                 "PIPELINE_VALIDATION_FAILED",

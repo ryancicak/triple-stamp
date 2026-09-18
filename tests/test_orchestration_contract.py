@@ -146,6 +146,9 @@ def _judgment(verdict: str = "REWORK") -> str:
         "needs_web": verdict == "NEEDS_WEB",
         "needs_internal": verdict == "NEEDS_INTERNAL",
         "why": "bounded test judgment",
+        "best_supported_answer": (
+            "The completed evidence supports this fixture's customer answer."
+        ),
         "gap_materiality": "material",
         "limitations": [],
     }
@@ -5436,7 +5439,7 @@ print("exact temp boundary: PASS")
                     cursor_web_2,
                     audit_web_2,
                 ],
-                ("validation_failed", "", "", ""),
+                ("best_effort", "", "", ""),
             ),
             (
                 [cursor_1, audit_pass, judge_web],
@@ -6303,7 +6306,7 @@ print("exact temp boundary: PASS")
                             f"cursor-cycle-{cycle + 1}",
                         )
                     else:
-                        self.assertEqual(route.status, "validation_failed")
+                        self.assertEqual(route.status, "best_effort")
 
         contract = plugin.supervisor_contract(enabled=True)
         denied = contract(
@@ -6533,7 +6536,7 @@ print("exact temp boundary: PASS")
                 ),
             ]
         )
-        self.assertEqual(terminal.status, "validation_failed")
+        self.assertEqual(terminal.status, "best_effort")
         self.assertNotIn("cursor-cycle-3", terminal.title)
 
         with tempfile.TemporaryDirectory() as value, mock.patch.dict(
@@ -6603,7 +6606,7 @@ print("exact temp boundary: PASS")
             ]
         )
         route = plugin._next_route(records)
-        self.assertEqual(route.status, "validation_failed")
+        self.assertEqual(route.status, "best_effort")
         self.assertIn("codex web-hop cap exhausted", route.reason)
 
     def test_codex_needs_internal_skips_cursor_uses_fresh_opus_and_exhausts(self) -> None:
@@ -6670,7 +6673,7 @@ print("exact temp boundary: PASS")
             ]
         )
         exhausted = plugin._next_route(records)
-        self.assertEqual(exhausted.status, "validation_failed")
+        self.assertEqual(exhausted.status, "best_effort")
         self.assertIn("internal-hop cap exhausted", exhausted.reason)
         self.assertFalse(
             any(
@@ -7748,6 +7751,393 @@ print("exact temp boundary: PASS")
             self.assertEqual(records[0]["cycle"], 1)
             self.assertEqual(records[0]["requester"], "opus")
             self.assertNotIn("resume_child_session_id", records[1])
+
+    def test_final_cycle_rework_returns_completed_answer_with_gaps(self) -> None:
+        parent = "parent-final-cycle-rework"
+        first = json.loads(_judgment("REWORK"))
+        first["punch_list_for_cursor"][0]["claim"] = "cycle one gap"
+        second = json.loads(_judgment("REWORK"))
+        second["punch_list_for_cursor"][0]["claim"] = "cycle two gap"
+        second["best_supported_answer"] = (
+            "The supported customer conclusion is still available."
+        )
+        records = [
+            {
+                **packet,
+                "parent_session_id": parent,
+            }
+            for packet in (
+                _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+                _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
+                _route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    json.dumps(first),
+                ),
+                _route_packet("cursor_workhorse", "cursor-cycle-2", "CURSOR-2"),
+                _route_packet("opus_auditor", "audit-cycle-2", _audit("FAIL")),
+                _route_packet(
+                    "codex_judge",
+                    "judge-cycle-2",
+                    json.dumps(second),
+                ),
+            )
+        ]
+        route = plugin._next_route(records, parent_session_id=parent)
+        self.assertEqual(route.status, "best_effort")
+        answer = plugin._best_effort_answer(records, route)
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertTrue(answer.startswith(second["best_supported_answer"]))
+        self.assertIn("Remaining evidence gaps:", answer)
+        self.assertIn("cycle two gap", answer)
+        self.assertFalse(answer.startswith("PIPELINE_"))
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            for record in records:
+                runtime_state.append_collection(record)
+            contract = plugin.supervisor_contract(enabled=True)
+            rejected = contract(
+                {
+                    "type": "response",
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                    "data": "PIPELINE_VALIDATION_FAILED: final cycle",
+                }
+            )
+            self.assertEqual(rejected["result"], "DENY")
+            accepted = contract(
+                {
+                    "type": "response",
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                    "data": answer,
+                }
+            )
+            self.assertEqual(accepted["result"], "ALLOW")
+            self.assertEqual(
+                runtime_state.read_best_effort_answer(parent),
+                answer,
+            )
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                launcher._validated_pipeline_exit(
+                    Path(value),
+                    70,
+                    [],
+                    parent_session_id=parent,
+                ),
+                0,
+            )
+
+    def test_final_cycle_internal_hop_exhaustion_returns_answer(self) -> None:
+        judgment = _judgment("NEEDS_INTERNAL")
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
+            _route_packet("codex_judge", "judge-cycle-1", _judgment("REWORK")),
+            _route_packet("cursor_workhorse", "cursor-cycle-2", "CURSOR-2"),
+            _route_packet("opus_auditor", "audit-cycle-2", _audit("FAIL")),
+            _route_packet("codex_judge", "judge-cycle-2", judgment),
+            _route_packet(
+                "opus_auditor",
+                "audit-internal-2-1",
+                _audit("PASS_WITH_GAPS"),
+            ),
+            _route_packet("codex_judge", "judge-cycle-2", judgment),
+            _route_packet(
+                "opus_auditor",
+                "audit-internal-2-2",
+                _audit("PASS_WITH_GAPS"),
+            ),
+            _route_packet("codex_judge", "judge-cycle-2", judgment),
+        ]
+        route = plugin._next_route(records)
+        self.assertEqual(route.status, "best_effort")
+        answer = plugin._best_effort_answer(records, route)
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertIn("verify internal claim", answer)
+        self.assertFalse(answer.startswith("PIPELINE_"))
+
+    def test_opus_web_hop_exhaustion_uses_completed_cursor_draft(self) -> None:
+        cursor = (
+            "question_restated: Verify the feature.\n"
+            "suggested_customer_answer_draft: The feature is supported by the "
+            "completed public evidence.\n"
+            "weakest_part: One live source still needs confirmation."
+        )
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", cursor),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("NEEDS_WEB")),
+            _route_packet(
+                "cursor_workhorse",
+                "cursor-web-opus-1-1",
+                "WEB-1",
+            ),
+            _route_packet(
+                "opus_auditor",
+                "audit-cycle-1-web-1",
+                _audit("NEEDS_WEB"),
+            ),
+            _route_packet(
+                "cursor_workhorse",
+                "cursor-web-opus-1-2",
+                "WEB-2",
+            ),
+            _route_packet(
+                "opus_auditor",
+                "audit-cycle-1-web-2",
+                _audit("NEEDS_WEB"),
+            ),
+        ]
+        route = plugin._next_route(records)
+        self.assertEqual(route.status, "best_effort")
+        answer = plugin._best_effort_answer(records, route)
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertTrue(answer.startswith("The feature is supported"))
+        self.assertIn("Remaining evidence gaps:", answer)
+        self.assertFalse(answer.startswith("PIPELINE_"))
+
+    def test_runtime_relays_bounded_answer_instead_of_pipeline_failure(self) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        parent = "parent-runtime-bounded-answer"
+        second = json.loads(_judgment("REWORK"))
+        second["punch_list_for_cursor"][0]["claim"] = "distinct final gap"
+        second["best_supported_answer"] = "Here is the supported customer answer."
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
+            _route_packet("codex_judge", "judge-cycle-1", _judgment("REWORK")),
+            _route_packet("cursor_workhorse", "cursor-cycle-2", "CURSOR-2"),
+            _route_packet("opus_auditor", "audit-cycle-2", _audit("FAIL")),
+            _route_packet(
+                "codex_judge",
+                "judge-cycle-2",
+                json.dumps(second),
+            ),
+        ]
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+
+        async def scripted(*_args: object, **_kwargs: object):
+            yield TextChunk("PIPELINE_VALIDATION_FAILED: must be suppressed")
+            yield TurnComplete(
+                response="PIPELINE_VALIDATION_FAILED: must be suppressed"
+            )
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    [
+                        {
+                            "role": "user",
+                            "content": "finish",
+                            "session_id": parent,
+                        }
+                    ],
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            for packet in records:
+                runtime_state.append_collection(
+                    {**packet, "parent_session_id": parent}
+                )
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+            persisted = runtime_state.read_best_effort_answer(parent)
+
+        rendered = "".join(
+            event.text for event in events if isinstance(event, TextChunk)
+        )
+        self.assertEqual(rendered, persisted)
+        self.assertTrue(rendered.startswith(second["best_supported_answer"]))
+        self.assertNotIn("PIPELINE_VALIDATION_FAILED", rendered)
+        self.assertEqual(
+            [
+                event.response
+                for event in events
+                if isinstance(event, TurnComplete)
+            ],
+            [persisted],
+        )
+
+    def test_prior_stamp_cannot_be_replaced_by_later_rework_or_sibling(self) -> None:
+        parent = "parent-prior-stamp"
+        sibling = "parent-sibling-failure"
+        answer = "The cycle-one answer remains authoritative."
+        stamp = json.dumps(
+            {
+                "verdict": "STAMP",
+                "needs_web": False,
+                "needs_internal": False,
+                "why": "cycle one evidence is complete",
+                "gap_materiality": "none",
+                "limitations": [],
+                "citations_that_hold": ["cycle one evidence"],
+                "voice_profile_check": {
+                    "source_path": "",
+                    "sha256": "",
+                    "constraints_applied": "none",
+                },
+                "shippable_answer": answer,
+            }
+        )
+        cycle_one = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("PASS")),
+            _route_packet("codex_judge", "judge-cycle-1", stamp),
+        ]
+        cycle_two = [
+            _route_packet("cursor_workhorse", "cursor-cycle-2", "CURSOR-2"),
+            _route_packet("opus_auditor", "audit-cycle-2", _audit("FAIL")),
+            _route_packet("codex_judge", "judge-cycle-2", _judgment("REWORK")),
+        ]
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            for packet in cycle_one:
+                record = {**packet, "parent_session_id": parent}
+                runtime_state.append_collection(record)
+                if packet["agent"] == "codex_judge":
+                    self.assertTrue(runtime_state.attest_codex_stamp(record))
+            for packet in cycle_two:
+                runtime_state.append_collection(
+                    {**packet, "parent_session_id": parent}
+                )
+            sibling_failure = runtime_state.record_terminal_failure(
+                "PIPELINE_VALIDATION_FAILED",
+                "sibling exhausted",
+                cycle=2,
+                parent_session_id=sibling,
+            )
+            contract = plugin.supervisor_contract(enabled=True)
+            rejected = contract(
+                {
+                    "type": "response",
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                    "data": "PIPELINE_VALIDATION_FAILED: later rework",
+                }
+            )
+            self.assertEqual(rejected["result"], "DENY")
+            self.assertEqual(
+                runtime_state.record_terminal_failure(
+                    "PIPELINE_VALIDATION_FAILED",
+                    "same parent later rework",
+                    cycle=2,
+                    parent_session_id=parent,
+                ),
+                answer,
+            )
+            self.assertEqual(runtime_state.read_attested_answer(parent), answer)
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                runtime_state.read_terminal_failure(sibling),
+                sibling_failure,
+            )
+
+    def test_same_cycle_nonstamp_retries_do_not_authorize_validation(self) -> None:
+        parent = "parent-same-cycle-judgments"
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
+            _route_packet(
+                "codex_judge",
+                "judge-cycle-1",
+                _judgment("NEEDS_INTERNAL"),
+            ),
+            _route_packet(
+                "opus_auditor",
+                "audit-internal-1-1",
+                _audit("PASS_WITH_GAPS"),
+            ),
+            _route_packet(
+                "codex_judge",
+                "judge-cycle-1",
+                _judgment("NEEDS_INTERNAL"),
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            for packet in records:
+                runtime_state.append_collection(
+                    {**packet, "parent_session_id": parent}
+                )
+            self.assertFalse(plugin._max_unstamped_judgments(parent))
+            decision = plugin.supervisor_contract(enabled=True)(
+                {
+                    "type": "response",
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                    "data": "PIPELINE_VALIDATION_FAILED: duplicate judgments",
+                }
+            )
+            self.assertEqual(decision["result"], "DENY")
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+
+    def test_incomplete_cursor_packet_is_not_a_fallback_answer(self) -> None:
+        second = json.loads(_judgment("REWORK"))
+        second["punch_list_for_cursor"][0]["claim"] = "distinct cycle two gap"
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
+            _route_packet("codex_judge", "judge-cycle-1", _judgment("REWORK")),
+            _route_packet(
+                "cursor_workhorse",
+                "cursor-cycle-2",
+                "CURSOR_FINALIZATION_REQUIRED: partial output",
+            ),
+            _route_packet("opus_auditor", "audit-cycle-2", _audit("FAIL")),
+            _route_packet(
+                "codex_judge",
+                "judge-cycle-2",
+                json.dumps(second),
+            ),
+        ]
+        route = plugin._next_route(records)
+        self.assertEqual(route.status, "best_effort")
+        self.assertIsNone(plugin._best_effort_answer(records, route))
 
     def test_parent_scoped_pending_and_resume_ignore_same_title_sibling(
         self,

@@ -1302,6 +1302,194 @@ def read_attested_answer(parent_session_id: str = "") -> str:
         return ""
 
 
+def record_best_effort_answer(
+    answer: str,
+    records: list[dict[str, Any]],
+    *,
+    cycle: int,
+    reason: str,
+    parent_session_id: str = "",
+) -> str:
+    """Persist a complete non-STAMP answer with its exact packet provenance."""
+
+    stamped = read_attested_answer(parent_session_id)
+    if stamped:
+        return stamped
+    existing = read_best_effort_answer(parent_session_id)
+    if existing:
+        return existing
+    run_dir = _run_dir()
+    clean_answer = answer.strip()
+    if (
+        run_dir is None
+        or not clean_answer
+        or clean_answer.startswith(
+            ("PIPELINE_VALIDATION_FAILED:", "PIPELINE_INFRASTRUCTURE_ERROR:")
+        )
+    ):
+        return ""
+
+    scoped = _scope_parent_records(records, parent_session_id)
+
+    def complete(record: dict[str, Any], agent: str) -> bool:
+        output = record.get("output")
+        parsed = parse_dispatch_title(record.get("title"))
+        return (
+            record.get("agent") == agent
+            and record.get("status") == "completed"
+            and isinstance(output, str)
+            and bool(output.strip())
+            and parsed is not None
+            and parsed["cycle"] == cycle
+            and not output.startswith(
+                (
+                    "CURSOR_FINALIZATION_REQUIRED:",
+                    "CURSOR_WORKER_STALLED:",
+                    "CURSOR_WORKER_FAILED:",
+                    "CURSOR_WORKER_TIMEOUT:",
+                )
+            )
+        )
+
+    cursor = next(
+        (
+            record
+            for record in reversed(scoped)
+            if complete(record, "cursor_workhorse")
+            and record.get("title") == f"cursor-cycle-{cycle}"
+        ),
+        None,
+    )
+    opus = next(
+        (
+            record
+            for record in reversed(scoped)
+            if complete(record, "opus_auditor")
+            and str(record.get("title") or "").startswith("audit-")
+        ),
+        None,
+    )
+    codex = next(
+        (
+            record
+            for record in reversed(scoped)
+            if complete(record, "codex_judge")
+            and str(record.get("title") or "").startswith("judge-")
+        ),
+        None,
+    )
+    if cursor is None or opus is None:
+        return ""
+
+    source_packets = []
+    sources = [cursor, opus]
+    if codex is not None:
+        sources.append(codex)
+    for record in sources:
+        output_bytes = str(record["output"]).encode("utf-8")
+        source_packets.append(
+            {
+                "agent": record["agent"],
+                "title": str(record.get("title") or ""),
+                "child_session_id": str(record.get("child_session_id") or ""),
+                "work_id": str(record.get("work_id") or ""),
+                "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+                "output_length": len(output_bytes),
+            }
+        )
+
+    answer_bytes = clean_answer.encode("utf-8")
+    attestation = {
+        "version": 1,
+        "verdict": "BEST_EFFORT",
+        "quality_approved": False,
+        "cycle": max(0, int(cycle)),
+        "parent_session_id": parent_session_id,
+        "reason": " ".join(str(reason).replace("\x00", " ").split())[:2000],
+        "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
+        "answer_length": len(answer_bytes),
+        "source_packets": source_packets,
+    }
+
+    def create_once(path: Path, data: bytes) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    try:
+        create_once(
+            _parent_artifact_path(
+                run_dir,
+                "best-effort-answer.bin",
+                parent_session_id,
+            ),
+            answer_bytes,
+        )
+        create_once(
+            _parent_artifact_path(
+                run_dir,
+                "best-effort-attestation.json",
+                parent_session_id,
+            ),
+            (
+                json.dumps(attestation, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8"),
+        )
+    except FileExistsError:
+        return read_best_effort_answer(parent_session_id)
+    return clean_answer
+
+
+def read_best_effort_answer(parent_session_id: str = "") -> str:
+    """Return one parent's complete non-STAMP answer after digest verification."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return ""
+    try:
+        attestation = json.loads(
+            _parent_artifact_path(
+                run_dir,
+                "best-effort-attestation.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+        answer = _parent_artifact_path(
+            run_dir,
+            "best-effort-answer.bin",
+            parent_session_id,
+        ).read_bytes()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("verdict") != "BEST_EFFORT"
+        or attestation.get("quality_approved") is not False
+        or (
+            parent_session_id
+            and attestation.get("parent_session_id") != parent_session_id
+        )
+        or attestation.get("answer_length") != len(answer)
+        or not isinstance(attestation.get("answer_sha256"), str)
+        or not hashlib.sha256(answer).hexdigest()
+        == attestation["answer_sha256"]
+    ):
+        return ""
+    try:
+        decoded = answer.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    if not decoded.strip() or decoded.startswith(
+        ("PIPELINE_VALIDATION_FAILED:", "PIPELINE_INFRASTRUCTURE_ERROR:")
+    ):
+        return ""
+    return decoded
+
+
 def append_supervisor_tool_call(
     name: str,
     parent_session_id: str = "",
@@ -1443,6 +1631,11 @@ def record_terminal_failure(
 ) -> str:
     """Create one immutable sanitized terminal failure result and attestation."""
 
+    completed_answer = read_attested_answer(parent_session_id) or (
+        read_best_effort_answer(parent_session_id)
+    )
+    if completed_answer:
+        return completed_answer
     run_dir = _run_dir()
     normalized_kind = (
         "PIPELINE_VALIDATION_FAILED"
