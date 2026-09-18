@@ -36,7 +36,7 @@ _TERMINAL_RELAY_ACTIONS = frozenset(
 # emit status prose and every attempt is suppressed, which is why the UI showed
 # raw `sys_session_send` rows and nothing else. The runtime holds the same facts
 # and cannot drift from them, so it narrates instead of the model.
-_NARRATED_STAGES: dict[tuple[str, str], set[str]] = {}
+_NARRATED_STAGES: dict[tuple[str, str, int], set[str]] = {}
 _STAGE_STEP = {
     "cursor_workhorse": ("1 of 3", "public-web research"),
     "opus_auditor": ("2 of 3", "internal audit"),
@@ -191,6 +191,33 @@ def _session_id(messages: list[dict[str, Any]]) -> str:
         if isinstance(metadata, dict) and metadata.get("session_id"):
             return str(metadata["session_id"])
     return "default"
+
+
+def _attempt_request_identity(messages: list[dict[str, Any]]) -> str:
+    """Fingerprint the latest top-level user turn."""
+
+    from triple_stamp_runtime_state import attempt_request_identity
+
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if (
+            isinstance(content, str)
+            and content.startswith(_CONTINUATION_PREFIX)
+        ):
+            continue
+        metadata = message.get("metadata")
+        message_id = (
+            metadata.get("message_id")
+            if isinstance(metadata, dict)
+            else None
+        )
+        return attempt_request_identity(
+            content,
+            message_id=str(message_id or ""),
+        )
+    return ""
 
 
 def _tool_child_session_ids(result: object) -> set[str]:
@@ -543,6 +570,7 @@ def install_supervisor_continuation_guard() -> None:
         _route_dispatch_pending,
     )
     from triple_stamp_runtime_state import (
+        activate_parent_attempt,
         read_collections,
         read_dispatches,
         read_attested_answer,
@@ -584,6 +612,11 @@ def install_supervisor_continuation_guard() -> None:
             # root conversation id. A later concrete wake can safely continue.
             yield TurnComplete(response="", modified_by_policy=True)
             return
+        request_identity = _attempt_request_identity(messages)
+        attempt_generation = activate_parent_attempt(
+            session_id,
+            request_identity,
+        )
         # One narration per stage title for the life of the run. The guard is
         # re-entered on every wake, so this cannot live in the loop. Keyed by run
         # directory rather than run id because the directory is unique per run
@@ -591,7 +624,11 @@ def install_supervisor_continuation_guard() -> None:
         if len(_NARRATED_STAGES) > 8:
             _NARRATED_STAGES.clear()
         narrated = _NARRATED_STAGES.setdefault(
-            (os.environ.get("TRIPLE_STAMP_RUN_DIR", ""), session_id),
+            (
+                os.environ.get("TRIPLE_STAMP_RUN_DIR", ""),
+                session_id,
+                attempt_generation,
+            ),
             set(),
         )
         while True:

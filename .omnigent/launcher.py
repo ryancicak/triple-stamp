@@ -2587,6 +2587,15 @@ def _validated_pipeline_exit(
                 for record in collections
                 if record.get("parent_session_id") == attested_parent
             ]
+        attempt_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+        collections = [
+            record
+            for record in collections
+            if int(record.get("attempt_generation") or 1)
+            == attempt_generation
+        ]
     except OSError:
         _ensure_terminal_failure(
             run_dir,

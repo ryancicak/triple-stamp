@@ -23,12 +23,19 @@ from triple_stamp_opus_mcp import (
     prepare_opus_mcp_config,
 )
 from triple_stamp_runtime_state import (
+    activate_parent_attempt,
     append_supervisor_tool_call,
+    attempt_request_identity,
+    current_attempt_generation,
+    initialize_attempt_cost_baseline,
     parse_dispatch_title,
+    read_attempt_cost_baseline,
+    read_attested_answer,
     read_budget_state,
     read_collections,
     read_dispatches,
     record_best_effort_answer,
+    read_supervisor_tool_calls,
     record_terminal_failure,
     write_budget_state,
 )
@@ -1948,33 +1955,12 @@ def _failure_metrics(
     raw = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
     if not raw:
         return None, None
-    run_dir = Path(raw)
     try:
         budget = read_budget_state(parent_session_id)
         cost = float(budget["cost_usd"])
     except (KeyError, TypeError, ValueError):
         cost = None
-    try:
-        tool_calls = [
-            json.loads(line)
-            for line in (
-                (run_dir / "supervisor-tool-calls.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            )
-            if line.strip()
-        ]
-        calls = sum(
-            1
-            for record in tool_calls
-            if isinstance(record, dict)
-            and (
-                not parent_session_id
-                or record.get("parent_session_id") == parent_session_id
-            )
-        )
-    except (OSError, ValueError, json.JSONDecodeError):
-        calls = 0
+    calls = len(read_supervisor_tool_calls(parent_session_id))
     if calls == 0:
         calls = None
     return cost, calls
@@ -2023,15 +2009,47 @@ def _mark_terminal(
                 "stamped-answer.bin",
                 parent_session_id,
             )
-            relay.write_bytes(data)
-            relay.chmod(0o600)
+            attested = read_attested_answer(parent_session_id)
+            if attested:
+                if attested.encode("utf-8") != data:
+                    return
+            else:
+                try:
+                    fd = os.open(
+                        relay,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o400,
+                    )
+                except FileExistsError:
+                    if relay.read_bytes() != data:
+                        return
+                else:
+                    try:
+                        os.write(fd, data)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
             digest = _parent_artifact_path(
                 run_dir,
                 "stamped-answer.sha256",
                 parent_session_id,
             )
-            digest.write_text(hashlib.sha256(data).hexdigest() + "\n", encoding="ascii")
-            digest.chmod(0o600)
+            digest_data = hashlib.sha256(data).hexdigest() + "\n"
+            try:
+                fd = os.open(
+                    digest,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o400,
+                )
+            except FileExistsError:
+                if digest.read_text(encoding="ascii") != digest_data:
+                    return
+            else:
+                try:
+                    os.write(fd, digest_data.encode("ascii"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
     except OSError:
         return
 
@@ -2239,7 +2257,16 @@ def supervisor_route_call_limit(
         state = event.get("session_state")
         if not isinstance(state, dict):
             return {"result": "ALLOW"}
-        raw_count = state.get(_SUPERVISOR_ROUTE_COUNT_STATE_KEY, 0)
+        generation = current_attempt_generation(root_conversation_id)
+        state_key = (
+            _SUPERVISOR_ROUTE_COUNT_STATE_KEY
+            if generation == 1
+            else (
+                f"{_SUPERVISOR_ROUTE_COUNT_STATE_KEY}"
+                f":attempt-{generation}"
+            )
+        )
+        raw_count = state.get(state_key, 0)
         if (
             isinstance(raw_count, bool)
             or not isinstance(raw_count, int)
@@ -2258,7 +2285,7 @@ def supervisor_route_call_limit(
             "result": "ALLOW",
             "state_updates": [
                 {
-                    "key": _SUPERVISOR_ROUTE_COUNT_STATE_KEY,
+                    "key": state_key,
                     "action": "increment",
                     "value": 1,
                 }
@@ -2541,14 +2568,45 @@ def strict_cost_budget(
             )
         ):
             return {"result": "ALLOW"}
+        if event.get("type") == "request" and event.get("data") is not None:
+            activate_parent_attempt(
+                parent_session_id,
+                attempt_request_identity(event.get("data")),
+                new_request=True,
+            )
         snapshot = _stored_cost_snapshot(event, parent_session_id)
         if snapshot.get("available") is False:
             # The runner cannot observe canonical usage in-process. Allow this
             # evaluation to fall through to the server-side policy evaluation.
             return {"result": "ALLOW"}
-        cost = float(snapshot["total_usd"])
-        reported = float(snapshot["reported_usd"])
-        estimated = float(snapshot["estimated_unpriced_usd"])
+        observed_cost = float(snapshot["total_usd"])
+        observed_reported = float(snapshot["reported_usd"])
+        observed_estimated = float(snapshot["estimated_unpriced_usd"])
+        baseline = read_attempt_cost_baseline(parent_session_id)
+        if baseline is None:
+            if current_attempt_generation(parent_session_id) == 1:
+                baseline = initialize_attempt_cost_baseline(
+                    parent_session_id,
+                    reported_usd=0.0,
+                    estimated_unpriced_usd=0.0,
+                    cost_usd=0.0,
+                )
+            else:
+                baseline = initialize_attempt_cost_baseline(
+                    parent_session_id,
+                    reported_usd=observed_reported,
+                    estimated_unpriced_usd=observed_estimated,
+                    cost_usd=observed_cost,
+                )
+        cost = max(0.0, observed_cost - baseline["cost_usd"])
+        reported = max(
+            0.0,
+            observed_reported - baseline["reported_usd"],
+        )
+        estimated = max(
+            0.0,
+            observed_estimated - baseline["estimated_unpriced_usd"],
+        )
         route = _next_route(
             read_collections(parent_session_id=parent_session_id),
             parent_session_id=parent_session_id,
@@ -2591,6 +2649,9 @@ def strict_cost_budget(
                 denial_reason=denial_reason,
                 sessions=snapshot.get("sessions", []),
                 parent_session_id=parent_session_id,
+                observed_cost_usd=observed_cost,
+                observed_reported_usd=observed_reported,
+                observed_estimated_unpriced_usd=observed_estimated,
             )
         if denied:
             if authoritative:
