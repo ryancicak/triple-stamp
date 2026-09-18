@@ -2874,9 +2874,11 @@ def strict_cost_budget(
             )
         ):
             return {"result": "ALLOW"}
+        is_request = event.get("type") == "request"
+        harness = context.get("harness") if isinstance(context, dict) else None
         request_identity = (
             _top_level_request_identity(event.get("data"))
-            if event.get("type") == "request"
+            if is_request and not harness
             else ""
         )
         if request_identity:
@@ -2894,6 +2896,13 @@ def strict_cost_budget(
                         "before sending a new request"
                     ),
                 }
+        elif is_request:
+            # Native harness hooks re-evaluate REQUEST policy for the rendered
+            # prompt and for synthetic continuation/wake prompts. They are not
+            # new UI submissions and their wrapper text is not a stable request
+            # identity. Ensure the current generation exists without replacing
+            # the identity established by the server-side UI input gate.
+            activate_parent_attempt(parent_session_id, "")
         snapshot = _stored_cost_snapshot(event, parent_session_id)
         if snapshot.get("available") is False:
             # The runner cannot observe canonical usage in-process. Allow this

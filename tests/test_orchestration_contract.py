@@ -5635,6 +5635,62 @@ print("exact temp boundary: PASS")
         self.assertLess(outer.index("_sandboxed_auth_preflight("), outer.index("with _RunLock"))
         self.assertLess(outer.index("with _RunLock"), outer.index("_spawn_sandboxed("))
 
+    def test_sandbox_sigint_requests_shutdown_and_repeated_signal_escalates(
+        self,
+    ) -> None:
+        class Child:
+            pid = 12345
+
+            def __init__(self) -> None:
+                self.terminated = 0
+                self.killed = 0
+
+            def terminate(self) -> None:
+                self.terminated += 1
+
+            def kill(self) -> None:
+                self.killed += 1
+
+        child = Child()
+        with mock.patch.object(launcher.os, "killpg") as killpg:
+            launcher._signal_sandbox_child(
+                child,
+                launcher.signal.SIGINT,
+                force=False,
+            )
+            killpg.assert_called_once_with(
+                child.pid,
+                launcher.signal.SIGTERM,
+            )
+            killpg.reset_mock()
+            launcher._signal_sandbox_child(
+                child,
+                launcher.signal.SIGINT,
+                force=True,
+            )
+            killpg.assert_called_once_with(
+                child.pid,
+                launcher.signal.SIGKILL,
+            )
+
+        with mock.patch.object(
+            launcher.os,
+            "killpg",
+            side_effect=PermissionError,
+        ):
+            launcher._signal_sandbox_child(
+                child,
+                launcher.signal.SIGINT,
+                force=False,
+            )
+            launcher._signal_sandbox_child(
+                child,
+                launcher.signal.SIGINT,
+                force=True,
+            )
+        self.assertEqual(child.terminated, 1)
+        self.assertEqual(child.killed, 1)
+
     def test_concurrent_launch_lock_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             lock_path = Path(value) / "run.lock"
@@ -9857,6 +9913,104 @@ print("exact temp boundary: PASS")
                 ["first-question evidence"],
             )
 
+    def test_first_ui_request_and_native_hook_reach_opus_without_denial(
+        self,
+    ) -> None:
+        parent = "first-ui-request-parent"
+        zero_cost = {
+            "available": True,
+            "source": "fixture",
+            "total_usd": 0.0,
+            "reported_usd": 0.0,
+            "estimated_unpriced_usd": 0.0,
+            "sessions": [],
+        }
+        ui_request = {
+            "type": "request",
+            "data": {
+                "user_content": "What is 2 + 2?",
+                "attachments": [],
+            },
+            "context": {
+                "conversation_id": parent,
+                "root_conversation_id": parent,
+                "harness": None,
+            },
+        }
+        native_hook = {
+            **ui_request,
+            "data": {
+                "user_content": (
+                    "Rendered supervisor prompt that differs from the UI text"
+                ),
+                "attachments": [],
+            },
+            "context": {
+                **ui_request["context"],
+                "harness": "claude-sdk",
+            },
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ), mock.patch.object(
+            plugin,
+            "_stored_cost_snapshot",
+            return_value=zero_cost,
+        ):
+            budget = plugin.strict_cost_budget(50.0)
+            self.assertEqual(budget(ui_request)["result"], "ALLOW")
+            first_identity = plugin._top_level_request_identity(
+                ui_request["data"]
+            )
+            self.assertEqual(budget(native_hook)["result"], "ALLOW")
+            state = json.loads(
+                runtime_state._attempt_state_path(
+                    Path(value),
+                    parent,
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["request_identity"], first_identity)
+
+            cursor = {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "suggested_customer_answer_draft: 4",
+                ),
+                "parent_session_id": parent,
+            }
+            runtime_state.append_dispatch(cursor)
+            runtime_state.append_collection(cursor)
+            route = plugin._next_route(
+                runtime_state.read_attempt_collections(parent),
+                parent_session_id=parent,
+            )
+            self.assertEqual(
+                (route.agent, route.title),
+                ("opus_auditor", "audit-cycle-1"),
+            )
+            decision = plugin.supervisor_contract(enabled=True)(
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "name": "sys_session_send",
+                        "arguments": {
+                            "agent": "opus_auditor",
+                            "title": "audit-cycle-1",
+                            "args": {"input": "audit Cursor evidence"},
+                        },
+                    },
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                }
+            )
+            self.assertEqual(decision["result"], "ALLOW")
+            self.assertEqual(runtime_state.current_attempt_generation(parent), 1)
+
     def test_child_wakes_and_late_cursor_never_discard_inflight_audit(
         self,
     ) -> None:
@@ -9965,18 +10119,12 @@ print("exact temp boundary: PASS")
             )
             # Claude SDK request hooks wrap both completion wakes and empty
             # supervisor continuations in prompt text that is not guaranteed
-            # to begin with the synthetic marker. A nonterminal attempt owns
-            # its generation despite those changing wrappers.
+            # to retain a synthetic marker. Their stamped harness provenance,
+            # rather than unstable wrapper prose, keeps them in the active
+            # generation.
             for synthetic_prompt in (
-                (
-                    "Supervisor wrapper around completed cursor-cycle-1\n"
-                    "[System: sub-agent task child completed — "
-                    "cursor_workhorse:cursor-cycle-1 returned: 4]"
-                ),
-                (
-                    "Supervisor wrapper around empty continuation turn\n"
-                    "TRIPLE_STAMP_NONTERMINAL_CONTINUATION"
-                ),
+                "Supervisor wrapper around completed cursor-cycle-1",
+                "Supervisor wrapper around empty continuation turn",
             ):
                 self.assertEqual(
                     budget(
@@ -9985,6 +10133,10 @@ print("exact temp boundary: PASS")
                             "data": {
                                 "user_content": synthetic_prompt,
                                 "attachments": [],
+                            },
+                            "context": {
+                                **request["context"],
+                                "harness": "claude-sdk",
                             },
                         }
                     )["result"],

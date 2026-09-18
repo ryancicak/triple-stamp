@@ -2299,10 +2299,15 @@ def _spawn_sandboxed(
 
     def forward(signum: int, _frame: object) -> None:
         nonlocal received_signal, stop_deadline
-        received_signal = signum
-        stop_deadline = time.monotonic() + STOP_GRACE_SECONDS
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(child.pid, signum)
+        force = received_signal is not None
+        if received_signal is None:
+            received_signal = signum
+        stop_deadline = (
+            time.monotonic()
+            if force
+            else time.monotonic() + STOP_GRACE_SECONDS
+        )
+        _signal_sandbox_child(child, signum, force=force)
 
     old_handlers = {
         signum: signal.signal(signum, forward)
@@ -2332,6 +2337,32 @@ def _spawn_sandboxed(
         )
         return 128 + received_signal
     return return_code
+
+
+def _signal_sandbox_child(
+    child: subprocess.Popen[bytes],
+    signum: int,
+    *,
+    force: bool,
+) -> None:
+    """Forward shutdown signals, escalating a repeated interrupt immediately."""
+
+    forwarded = (
+        signal.SIGKILL
+        if force
+        else signal.SIGTERM
+        if signum == signal.SIGINT
+        else signum
+    )
+    try:
+        os.killpg(child.pid, forwarded)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        if force:
+            child.kill()
+        else:
+            child.terminate()
 
 
 def _record_external_signal(run_dir: Path, signum: int) -> None:
