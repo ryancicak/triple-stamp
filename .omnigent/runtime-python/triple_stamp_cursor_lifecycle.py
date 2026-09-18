@@ -26,6 +26,8 @@ _CURSOR_POST_CLAIM_S = 30.0
 _INBOX_TIME_CONTRACT_S = 5.0
 _CURSOR_PARENT_WAKE_RETRY_BASE_S = 1.0
 _CURSOR_PARENT_WAKE_RETRY_MAX_S = 30.0
+_CURSOR_PARENT_WAKE_MAX_ATTEMPTS = 5
+_CURSOR_PARENT_WAKE_DEADLINE_S = 180.0
 _NO_OUTPUT = "[System: sub-agent completed with no output]"
 _PENDING_PREFIX = "[System: sub-agent task pending —"
 _MISSING_PARENT_INBOX = "Error: sys_session_send requires parent session inbox"
@@ -75,13 +77,21 @@ async def _retry_cursor_parent_wake(
     notice: str,
     created_by: str | None,
 ) -> None:
-    """Retry one already-queued Cursor completion until its parent wakes."""
+    """Retry one queued Cursor completion, then terminalize if unreachable."""
 
     from omnigent.runner import app as runner_app
-    from triple_stamp_runtime_state import mutate_cursor_lifecycle
+    from triple_stamp_runtime_state import (
+        mutate_cursor_lifecycle,
+        read_dispatches,
+        record_terminal_failure,
+    )
 
     attempts = 0
-    while True:
+    started = time.monotonic()
+    while (
+        attempts < _CURSOR_PARENT_WAKE_MAX_ATTEMPTS
+        and time.monotonic() - started < _CURSOR_PARENT_WAKE_DEADLINE_S
+    ):
         attempts += 1
         try:
             delivered = await runner_app._deliver_subagent_wake_post(
@@ -107,11 +117,110 @@ async def _retry_cursor_parent_wake(
         mutate_cursor_lifecycle(child_session_id, work_id, observe)
         if delivered:
             return
+        elapsed = time.monotonic() - started
+        if (
+            attempts >= _CURSOR_PARENT_WAKE_MAX_ATTEMPTS
+            or elapsed >= _CURSOR_PARENT_WAKE_DEADLINE_S
+        ):
+            break
         delay = min(
             _CURSOR_PARENT_WAKE_RETRY_BASE_S * (2 ** min(attempts - 1, 8)),
             _CURSOR_PARENT_WAKE_RETRY_MAX_S,
+            max(0.0, _CURSOR_PARENT_WAKE_DEADLINE_S - elapsed),
         )
         await _cursor_parent_wake_retry_sleep(delay)
+
+    dispatch = next(
+        (
+            record
+            for record in reversed(read_dispatches())
+            if record.get("child_session_id") == child_session_id
+            and record.get("work_id") == work_id
+        ),
+        {},
+    )
+    reason = (
+        "Cursor parent wake exhausted its bounded recovery "
+        f"(attempts={attempts}, deadline_s={_CURSOR_PARENT_WAKE_DEADLINE_S:.0f}); "
+        "the terminal packet remains queued locally"
+    )
+    failure = record_terminal_failure(
+        "PIPELINE_INFRASTRUCTURE_ERROR",
+        reason,
+        stage=str(dispatch.get("title") or "cursor-parent-wake"),
+        cycle=int(dispatch.get("cycle") or 0),
+        parent_session_id=parent_session_id,
+    )
+    parent_events = runner_app._session_event_queues_ref.setdefault(
+        parent_session_id,
+        asyncio.Queue(),
+    )
+    parent_events.put_nowait(
+        {
+            "type": "session.status",
+            "status": "failed",
+            "error": {
+                "type": "CursorParentWakeExhausted",
+                "message": failure,
+            },
+        }
+    )
+    inbox = ensure_parent_inbox(parent_session_id)
+    queued = False
+    for packet in tuple(inbox._queue):  # type: ignore[attr-defined]
+        if (
+            isinstance(packet, dict)
+            and packet.get("work_id") == work_id
+            and packet.get("conversation_id") == child_session_id
+        ):
+            packet["status"] = "failed"
+            packet["output"] = failure
+            queued = True
+            break
+    entry = runner_app.get_subagent_work(child_session_id)
+    if entry is not None:
+        entry.status = "failed"
+        entry.output = failure
+        entry.completed_at = time.time()
+        entry.delivered = True
+    if not queued:
+        inbox.put_nowait(
+            {
+                "type": "sub_agent",
+                "work_id": work_id,
+                "task_id": child_session_id,
+                "handle_id": child_session_id,
+                "conversation_id": child_session_id,
+                "tool_name": (
+                    entry.agent if entry is not None else "cursor_workhorse"
+                ),
+                "agent": (
+                    entry.agent if entry is not None else "cursor_workhorse"
+                ),
+                "title": (
+                    entry.title
+                    if entry is not None
+                    else str(dispatch.get("title") or "")
+                ),
+                "status": "failed",
+                "output": failure,
+            }
+        )
+
+    def terminalize(
+        generation: dict[str, Any],
+        _state: dict[str, Any],
+    ) -> None:
+        generation["parent_wake_attempts"] = attempts
+        generation["parent_wake_pending"] = False
+        generation["parent_wake_exhausted"] = True
+        generation["parent_notification_queued"] = True
+        generation["delivery_committed"] = False
+        generation["terminal_status"] = "failed"
+        generation["terminal_output"] = failure
+        generation["terminal_phase"] = "wake_exhausted"
+
+    mutate_cursor_lifecycle(child_session_id, work_id, terminalize)
 
 
 def _schedule_cursor_parent_wake_retry(

@@ -959,6 +959,7 @@ class CursorLifecycleTests(unittest.TestCase):
             runtime_state.mutate_cursor_lifecycle(child, work_id, ready)
             runner_app.unregister_subagent_work(child)
             runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
             client = _MissingWorkClient(child, missing_attempts=2)
             wake = mock.AsyncMock(side_effect=[False, False, True])
 
@@ -1010,6 +1011,107 @@ class CursorLifecycleTests(unittest.TestCase):
             finally:
                 runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)
+
+    def test_permanent_parent_wake_failure_terminalizes_without_loop(
+        self,
+    ) -> None:
+        parent = "permanent-wake-failure-parent"
+        child = "permanent-wake-failure-child"
+        work_id = "permanent-wake-failure-work"
+        initial_output = (
+            "CURSOR_WORKER_FAILED: Cursor turn ended with status error; "
+            'recovered_assistant_output="Python printed `4`."'
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            self._dispatch(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+                title="cursor-cycle-1",
+            )
+
+            def ready(
+                generation: dict[str, object],
+                _state: dict[str, object],
+            ) -> None:
+                generation["terminal_status"] = "failed"
+                generation["terminal_output"] = initial_output
+                generation["terminal_phase"] = "ready"
+
+            runtime_state.mutate_cursor_lifecycle(child, work_id, ready)
+            runner_app.unregister_subagent_work(child)
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            client = _MissingWorkClient(child, missing_attempts=2)
+            wake = mock.AsyncMock(return_value=False)
+
+            async def deliver_and_wait_for_terminal() -> None:
+                await _native_post_delivery.post_external_session_status(
+                    client,
+                    session_id=child,
+                    status="idle",
+                )
+                retry = lifecycle._cursor_parent_wake_tasks[parent]
+                await asyncio.wait_for(retry, timeout=1.0)
+                await asyncio.sleep(0)
+
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    wake,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_cursor_parent_wake_retry_sleep",
+                    mock.AsyncMock(return_value=None),
+                ), mock.patch.object(
+                    lifecycle,
+                    "_CURSOR_PARENT_WAKE_MAX_ATTEMPTS",
+                    2,
+                ):
+                    asyncio.run(deliver_and_wait_for_terminal())
+
+                entry = runner_app.get_subagent_work(child)
+                self.assertIsNotNone(entry)
+                assert entry is not None
+                self.assertEqual(entry.status, "failed")
+                self.assertTrue(entry.delivered)
+                inbox = runner_app._session_inboxes_ref[parent]
+                self.assertEqual(inbox.qsize(), 1)
+                packet = inbox.get_nowait()
+                self.assertEqual(packet["status"], "failed")
+                self.assertTrue(
+                    str(packet["output"]).startswith(
+                        "PIPELINE_INFRASTRUCTURE_ERROR:"
+                    )
+                )
+                state = runtime_state.read_cursor_lifecycle(child, work_id)
+                self.assertFalse(state["delivery_committed"])
+                self.assertFalse(state["parent_wake_pending"])
+                self.assertTrue(state["parent_wake_exhausted"])
+                self.assertTrue(state["parent_notification_queued"])
+                self.assertEqual(state["parent_wake_attempts"], 2)
+                self.assertTrue(runtime_state.read_terminal_failure(parent))
+                parent_events = runner_app._session_event_queues_ref[parent]
+                self.assertEqual(parent_events.qsize(), 1)
+                parent_notice = parent_events.get_nowait()
+                self.assertEqual(parent_notice["type"], "session.status")
+                self.assertEqual(parent_notice["status"], "failed")
+                self.assertTrue(
+                    str(parent_notice["error"]["message"]).startswith(  # type: ignore[index]
+                        "PIPELINE_INFRASTRUCTURE_ERROR:"
+                    )
+                )
+                self.assertEqual(wake.await_count, 3)
+                self.assertNotIn(parent, lifecycle._cursor_parent_wake_tasks)
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+                runner_app._session_event_queues_ref.pop(parent, None)
 
     def test_inbox_time_contract_is_far_below_transport_timeout(self) -> None:
         self.assertEqual(lifecycle._CURSOR_STAGE_INACTIVITY_S, 5 * 60)
