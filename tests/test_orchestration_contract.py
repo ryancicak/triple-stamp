@@ -534,7 +534,7 @@ class OrchestrationContractTests(unittest.TestCase):
         )
         self.assertIn("At most two web hops for each", prompt)
 
-    def test_final_response_policy_never_gates_tool_calls(self) -> None:
+    def test_final_response_policy_gates_only_second_paid_retry(self) -> None:
         contract = plugin.supervisor_contract(enabled=True)
         calls = (
             {
@@ -566,6 +566,31 @@ class OrchestrationContractTests(unittest.TestCase):
             side_effect=OSError("ledger unavailable"),
         ):
             self.assertEqual(contract(calls[0])["result"], "ALLOW")
+        first_retry = {
+            "type": "tool_call",
+            "data": {
+                "name": "mcp__omnigent__sys_session_send",
+                "arguments": {
+                    "agent": "opus_auditor",
+                    "title": "audit-retry-1-1",
+                    "args": {"input": "fresh retry"},
+                },
+            },
+        }
+        second_retry = {
+            **first_retry,
+            "data": {
+                **first_retry["data"],
+                "arguments": {
+                    **first_retry["data"]["arguments"],
+                    "title": "audit-retry-1-2",
+                },
+            },
+        }
+        self.assertEqual(contract(first_retry)["result"], "ALLOW")
+        denied = contract(second_retry)
+        self.assertEqual(denied["result"], "DENY")
+        self.assertIn("Only one paid transient Opus retry", denied["reason"])
 
     def test_voice_profile_digest_propagates_current_bytes(self) -> None:
         required = (
@@ -4932,6 +4957,110 @@ print("exact temp boundary: PASS")
             self.assertFalse(runtime_state.attest_codex_stamp(payload))
             self.assertFalse((Path(value) / "stamp-attestation.json").exists())
 
+    def test_malformed_audit_cannot_fabricate_stamp_or_best_effort(self) -> None:
+        """Exact POC: completed audit title plus `not json` is not evidence."""
+
+        parent = "malformed-audit-parent"
+        answer = "Fabricated approval despite malformed audit."
+        judge = {
+            **_route_packet(
+                "codex_judge",
+                "judge-cycle-1",
+                json.dumps(
+                    {
+                        "verdict": "STAMP",
+                        "needs_web": False,
+                        "needs_internal": False,
+                        "gap_materiality": "none",
+                        "limitations": [],
+                        "citations_that_hold": ["invalid audit title only"],
+                        "voice_profile_check": {
+                            "source_path": "",
+                            "sha256": "",
+                        },
+                        "shippable_answer": answer,
+                    }
+                ),
+            ),
+            "parent_session_id": parent,
+        }
+        records = [
+            {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "2 + 2 = 4",
+                ),
+                "parent_session_id": parent,
+            },
+            {
+                **_route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    "not json",
+                ),
+                "parent_session_id": parent,
+            },
+            judge,
+        ]
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            for record in records:
+                runtime_state.append_collection(record)
+            self.assertFalse(plugin._has_required_stage_chain(records, 1))
+            self.assertFalse(runtime_state.attest_codex_stamp(judge))
+            self.assertEqual(
+                runtime_state.record_best_effort_answer(
+                    answer,
+                    records,
+                    cycle=1,
+                    reason="must not attest malformed audit",
+                    parent_session_id=parent,
+                ),
+                "",
+            )
+            decision = plugin.supervisor_contract(enabled=True)(
+                {
+                    "type": "response",
+                    "data": answer,
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                }
+            )
+            self.assertEqual(decision["result"], "DENY")
+            attempt = (
+                Path(value)
+                / ".triple-stamp-attempts"
+                / hashlib.sha256(parent.encode()).hexdigest()[:16]
+                / "current"
+                / "terminal"
+            )
+            self.assertFalse(attempt.exists())
+            for artifact in (
+                "stamped-answer.bin",
+                "stamp-attestation.json",
+                "best-effort-answer.bin",
+                "best-effort-attestation.json",
+                "pipeline-terminal",
+            ):
+                self.assertFalse(
+                    runtime_state._parent_artifact_path(
+                        Path(value),
+                        artifact,
+                        parent,
+                    ).exists()
+                )
+
     def test_infrastructure_failure_needs_worker_provenance(self) -> None:
         text = "PIPELINE_INFRASTRUCTURE_ERROR: Cursor failed"
         with tempfile.TemporaryDirectory() as empty_value, mock.patch.dict(
@@ -5100,6 +5229,111 @@ print("exact temp boundary: PASS")
                 self.assertEqual(
                     launcher._validated_pipeline_exit(run, 0, ["-p", "prompt"]),
                     launcher.EXIT_PIPELINE,
+                )
+
+    def test_launcher_exit_accepts_retry_stamp_and_best_effort(self) -> None:
+        """Both terminal validators accept the one valid retry audit title."""
+
+        off = {
+            "TRIPLE_STAMP_VOICE_PROFILE": "",
+            "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+        }
+        stamp_answer = "Retry-backed stamped answer."
+        stamp = json.dumps(
+            {
+                "verdict": "STAMP",
+                "needs_web": False,
+                "needs_internal": False,
+                "gap_materiality": "none",
+                "limitations": [],
+                "citations_that_hold": ["retry audit evidence"],
+                "voice_profile_check": {
+                    "source_path": "",
+                    "sha256": "",
+                },
+                "shippable_answer": stamp_answer,
+            }
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {**off, "TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            run = Path(value)
+            records = [
+                _route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "cursor evidence",
+                ),
+                self._dead_opus("audit-cycle-1"),
+                _route_packet(
+                    "opus_auditor",
+                    "audit-retry-1-1",
+                    _audit("PASS"),
+                ),
+            ]
+            judge = _route_packet(
+                "codex_judge",
+                "judge-cycle-1",
+                stamp,
+            )
+            for record in (*records, judge):
+                runtime_state.append_collection(record)
+            self.assertTrue(runtime_state.attest_codex_stamp(judge))
+            with mock.patch.object(launcher, "_eprint"):
+                self.assertEqual(
+                    launcher._validated_pipeline_exit(
+                        run,
+                        0,
+                        ["-p", "prompt"],
+                    ),
+                    0,
+                )
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {**off, "TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            run = Path(value)
+            records = [
+                _route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "bounded customer answer",
+                ),
+                self._dead_opus("audit-cycle-1"),
+                _route_packet(
+                    "opus_auditor",
+                    "audit-retry-1-1",
+                    _audit("PASS_WITH_GAPS"),
+                ),
+                _route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    _judgment("REWORK"),
+                ),
+            ]
+            for record in records:
+                runtime_state.append_collection(record)
+            self.assertEqual(
+                runtime_state.record_best_effort_answer(
+                    "bounded customer answer",
+                    records,
+                    cycle=1,
+                    reason="bounded retry-backed answer",
+                ),
+                "bounded customer answer",
+            )
+            with mock.patch.object(launcher, "_eprint"):
+                self.assertEqual(
+                    launcher._validated_pipeline_exit(
+                        run,
+                        0,
+                        ["-p", "prompt"],
+                    ),
+                    0,
                 )
 
     def test_attested_answer_emission_preserves_exact_bytes_and_framing(self) -> None:
@@ -5620,27 +5854,63 @@ print("exact temp boundary: PASS")
         self.assertFalse(plugin._is_transient_opus_stream_error(unknown))
 
     def test_incomplete_opus_output_is_never_audit_evidence(self) -> None:
-        """A truncated audit with a valid-looking verdict is never usable evidence."""
+        """A failed stream cannot turn a valid-looking body into evidence."""
 
-        truncated = (
-            _audit("PASS")
-            + "\n\nAPI Error: Server error mid-response. The response above may "
-            "be incomplete."
-        )
-        self.assertIsNone(plugin._valid_audit(truncated))
-        payload, validation = plugin._audit_payload_and_validation(truncated)
-        self.assertIsNone(payload)
-        self.assertIsNone(validation)
-        # A completed packet carrying truncated output routes to a fresh retry,
-        # never to the judge and never adjudicated as PASS.
+        truncated = _audit("PASS")
         records = [
             _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
-            _route_packet("opus_auditor", "audit-cycle-1", truncated, child="opus-1"),
+            dict(
+                _route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    truncated,
+                    child="opus-1",
+                ),
+                status="failed",
+                stream_error=(
+                    "API Error: Server error mid-response. The response above "
+                    "may be incomplete."
+                ),
+            ),
         ]
         route = plugin._next_route(records)
         self.assertEqual(
             (route.status, route.agent, route.title),
             ("dispatch", "opus_auditor", "audit-retry-1-1"),
+        )
+        self.assertFalse(plugin._has_required_stage_chain(records, 1))
+
+    def test_valid_audit_prose_about_http_500_is_not_stream_truncation(self) -> None:
+        """Provider-error analysis inside a valid audit is ordinary evidence."""
+
+        audit = _audit(
+            "PASS_WITH_GAPS",
+            attack=(
+                "The earlier HTTP 500 internal server error was transient; "
+                "the completed response is valid."
+            ),
+        )
+        record = _route_packet(
+            "opus_auditor",
+            "audit-cycle-1",
+            audit,
+            child="opus-valid-http-analysis",
+        )
+        self.assertIsNotNone(plugin._valid_audit(audit))
+        self.assertFalse(plugin._is_transient_opus_stream_error(record))
+        route = plugin._next_route(
+            [
+                _route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "CURSOR-1",
+                ),
+                record,
+            ]
+        )
+        self.assertEqual(
+            (route.status, route.agent, route.title),
+            ("dispatch", "codex_judge", "judge-cycle-1"),
         )
 
     def test_completed_retry_audit_routes_like_normal_audit(self) -> None:
@@ -5661,15 +5931,10 @@ print("exact temp boundary: PASS")
             (route.agent, route.title), ("codex_judge", "judge-cycle-1")
         )
         self.assertTrue(plugin._has_required_stage_chain(records, 1))
-        self.assertEqual(
-            runtime_state.parse_dispatch_title("audit-retry-1-2"),
-            {
-                "stage_id": "audit_retry",
-                "cycle": 1,
-                "hop": 2,
-                "requester": "opus",
-            },
+        self.assertIsNone(
+            runtime_state.parse_dispatch_title("audit-retry-1-2")
         )
+        self.assertIsNone(plugin._stage("audit-retry-1-2"))
 
     def test_transient_opus_failure_is_recoverable_worker_state(self) -> None:
         """A transient Opus death is terminal only after its retry budget is spent."""
@@ -6357,6 +6622,111 @@ print("exact temp boundary: PASS")
             self.assertIn(
                 (value, "parent", 1),
                 supervisor_runtime._NARRATED_STAGES,
+            )
+
+    def test_two_empty_supervisor_turns_still_dispatch_pending_cursor(
+        self,
+    ) -> None:
+        """Recoverable empty routing turns never become a user-visible failure."""
+
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import ToolCallRequest, TurnComplete
+
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        calls = 0
+        parent = "empty-turn-parent"
+
+        async def scripted(
+            _self: object,
+            _messages: object,
+            _tools: object,
+            _system_prompt: object,
+            _config: object = None,
+        ):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                yield TurnComplete(response="")
+                return
+            yield ToolCallRequest(
+                name="mcp__omnigent__sys_session_send",
+                args={
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                },
+            )
+            runtime_state.append_dispatch(
+                {
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                    "child_session_id": "cursor-child",
+                    "work_id": "cursor-work",
+                    "parent_session_id": parent,
+                }
+            )
+            yield TurnComplete(response="")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    [
+                        {
+                            "role": "user",
+                            "content": "2 + 2 = ?",
+                            "session_id": parent,
+                        }
+                    ],
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "empty-turn-fixture",
+            },
+            clear=False,
+        ):
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+            self.assertEqual(calls, 3)
+            self.assertTrue(
+                any(
+                    isinstance(event, ToolCallRequest)
+                    and event.args.get("title") == "cursor-cycle-1"
+                    for event in events
+                )
+            )
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                [
+                    row["action"]
+                    for row in runtime_state.read_supervisor_continuations(parent)
+                ],
+                [
+                    "continuation_enqueued",
+                    "continuation_enqueued",
+                    "ordinary_response_suppressed",
+                ],
+            )
+            self.assertNotIn(
+                "continuation denied",
+                " ".join(
+                    str(getattr(event, "response", ""))
+                    for event in events
+                ).lower(),
             )
 
     def test_later_cursor_cycle_cannot_claim_prior_single_transcript(self) -> None:
@@ -7197,7 +7567,12 @@ print("exact temp boundary: PASS")
             clear=False,
         ):
             for form, stage_id, requester, has_hop in forms:
-                for cycle, hop in ((1, 1), (4, 2)):
+                boundaries = (
+                    ((1, 1), (4, 1))
+                    if stage_id == "audit_retry"
+                    else ((1, 1), (4, 2))
+                )
+                for cycle, hop in boundaries:
                     title = form.format(cycle=cycle, hop=hop)
                     with self.subTest(title=title):
                         runtime_state.append_dispatch(
@@ -7241,6 +7616,8 @@ print("exact temp boundary: PASS")
                             form.format(cycle=1, hop=3),
                         }
                     )
+                    if _stage_id == "audit_retry":
+                        malformed.add(form.format(cycle=1, hop=2))
             for title in sorted(malformed):
                 with self.subTest(malformed=title):
                     self.assertIsNone(runtime_state.parse_dispatch_title(title))
@@ -7544,16 +7921,10 @@ print("exact temp boundary: PASS")
             [""],
         )
 
-    def test_terminal_failure_reads_as_text_and_stops_the_pipeline(self) -> None:
-        """run-4gqa_fil showed the reader a bare red "Something went wrong".
-
-        An ExecutorError is the one terminal shape the UI cannot render as text,
-        so the actual reason stayed in `terminal-failure.txt` where nobody
-        looked. Worse, nothing consulted that file again: the run kept working
-        for ten more minutes past its own death notice, completing a whole
-        `cursor-cycle-2` and dispatching an `audit-cycle-2` that was then killed
-        mid-tool-call.
-        """
+    def test_empty_supervisor_exhaustion_abstains_without_terminal_failure(
+        self,
+    ) -> None:
+        """Empty routing turns leave a recoverable route open and invisible."""
 
         from omnigent.inner import claude_sdk_executor
         from omnigent.inner.executor import (
@@ -7573,9 +7944,6 @@ print("exact temp boundary: PASS")
             _system_prompt: object,
             _config: object = None,
         ):
-            # A supervisor that answers instead of routing, twice. This is the
-            # remaining genuinely unrecoverable case: nothing was dispatched, so
-            # unlike a misroute there is no in-flight work that can self-heal.
             nonlocal turns
             turns += 1
             yield TextChunk("here is my own answer, which is never allowed")
@@ -7618,8 +7986,6 @@ print("exact temp boundary: PASS")
             try:
                 supervisor_runtime.install_supervisor_continuation_guard()
                 failing = asyncio.run(collect())
-                turns_at_failure = turns
-                # An in-flight child still wakes the loop once after the run died.
                 after = asyncio.run(collect())
             finally:
                 claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
@@ -7632,27 +7998,25 @@ print("exact temp boundary: PASS")
             ]
             dispatches_after = len(runtime_state.read_dispatches())
 
-        # The reader gets the real reason as text, never an error event, and
-        # never the supervisor's own attempt at an answer.
+        # Neither the supervisor's prose nor a fabricated infrastructure error
+        # reaches the reader. A later wake may retry the still-open route.
         self.assertFalse(any(isinstance(event, ExecutorError) for event in failing))
         streamed = "".join(
             event.text for event in failing if isinstance(event, TextChunk)
         )
         self.assertNotIn("here is my own answer", streamed)
-        self.assertTrue(streamed.startswith("PIPELINE_INFRASTRUCTURE_ERROR:"))
-        self.assertEqual(streamed, recorded)
-        self.assertIn("judge-cycle-1", streamed)
+        self.assertEqual(streamed, "")
+        self.assertEqual(recorded, "")
         self.assertEqual(
             [
                 event.response
                 for event in failing
                 if isinstance(event, TurnComplete)
             ],
-            [recorded],
+            [""],
         )
 
-        # The next wake costs no model turn, no dispatch, and no second copy.
-        self.assertEqual(turns, turns_at_failure)
+        self.assertEqual(turns, 6)
         self.assertEqual(dispatches_after, 0)
         self.assertFalse(any(isinstance(event, TextChunk) for event in after))
         self.assertEqual(
@@ -7660,14 +8024,16 @@ print("exact temp boundary: PASS")
             [""],
         )
         self.assertEqual(
-            sum(
-                1
-                for action in actions
-                if action in supervisor_runtime._TERMINAL_RELAY_ACTIONS
-            ),
-            1,
+            actions,
+            [
+                "continuation_enqueued",
+                "continuation_enqueued",
+                "continuation_exhausted_abstained",
+                "continuation_enqueued",
+                "continuation_enqueued",
+                "continuation_exhausted_abstained",
+            ],
         )
-        self.assertIn("terminal_failure_suppressed", actions)
 
     def test_supervisor_abstains_after_recorded_dispatch_observer_failure(
         self,
@@ -8830,6 +9196,148 @@ print("exact temp boundary: PASS")
             self.assertEqual(
                 best_effort_path.read_bytes(),
                 immutable_best_effort,
+            )
+
+    def test_child_wakes_and_late_cursor_never_discard_inflight_audit(
+        self,
+    ) -> None:
+        """Regression for run-o5qy5w05's 2+2 attempt-generation churn."""
+
+        parent = "live-abort-regression-parent"
+        zero_cost = {
+            "available": True,
+            "source": "fixture",
+            "total_usd": 0.0,
+            "reported_usd": 0.0,
+            "estimated_unpriced_usd": 0.0,
+            "sessions": [],
+        }
+        request = {
+            "type": "request",
+            "data": {
+                "user_content": "2 + 2 = ?",
+                "attachments": [],
+            },
+            "context": {
+                "conversation_id": parent,
+                "root_conversation_id": parent,
+            },
+        }
+        wake = {
+            **request,
+            "data": {
+                "user_content": (
+                    "[System: sub-agent task child completed — "
+                    "cursor_workhorse:cursor-cycle-1 returned: 4]"
+                ),
+                "attachments": [],
+            },
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ), mock.patch.object(
+            plugin,
+            "_stored_cost_snapshot",
+            return_value=zero_cost,
+        ):
+            budget = plugin.strict_cost_budget(50.0)
+            self.assertEqual(budget(request)["result"], "ALLOW")
+            self.assertEqual(
+                runtime_state.current_attempt_generation(parent),
+                1,
+            )
+            # The executor guard only ensures the request policy's generation;
+            # it never derives a new identity from synthetic wake messages.
+            self.assertEqual(
+                runtime_state.activate_parent_attempt(parent, ""),
+                1,
+            )
+
+            cursor = {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "4",
+                ),
+                "parent_session_id": parent,
+            }
+            runtime_state.append_dispatch(cursor)
+            runtime_state.append_collection(cursor)
+            audit = {
+                **_route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS_WITH_GAPS"),
+                ),
+                "parent_session_id": parent,
+            }
+            runtime_state.append_dispatch(audit)
+
+            self.assertEqual(budget(wake)["result"], "ALLOW")
+            self.assertEqual(
+                runtime_state.current_attempt_generation(parent),
+                1,
+            )
+            self.assertEqual(
+                supervisor_runtime._attempt_request_identity(
+                    [
+                        {
+                            "role": "user",
+                            "content": wake["data"]["user_content"],
+                        }
+                    ]
+                ),
+                "",
+            )
+
+            late_cursor = {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "",
+                    child="late-cursor",
+                ),
+                "parent_session_id": parent,
+                "status": "failed",
+            }
+            runtime_state.append_collection(late_cursor)
+            records = runtime_state.read_collections(parent)
+            self.assertEqual(len(records), 2)
+            route = plugin._next_route(
+                records,
+                parent_session_id=parent,
+            )
+            self.assertEqual(
+                (route.status, route.agent, route.title),
+                ("dispatch", "opus_auditor", "audit-cycle-1"),
+            )
+            self.assertTrue(
+                plugin._route_dispatch_pending(
+                    route,
+                    records,
+                    runtime_state.read_dispatches(parent),
+                    parent_session_id=parent,
+                )
+            )
+
+            runtime_state.append_collection(audit)
+            records = runtime_state.read_collections(parent)
+            route = plugin._next_route(
+                records,
+                parent_session_id=parent,
+            )
+            self.assertEqual(
+                (route.status, route.agent, route.title),
+                ("dispatch", "codex_judge", "judge-cycle-1"),
+            )
+            self.assertFalse(
+                runtime_state._parent_artifact_path(
+                    Path(value),
+                    "terminal-failure.txt",
+                    parent,
+                ).exists()
             )
 
     def test_same_chat_reask_invokes_model_before_old_failure_relay(

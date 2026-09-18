@@ -145,12 +145,9 @@ _OPUS_AUDIT_KINDS = frozenset(
         "audit_repair_web",
     }
 )
-# Lower-cased substrings that mark a transient, platform-side Opus stream death:
-# the native Claude process began (or completed) a turn whose response the model
-# provider cut off mid-stream. These are distinct from a genuine worker failure
-# (a native timeout, a pin/harness break, or empty output), which stays
-# terminal. Detection is marker-based so a plain "native timeout" is never
-# misclassified as recoverable.
+# Lower-cased substrings that mark a transient, platform-side Opus stream death
+# in a launch/error envelope. They never override a semantically valid completed
+# audit merely because its analysis discusses one of these provider errors.
 _TRANSIENT_OPUS_STREAM_MARKERS = (
     "server error mid-response",
     "the response above may be incomplete",
@@ -172,9 +169,7 @@ _TRANSIENT_OPUS_STREAM_MARKERS = (
 # second transient death (on that retry) is terminal infrastructure failure.
 # The bound is deliberately conservative: every retry is a paid Opus launch, and
 # a single fresh child recovers the overwhelmingly common one-off provider blip
-# without risking repeated spend on a persistently failing provider. The title
-# grammar still admits hop 2 so the cap can be raised by this one constant with
-# no title or parser change.
+# without risking repeated spend on a persistently failing provider.
 _OPUS_TRANSIENT_RETRY_CAP = 1
 
 
@@ -190,13 +185,28 @@ def _has_incomplete_stream_marker(text: object) -> bool:
 def _is_transient_opus_stream_error(record: dict[str, Any]) -> bool:
     """Classify one Opus record as a recoverable, transient stream death.
 
-    True only when the record carries a concrete transient platform marker in
-    its output. A failed record without such a marker (for example a native
-    timeout, a model/harness pin break, or empty output) is a genuine worker
-    failure and stays terminal.
+    A semantically valid completed audit always wins over marker-shaped prose
+    inside its analysis. Otherwise a concrete marker must be present in output
+    or an explicit launch-error field. A failed record without such a marker
+    (for example a native timeout, a model/harness pin break, or empty output)
+    is a genuine worker failure and stays terminal.
     """
 
-    return _has_incomplete_stream_marker(record.get("output"))
+    output = record.get("output")
+    observation = (
+        record.get("internal_mcp_observation")
+        if isinstance(record.get("internal_mcp_observation"), dict)
+        else None
+    )
+    if (
+        record.get("status") == "completed"
+        and _valid_audit(output, observation) is not None
+    ):
+        return False
+    return any(
+        _has_incomplete_stream_marker(record.get(field))
+        for field in ("output", "error", "launch_error", "stream_error")
+    )
 
 
 def _voice_profile_path() -> str:
@@ -700,11 +710,6 @@ def _audit_payload_and_validation(
     lowered = text.lower()
     if "tool use: bash" in lowered or "cursor-agent --version" in lowered:
         return None, None
-    # An Opus turn the provider truncated mid-stream can leave a syntactically
-    # parseable verdict object behind. Incomplete output must never be treated
-    # as audit evidence; the router recovers it with a fresh retry child.
-    if _has_incomplete_stream_marker(lowered):
-        return None, None
     payloads = [
         candidate
         for candidate in _mapping_candidates(text)
@@ -1154,7 +1159,7 @@ def _opus_transient_retry_route(
 
     This is not a model-quality cycle: it never advances the cycle counter, is
     scoped to one parent's ledger, and the truncated packet that triggered it is
-    never read as audit evidence. Bounded to two retries per cycle; a third
+    never read as audit evidence. Bounded to one retry per cycle; a second
     transient death is terminal infrastructure failure.
     """
 
@@ -1333,6 +1338,26 @@ def _next_route(
         ]
     if not records:
         return _Route("dispatch", 1, "cursor_workhorse", "cursor-cycle-1")
+    # A retained Cursor child can report a duplicate completion after its
+    # original packet already advanced the cycle to Opus. Ignore only trailing
+    # duplicates backed by an earlier complete non-empty packet of the exact
+    # same cycle/title. The original packet remains the Cursor evidence; a lone
+    # failed or empty Cursor packet still fails closed.
+    while records:
+        trailing = records[-1]
+        trailing_stage = _stage(trailing.get("title"))
+        if trailing_stage is None or trailing_stage.kind != "cursor_grunt":
+            break
+        title = trailing.get("title")
+        if not any(
+            prior.get("agent") == "cursor_workhorse"
+            and prior.get("title") == title
+            and prior.get("status") == "completed"
+            and bool(str(prior.get("output") or "").strip())
+            for prior in records[:-1]
+        ):
+            break
+        records = records[:-1]
     last = records[-1]
     parsed = _stage(last.get("title"))
     if parsed is None:
@@ -1606,33 +1631,56 @@ def _observed_nonmax_opus_effort(
     return False
 
 
-def _has_required_stage_chain(records: list[dict[str, Any]], cycle: int) -> bool:
-    """Confirm the final cycle collected Cursor and Opus before Codex.
+def _has_required_stage_chain(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    parent_session_id: str = "",
+    attempt_generation: int | None = None,
+) -> bool:
+    """Confirm exact-cycle Cursor plus a semantically valid Opus audit."""
 
-    This is a final-attestation prerequisite, not routing authorization. Tool
-    calls remain unrestricted by message content or project-owned stage gates.
-    """
-
-    if _observed_nonmax_opus_effort(records, cycle):
+    scoped: list[dict[str, Any]] = []
+    for record in records:
+        if (
+            parent_session_id
+            and record.get("parent_session_id") != parent_session_id
+        ):
+            continue
+        if attempt_generation is not None:
+            try:
+                generation = int(record.get("attempt_generation") or 1)
+            except (TypeError, ValueError):
+                continue
+            if generation != attempt_generation:
+                continue
+        scoped.append(record)
+    if _observed_nonmax_opus_effort(scoped, cycle):
         return False
     cursor_seen = False
-    for record in records:
+    for record in scoped:
         if record.get("status") != "completed":
             continue
-        title = str(record.get("title") or "")
-        if title == f"cursor-cycle-{cycle}":
+        if (
+            record.get("agent") == "cursor_workhorse"
+            and record.get("title") == f"cursor-cycle-{cycle}"
+            and bool(str(record.get("output") or "").strip())
+        ):
             cursor_seen = True
-        elif cursor_seen and title in {
-            f"audit-cycle-{cycle}",
-            f"audit-format-repair-{cycle}",
-        } or (
+            continue
+        parsed = _stage(record.get("title"))
+        observation = (
+            record.get("internal_mcp_observation")
+            if isinstance(record.get("internal_mcp_observation"), dict)
+            else None
+        )
+        if (
             cursor_seen
-            and re.fullmatch(
-                rf"audit-(?:cycle|format-repair)-{cycle}-web-[1-2]"
-                rf"|audit-retry-{cycle}-[1-2]",
-                title,
-            )
-            is not None
+            and record.get("agent") == "opus_auditor"
+            and parsed is not None
+            and parsed.cycle == cycle
+            and parsed.kind in _OPUS_AUDIT_KINDS
+            and _valid_audit(record.get("output"), observation) is not None
         ):
             return True
     return False
@@ -2057,11 +2105,10 @@ def _mark_terminal(
 def supervisor_contract(
     enabled: bool = True,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """Observe routing calls and enforce only terminal response attestation.
+    """Observe routing calls and enforce terminal and paid-retry safety.
 
-    Worker sends and inbox reads are authorized by their mechanically minimal
-    tool surface, not by this policy. Native Omnigent validation and errors pass
-    through unchanged.
+    The only tool-call denial is a second transient Opus retry, which must never
+    launch a duplicate paid child even if supervisor prose asks for it.
     """
 
     def evaluate(event: dict[str, Any]) -> dict[str, Any]:
@@ -2087,6 +2134,23 @@ def supervisor_contract(
             except OSError:
                 # Observability must never become routing authorization.
                 pass
+            arguments = data.get("arguments") if isinstance(data, dict) else None
+            title = (
+                str(arguments.get("title") or "")
+                if isinstance(arguments, dict)
+                else ""
+            )
+            if (
+                str(raw_name or "").rsplit("__", 1)[-1] == "sys_session_send"
+                and re.fullmatch(r"audit-retry-[1-4]-(?:[2-9]|[1-9][0-9]+)", title)
+            ):
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        "Only one paid transient Opus retry is allowed per "
+                        "cycle; audit-retry-N-2 and higher are forbidden."
+                    ),
+                }
             return {"result": "ALLOW"}
         if event_type != "response":
             return {"result": "ALLOW"}
@@ -2539,6 +2603,19 @@ def _project_dispatch_cost(event: dict[str, Any]) -> tuple[str, float]:
     return title, reserve
 
 
+def _top_level_request_identity(data: object) -> str:
+    """Identify only a genuine user submit, never a child-completion wake."""
+
+    if not isinstance(data, dict) or "user_content" not in data:
+        return ""
+    content = data.get("user_content")
+    if isinstance(content, str) and content.startswith(
+        ("[System: sub-agent task ", "TRIPLE_STAMP_NONTERMINAL_CONTINUATION")
+    ):
+        return ""
+    return attempt_request_identity(data)
+
+
 def strict_cost_budget(
     max_cost_usd: float = 50.0,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -2568,10 +2645,15 @@ def strict_cost_budget(
             )
         ):
             return {"result": "ALLOW"}
-        if event.get("type") == "request" and event.get("data") is not None:
+        request_identity = (
+            _top_level_request_identity(event.get("data"))
+            if event.get("type") == "request"
+            else ""
+        )
+        if request_identity:
             activate_parent_attempt(
                 parent_session_id,
-                attempt_request_identity(event.get("data")),
+                request_identity,
                 new_request=True,
             )
         snapshot = _stored_cost_snapshot(event, parent_session_id)

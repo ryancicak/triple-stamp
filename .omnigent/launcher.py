@@ -2472,7 +2472,8 @@ def _validated_best_effort_exit(
         "cursor_workhorse": rf"cursor-cycle-{cycle}",
         "opus_auditor": (
             rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
-            rf"internal-{cycle}-[1-2]|format-repair-{cycle}(?:-web-[1-2])?)"
+            rf"retry-{cycle}-1|internal-{cycle}-[1-2]|"
+            rf"format-repair-{cycle}(?:-web-[1-2])?)"
         ),
         "codex_judge": (
             rf"judge-(?:cycle|convergence|format-repair)-{cycle}"
@@ -2648,7 +2649,7 @@ def _validated_pipeline_exit(
             if (
                 record.get("agent") == "opus_auditor"
                 and re.search(
-                    rf"(?:cycle-|repair-|internal-){attested_cycle}(?:-|$)",
+                    rf"(?:cycle-|repair-|retry-|internal-){attested_cycle}(?:-|$)",
                     title,
                 )
                 and isinstance(observation, dict)
@@ -2664,7 +2665,8 @@ def _validated_pipeline_exit(
             } or (
                 cursor_seen
                 and re.fullmatch(
-                    rf"audit-(?:cycle|format-repair)-{attested_cycle}-web-[1-2]",
+                    rf"audit-(?:(?:cycle|format-repair)-"
+                    rf"{attested_cycle}-web-[1-2]|retry-{attested_cycle}-1)",
                     title,
                 )
                 is not None

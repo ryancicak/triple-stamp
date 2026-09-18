@@ -13,7 +13,10 @@ from collections.abc import AsyncIterator
 from types import CodeType
 from typing import Any
 
-_CONTINUATION_LIMIT = 1
+# Give the routing-only supervisor two deterministic reprompts. A recoverable
+# empty turn is never terminalized if the model still declines the required
+# dispatch; a later child wake can continue the same attempt.
+_CONTINUATION_LIMIT = 2
 _HEADLESS_PIPELINE_TIMEOUT_S: float | None = None
 _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT = 30
 # More than the pipeline can ever consume (two or four complete cycles plus
@@ -194,7 +197,7 @@ def _session_id(messages: list[dict[str, Any]]) -> str:
 
 
 def _attempt_request_identity(messages: list[dict[str, Any]]) -> str:
-    """Fingerprint the latest top-level user turn."""
+    """Fingerprint the latest genuine top-level user turn."""
 
     from triple_stamp_runtime_state import attempt_request_identity
 
@@ -204,7 +207,10 @@ def _attempt_request_identity(messages: list[dict[str, Any]]) -> str:
         content = message.get("content")
         if (
             isinstance(content, str)
-            and content.startswith(_CONTINUATION_PREFIX)
+            and (
+                content.startswith(_CONTINUATION_PREFIX)
+                or content.startswith("[System: sub-agent task ")
+            )
         ):
             continue
         metadata = message.get("metadata")
@@ -552,7 +558,7 @@ def install_headless_pipeline_wait() -> None:
 
 
 def install_supervisor_continuation_guard() -> None:
-    """Suppress nonterminal replies and force one deterministic re-entry."""
+    """Suppress nonterminal replies and force bounded deterministic re-entry."""
 
     if not os.environ.get("TRIPLE_STAMP_RUN_ID"):
         return
@@ -612,10 +618,19 @@ def install_supervisor_continuation_guard() -> None:
             # root conversation id. A later concrete wake can safely continue.
             yield TurnComplete(response="", modified_by_policy=True)
             return
-        request_identity = _attempt_request_identity(messages)
+        # The request policy normally owns attempt identity because it sees the
+        # genuine top-level submit event. Preserve its generation on every
+        # ordinary child wake. The fallback identity is used only when a prior
+        # terminal artifact exists, allowing direct executor callers and a new
+        # user turn to open a fresh attempt without reviving synthetic wakes.
+        terminal_exists = bool(
+            read_terminal_failure(parent_session_id=session_id)
+            or read_attested_answer(parent_session_id=session_id)
+            or read_best_effort_answer(parent_session_id=session_id)
+        )
         attempt_generation = activate_parent_attempt(
             session_id,
-            request_identity,
+            _attempt_request_identity(messages) if terminal_exists else "",
         )
         # One narration per stage title for the life of the run. The guard is
         # re-entered on every wake, so this cannot live in the loop. Keyed by run
@@ -1059,30 +1074,20 @@ def install_supervisor_continuation_guard() -> None:
                 continue
 
             reason = (
-                "supervisor ended twice without executing the deterministic "
-                f"continuation for {getattr(route, 'title', '') or route.status}"
+                "supervisor exhausted deterministic continuation prompts "
+                f"without dispatching {getattr(route, 'title', '') or route.status}; "
+                "leaving the recoverable route open"
             )
             _LOGGER.warning(reason)
             _record(
-                "continuation_exhausted",
+                "continuation_exhausted_abstained",
                 route,
                 attempt=continuation_attempt,
                 reason=reason,
                 parent_session_id=session_id,
             )
-            cost, calls = _failure_metrics(session_id)
-            terminal = record_terminal_failure(
-                "PIPELINE_INFRASTRUCTURE_ERROR",
-                reason,
-                stage=str(getattr(route, "title", "") or ""),
-                cycle=int(getattr(route, "cycle", 0) or 0),
-                cost_usd=cost,
-                calls=calls,
-                parent_session_id=session_id,
-            )
-            yield TextChunk(text=terminal)
             yield TurnComplete(
-                response=terminal,
+                response="",
                 modified_by_policy=True,
                 usage=completed.usage,
             )

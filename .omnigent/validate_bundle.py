@@ -510,7 +510,7 @@ def validate_spec(
             "cursor-web-codex-N-H",
             "audit-cycle-N",
             "audit-cycle-N-web-H",
-            "audit-retry-N-H",
+            "audit-retry-N-1",
             "FRESH `opus_auditor` child",
             "judge-cycle-N",
             "judge-format-repair-N",
@@ -696,7 +696,7 @@ def validate_launchers(
         "def parse_dispatch_title(",
         "def record_tool_dispatch_exception(",
         'r"audit-internal-([1-4])-([1-2])"',
-        'r"audit-retry-([1-4])-([1-2])"',
+        'r"audit-retry-([1-4])-(1)"',
     ):
         if marker not in runtime_state_source:
             fail(f"runtime attestation marker missing: {marker}")
@@ -708,7 +708,7 @@ def validate_launchers(
         "__triple_stamp_headless_wait__",
         "def install_supervisor_continuation_guard(",
         "ordinary_response_suppressed",
-        "continuation_exhausted",
+        "continuation_exhausted_abstained",
         "dispatch_observer_failure_abstained",
         "ledger observer failure=",
     ):
@@ -1141,6 +1141,19 @@ def validate_launchers(
     )
     if any(contract(event).get("result") != "ALLOW" for event in arbitrary_calls):
         fail("final response contract still gates a routing/tool payload")
+    forbidden_retry = {
+        "type": "tool_call",
+        "data": {
+            "name": "sys_session_send",
+            "arguments": {
+                "agent": "opus_auditor",
+                "title": "audit-retry-1-2",
+                "args": {"input": "must not launch"},
+            },
+        },
+    }
+    if contract(forbidden_retry).get("result") != "DENY":
+        fail("second paid Opus retry was not denied before dispatch")
 
     if _SUPERVISOR_ROUTE_LIMIT != _route_call_cap():
         fail("supervisor route-call formula drifted")

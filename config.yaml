@@ -93,7 +93,7 @@ prompt: |
      launch the same fresh `audit-internal-N-H` path before Codex. Never ask
      Cursor to repair internal receipts or internal-system evidence.
      If the collected Opus packet is a transient mid-stream death, launch a fresh
-     Opus child and native process titled `audit-retry-N-H`, skipping Cursor.
+     Opus child and native process titled `audit-retry-N-1`, skipping Cursor.
      Its self-contained handoff is the same audit request: original request and
      current-cycle Cursor evidence. Never continue or resume the dead terminal;
      the child returns a complete fresh audit object. The truncated packet is not
@@ -252,10 +252,10 @@ prompt: |
   error mid-response" or "the response above may be incomplete"), its output is
   truncated and must never be read as an audit verdict. The runtime recovers it
   deterministically: the `[System-required next dispatch: ...]` line, or the
-  continuation prompt, names a fresh `audit-retry-N-H` child. Dispatch exactly
+  continuation prompt, names a fresh `audit-retry-N-1` child. Dispatch exactly
   that title. This is a new native Claude process and session, never a resume of
-  the dead terminal, and it does not advance the cycle counter. At most two such
-  retries per cycle are allowed; a third mid-stream death is terminal
+  the dead terminal, and it does not advance the cycle counter. At most one such
+  retry per cycle is allowed; a second mid-stream death is terminal
   `PIPELINE_INFRASTRUCTURE_ERROR`.
 
   CURSOR DELIVERY

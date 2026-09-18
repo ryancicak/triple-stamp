@@ -19,7 +19,7 @@ _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-cycle-([1-4])", "cursor_grunt", ""),
     (r"audit-cycle-([1-4])", "audit", "opus"),
     (r"audit-cycle-([1-4])-web-([1-2])", "audit_web", "opus"),
-    (r"audit-retry-([1-4])-([1-2])", "audit_retry", "opus"),
+    (r"audit-retry-([1-4])-(1)", "audit_retry", "opus"),
     (r"audit-internal-([1-4])-([1-2])", "audit_internal", "codex"),
     (r"judge-cycle-([1-4])", "judge", "codex"),
     (r"judge-convergence-([1-4])", "judge_convergence", "codex"),
@@ -903,7 +903,7 @@ _INTERNAL_SYSTEMS = ("glean", "jira", "slack", "confluence", "safe")
 _OPUS_STAGE_TITLE = re.compile(
     r"(?:"
     r"audit-cycle-[1-4](?:-web-[1-2])?"
-    r"|audit-retry-[1-4]-[1-2]"
+    r"|audit-retry-[1-4]-1"
     r"|audit-internal-[1-4]-[1-2]"
     r"|audit-format-repair-[1-4](?:-web-[1-2])?"
     r")"
@@ -1765,12 +1765,14 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     evidence_bytes = output.encode("utf-8")
     title = str(payload.get("title") or "")
     match = re.fullmatch(r"judge-(?:cycle|convergence)-([1-4])", title)
+    generation = current_attempt_generation(parent_session_id)
     if match is None or not _has_required_stage_chain(
         read_collections(parent_session_id=parent_session_id),
         int(match.group(1)),
+        parent_session_id=parent_session_id,
+        attempt_generation=generation,
     ):
         return False
-    generation = current_attempt_generation(parent_session_id)
     attestation = {
         "version": 1,
         "verdict": "STAMP",
@@ -1879,6 +1881,22 @@ def record_best_effort_answer(
         return ""
 
     scoped = _scope_parent_records(records, parent_session_id)
+    generation = current_attempt_generation(parent_session_id)
+    try:
+        from triple_stamp_isaac_launcher import (
+            _has_required_stage_chain,
+            _stage,
+            _valid_audit,
+        )
+    except ImportError:
+        return ""
+    if not _has_required_stage_chain(
+        scoped,
+        cycle,
+        parent_session_id=parent_session_id,
+        attempt_generation=generation,
+    ):
+        return ""
 
     def complete(record: dict[str, Any], agent: str) -> bool:
         output = record.get("output")
@@ -1914,7 +1932,26 @@ def record_best_effort_answer(
             record
             for record in reversed(scoped)
             if complete(record, "opus_auditor")
-            and str(record.get("title") or "").startswith("audit-")
+            and (parsed := _stage(record.get("title"))) is not None
+            and parsed.cycle == cycle
+            and parsed.kind
+            in {
+                "audit",
+                "audit_web",
+                "audit_retry",
+                "audit_internal",
+                "audit_repair",
+                "audit_repair_web",
+            }
+            and _valid_audit(
+                record.get("output"),
+                (
+                    record.get("internal_mcp_observation")
+                    if isinstance(record.get("internal_mcp_observation"), dict)
+                    else None
+                ),
+            )
+            is not None
         ),
         None,
     )
@@ -1954,7 +1991,7 @@ def record_best_effort_answer(
         "quality_approved": False,
         "cycle": max(0, int(cycle)),
         "parent_session_id": parent_session_id,
-        "attempt_generation": current_attempt_generation(parent_session_id),
+        "attempt_generation": generation,
         "reason": " ".join(str(reason).replace("\x00", " ").split())[:2000],
         "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
         "answer_length": len(answer_bytes),
