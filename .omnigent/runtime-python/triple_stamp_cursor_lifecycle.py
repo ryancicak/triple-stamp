@@ -1157,7 +1157,30 @@ def install_parent_inbox_guard() -> None:
                 )
                 return
             except Exception:  # noqa: BLE001 - one bounded recovery attempt
-                pass
+                acknowledgement = runner_app.mark_subagent_work_terminal(
+                    session_id,
+                    status=desired,
+                    output=terminal_output,
+                )
+                if acknowledgement.delivered:
+                    if (
+                        acknowledgement.delivered_now
+                        and acknowledgement.entry is not None
+                    ):
+                        parent_inbox = ensure_parent_inbox(parent_session_id)
+                        notice = runner_app._format_subagent_wake_notice(
+                            agent=entry.agent,
+                            title=entry.title,
+                            status=entry.status,
+                            pending=parent_inbox.qsize(),
+                        )
+                        await runner_app._deliver_subagent_wake_post(
+                            client,
+                            parent_session_id,
+                            notice,
+                            created_by=entry.created_by,
+                        )
+                    return
             reason = (
                 "Cursor terminal delivery recovery exhausted after one "
                 "reconstructed missing_work_entry retry; duplicate delivery "
@@ -1170,16 +1193,6 @@ def install_parent_inbox_guard() -> None:
                 cycle=int(record.get("cycle") or 0),
                 parent_session_id=parent_session_id,
             )
-
-            def stop_retrying(
-                current: dict[str, Any],
-                _state: dict[str, Any],
-            ) -> None:
-                current["delivery_committed"] = True
-                current["delivery_committed_at_ns"] = time.time_ns()
-                current["terminal_phase"] = "delivered"
-
-            mutate_cursor_lifecycle(session_id, work_id, stop_retrying)
 
         guarded_native_status_post.__triple_stamp_cursor_delivery__ = True
         guarded_native_status_post.__triple_stamp_original__ = (
