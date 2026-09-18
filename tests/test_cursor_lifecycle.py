@@ -115,6 +115,73 @@ class CursorLifecycleTests(unittest.TestCase):
     def _line(role: str, blocks: list[dict[str, object]]) -> str:
         return json.dumps({"role": role, "message": {"content": blocks}})
 
+    def test_single_transcript_fallback_never_crosses_parent_sessions(
+        self,
+    ) -> None:
+        parent_a = "cursor-parent-a"
+        parent_b = "cursor-parent-b"
+        child_a = "cursor-child-a"
+        child_b = "cursor-child-b"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            run = Path(value)
+            transcript = (
+                run
+                / "home/.cursor/projects/project/agent-transcripts"
+                / "cursor-session-a"
+                / "cursor-session-a.jsonl"
+            )
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                self._line(
+                    "assistant",
+                    [{"type": "text", "text": "math answer"}],
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bridge_b = (
+                run
+                / "tmp"
+                / f"omnigent-{os.getuid()}"
+                / "cursor-native"
+                / __import__("hashlib").sha256(
+                    child_b.encode()
+                ).hexdigest()[:32]
+            )
+            bridge_b.mkdir(parents=True)
+            (bridge_b / "triple-stamp-startup.json").write_text(
+                json.dumps({"state": "ready"}),
+                encoding="utf-8",
+            )
+            self._dispatch(
+                parent=parent_a,
+                child=child_a,
+                work_id="work-a",
+                title="cursor-cycle-1",
+            )
+            self._dispatch(
+                parent=parent_b,
+                child=child_b,
+                work_id="work-b",
+                title="cursor-cycle-1",
+            )
+
+            snapshot = lifecycle._cursor_transcript_snapshot(
+                child_b,
+                bridge_b,
+            )
+
+        self.assertFalse(snapshot["seen"])
+        self.assertEqual(snapshot["output"], "")
+        self.assertIn(
+            "metadata_source=forwarder-required-after-parent-dispatch",
+            snapshot["diagnostic"],
+        )
+
     def _dispatch(
         self,
         *,

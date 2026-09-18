@@ -36,7 +36,7 @@ _TERMINAL_RELAY_ACTIONS = frozenset(
 # emit status prose and every attempt is suppressed, which is why the UI showed
 # raw `sys_session_send` rows and nothing else. The runtime holds the same facts
 # and cannot drift from them, so it narrates instead of the model.
-_NARRATED_STAGES: dict[str, set[str]] = {}
+_NARRATED_STAGES: dict[tuple[str, str], set[str]] = {}
 _STAGE_STEP = {
     "cursor_workhorse": ("1 of 3", "public-web research"),
     "opus_auditor": ("2 of 3", "internal audit"),
@@ -366,7 +366,13 @@ def _finished_clause(
     return " ".join(parts)
 
 
-def _progress_note(agent: str, title: str, announced: set[str]) -> str:
+def _progress_note(
+    agent: str,
+    title: str,
+    announced: set[str],
+    *,
+    parent_session_id: str,
+) -> str:
     """Author one deterministic status line for a stage that is starting now."""
 
     from triple_stamp_runtime_state import (
@@ -381,7 +387,11 @@ def _progress_note(agent: str, title: str, announced: set[str]) -> str:
     parsed = parse_dispatch_title(title)
     cycle = f"cycle {parsed['cycle']}" if parsed else "cycle ?"
     lines = [f"**Triple-stamp, {cycle} - step {step}, {kind}** (`{title}`)"]
-    finished = _finished_clause(read_collections(), read_dispatches(), announced)
+    finished = _finished_clause(
+        read_collections(parent_session_id=parent_session_id),
+        read_dispatches(parent_session_id=parent_session_id),
+        announced,
+    )
     if finished:
         lines.append(finished)
     lines.append(_STAGE_DOING[agent])
@@ -411,7 +421,14 @@ def _terminal_response_allowed(
     return False
 
 
-def _record(action: str, route: object, *, attempt: int, reason: str) -> None:
+def _record(
+    action: str,
+    route: object,
+    *,
+    attempt: int,
+    reason: str,
+    parent_session_id: str = "",
+) -> None:
     from triple_stamp_runtime_state import append_supervisor_continuation
 
     append_supervisor_continuation(
@@ -420,6 +437,7 @@ def _record(action: str, route: object, *, attempt: int, reason: str) -> None:
             "attempt": attempt,
             "reason": reason,
             "route": _route_snapshot(route),
+            "parent_session_id": parent_session_id,
         }
     )
 
@@ -514,6 +532,7 @@ def install_supervisor_continuation_guard() -> None:
     from triple_stamp_runtime_state import (
         read_collections,
         read_dispatches,
+        read_attested_answer,
         read_last_tool_dispatch_exception,
         read_supervisor_continuations,
         read_terminal_failure,
@@ -545,6 +564,11 @@ def install_supervisor_continuation_guard() -> None:
         continuation_attempt = 0
         current_messages = messages
         session_id = _session_id(messages)
+        if not session_id or session_id == "default":
+            # Never reduce a run-global union when a wake lacks one authoritative
+            # root conversation id. A later concrete wake can safely continue.
+            yield TurnComplete(response="", modified_by_policy=True)
+            return
         # One narration per stage title for the life of the run. The guard is
         # re-entered on every wake, so this cannot live in the loop. Keyed by run
         # directory rather than run id because the directory is unique per run
@@ -552,9 +576,31 @@ def install_supervisor_continuation_guard() -> None:
         if len(_NARRATED_STAGES) > 8:
             _NARRATED_STAGES.clear()
         narrated = _NARRATED_STAGES.setdefault(
-            os.environ.get("TRIPLE_STAMP_RUN_DIR", ""), set()
+            (os.environ.get("TRIPLE_STAMP_RUN_DIR", ""), session_id),
+            set(),
         )
         while True:
+            attested_answer = read_attested_answer(
+                parent_session_id=session_id
+            )
+            if attested_answer:
+                route = _next_route(
+                    read_collections(parent_session_id=session_id),
+                    parent_session_id=session_id,
+                )
+                _record(
+                    "deterministic_stamp_relay",
+                    route,
+                    attempt=continuation_attempt,
+                    reason="parent already has an immutable STAMP attestation",
+                    parent_session_id=session_id,
+                )
+                yield TextChunk(text=attested_answer)
+                yield TurnComplete(
+                    response=attested_answer,
+                    modified_by_policy=True,
+                )
+                return
             # A recorded terminal failure ends the run, and it has to end it
             # here, before the model is asked for another turn. Two things went
             # wrong on 2026-09-11 run-4gqa_fil once `judge-cycle-1` failed at
@@ -568,14 +614,18 @@ def install_supervisor_continuation_guard() -> None:
             # the recorded text instead. The exit code does not depend on the
             # event shape: `_validated_pipeline_exit` returns zero only for a
             # STAMP attestation with a valid stage chain.
-            recorded_failure = read_terminal_failure()
+            recorded_failure = read_terminal_failure(
+                parent_session_id=session_id
+            )
             if recorded_failure:
                 relayed = any(
                     row.get("action") in _TERMINAL_RELAY_ACTIONS
-                    for row in read_supervisor_continuations()
+                    for row in read_supervisor_continuations(
+                        parent_session_id=session_id
+                    )
                 )
                 route = _next_route(
-                    read_collections(),
+                    read_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
                 if relayed:
@@ -587,6 +637,7 @@ def install_supervisor_continuation_guard() -> None:
                         route,
                         attempt=continuation_attempt,
                         reason="terminal failure was already relayed to the reader",
+                        parent_session_id=session_id,
                     )
                     yield TurnComplete(response="", modified_by_policy=True)
                     return
@@ -594,7 +645,8 @@ def install_supervisor_continuation_guard() -> None:
                     "terminal_failure_relayed",
                     route,
                     attempt=continuation_attempt,
-                    reason="run already has a recorded terminal failure",
+                    reason="parent already has a recorded terminal failure",
+                    parent_session_id=session_id,
                 )
                 yield TextChunk(text=recorded_failure)
                 yield TurnComplete(
@@ -637,6 +689,7 @@ def install_supervisor_continuation_guard() -> None:
                                 str(arguments.get("agent") or ""),
                                 sent_title,
                                 narrated,
+                                parent_session_id=session_id,
                             )
                             if note:
                                 yield TextChunk(text=note)
@@ -665,18 +718,27 @@ def install_supervisor_continuation_guard() -> None:
             if completed is None:
                 return
 
-            records = read_collections()
-            dispatches = read_dispatches()
+            records = read_collections(parent_session_id=session_id)
+            dispatches = read_dispatches(parent_session_id=session_id)
             resolved_parent = _dispatch_parent_session_id(
-                dispatches,
+                read_dispatches(),
                 sent_child_session_ids,
             )
             if resolved_parent:
                 session_id = resolved_parent
             elif len(observed_parent_session_ids) == 1:
                 session_id = next(iter(observed_parent_session_ids))
-            records = _records_for_session(records, session_id)
-            route = _next_route(records)
+            elif observed_parent_session_ids or sent_child_session_ids:
+                # Ambiguous native identity is not permission to merge ledgers.
+                yield TurnComplete(
+                    response="",
+                    modified_by_policy=True,
+                    usage=completed.usage,
+                )
+                return
+            records = read_collections(parent_session_id=session_id)
+            dispatches = read_dispatches(parent_session_id=session_id)
+            route = _next_route(records, parent_session_id=session_id)
             response = completed.response
             if not isinstance(response, str):
                 response = "".join(event.text for event in buffered_text)
@@ -707,6 +769,7 @@ def install_supervisor_continuation_guard() -> None:
                         "supervisor response was not byte-exact; relayed the "
                         "attested stamped answer"
                     ),
+                    parent_session_id=session_id,
                 )
                 # The answer has to be STREAMED, not just declared on
                 # TurnComplete. The success path above yields its buffered
@@ -724,12 +787,18 @@ def install_supervisor_continuation_guard() -> None:
                 )
                 return
 
-            if _route_dispatch_pending(route, records, dispatches):
+            if _route_dispatch_pending(
+                route,
+                records,
+                dispatches,
+                parent_session_id=session_id,
+            ):
                 _record(
                     "ordinary_response_suppressed",
                     route,
                     attempt=continuation_attempt,
                     reason="required route was already durably dispatched",
+                    parent_session_id=session_id,
                 )
                 yield TurnComplete(
                     response="",
@@ -779,6 +848,7 @@ def install_supervisor_continuation_guard() -> None:
                         route,
                         attempt=continuation_attempt,
                         reason=reason,
+                        parent_session_id=session_id,
                     )
                     yield TurnComplete(
                         response="",
@@ -809,6 +879,7 @@ def install_supervisor_continuation_guard() -> None:
                         route,
                         attempt=continuation_attempt,
                         reason=reason,
+                        parent_session_id=session_id,
                     )
                     current_messages = [
                         {
@@ -834,6 +905,7 @@ def install_supervisor_continuation_guard() -> None:
                     route,
                     attempt=continuation_attempt,
                     reason=reason,
+                    parent_session_id=session_id,
                 )
                 yield TurnComplete(
                     response="",
@@ -855,6 +927,7 @@ def install_supervisor_continuation_guard() -> None:
                     route,
                     attempt=continuation_attempt,
                     reason=reason,
+                    parent_session_id=session_id,
                 )
                 yield TurnComplete(
                     response="",
@@ -870,6 +943,7 @@ def install_supervisor_continuation_guard() -> None:
                     route,
                     attempt=continuation_attempt,
                     reason="ordinary final response left durable route unexecuted",
+                    parent_session_id=session_id,
                 )
                 current_messages = [
                     {
@@ -890,8 +964,9 @@ def install_supervisor_continuation_guard() -> None:
                 route,
                 attempt=continuation_attempt,
                 reason=reason,
+                parent_session_id=session_id,
             )
-            cost, calls = _failure_metrics()
+            cost, calls = _failure_metrics(session_id)
             terminal = record_terminal_failure(
                 "PIPELINE_INFRASTRUCTURE_ERROR",
                 reason,
@@ -899,6 +974,7 @@ def install_supervisor_continuation_guard() -> None:
                 cycle=int(getattr(route, "cycle", 0) or 0),
                 cost_usd=cost,
                 calls=calls,
+                parent_session_id=session_id,
             )
             yield TextChunk(text=terminal)
             yield TurnComplete(

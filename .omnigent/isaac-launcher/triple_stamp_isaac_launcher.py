@@ -24,6 +24,7 @@ from triple_stamp_opus_mcp import (
 from triple_stamp_runtime_state import (
     append_supervisor_tool_call,
     parse_dispatch_title,
+    read_budget_state,
     read_collections,
     read_dispatches,
     record_terminal_failure,
@@ -969,10 +970,21 @@ def _stage(title: object) -> _Stage | None:
 
 
 def _resume_child(
-    records: list[dict[str, Any]], agent: str, title: str
+    records: list[dict[str, Any]],
+    agent: str,
+    title: str,
+    *,
+    parent_session_id: str = "",
 ) -> str:
     for record in records:
-        if record.get("agent") == agent and record.get("title") == title:
+        if (
+            record.get("agent") == agent
+            and record.get("title") == title
+            and (
+                not parent_session_id
+                or record.get("parent_session_id") == parent_session_id
+            )
+        ):
             return str(record.get("child_session_id") or "")
     return ""
 
@@ -1159,9 +1171,7 @@ def _next_route(
 ) -> _Route:
     """Reduce the ledger to one deterministic next transition."""
 
-    if parent_session_id and any(
-        record.get("parent_session_id") for record in records
-    ):
+    if parent_session_id:
         records = [
             record
             for record in records
@@ -1210,7 +1220,10 @@ def _next_route(
             requester="codex",
             hop=parsed.hop,
             resume_child_session_id=_resume_child(
-                records, "codex_judge", title
+                records,
+                "codex_judge",
+                title,
+                parent_session_id=parent_session_id,
             ),
         )
     if parsed.kind in {
@@ -1372,18 +1385,32 @@ def _route_dispatch_pending(
     route: _Route,
     records: list[dict[str, Any]] | None = None,
     dispatches: list[dict[str, Any]] | None = None,
+    *,
+    parent_session_id: str = "",
 ) -> bool:
     """Return whether the canonical route has an uncollected dispatch in flight."""
 
     if route.status != "dispatch" or not route.agent or not route.title:
         return False
-    collected = records if records is not None else read_collections()
-    sent = dispatches if dispatches is not None else read_dispatches()
+    collected = (
+        records
+        if records is not None
+        else read_collections(parent_session_id=parent_session_id)
+    )
+    sent = (
+        dispatches
+        if dispatches is not None
+        else read_dispatches(parent_session_id=parent_session_id)
+    )
 
     def matches(record: dict[str, Any]) -> bool:
         return (
             record.get("agent") == route.agent
             and record.get("title") == route.title
+            and (
+                not parent_session_id
+                or record.get("parent_session_id") == parent_session_id
+            )
         )
 
     return sum(matches(record) for record in sent) > sum(
@@ -1444,8 +1471,15 @@ def _has_required_stage_chain(records: list[dict[str, Any]], cycle: int) -> bool
     return False
 
 
-def _latest_codex_stamp() -> tuple[str, int] | None:
-    for record in reversed(_completion_records()):
+def _latest_codex_stamp(
+    parent_session_id: str = "",
+) -> tuple[str, int] | None:
+    records = (
+        read_collections(parent_session_id=parent_session_id)
+        if parent_session_id
+        else _completion_records()
+    )
+    for record in reversed(records):
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
         match = re.fullmatch(
@@ -1502,7 +1536,7 @@ def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
     return answer
 
 
-def _has_terminal_worker_failure() -> bool:
+def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
     pin_markers = (
         "pin broke",
         "model drift",
@@ -1510,13 +1544,19 @@ def _has_terminal_worker_failure() -> bool:
         "wrong harness",
         "produced no output",
     )
-    for record in _completion_records():
-        if record["status"] in {"failed", "cancelled"} or not record["output"].strip():
+    records = (
+        read_collections(parent_session_id=parent_session_id)
+        if parent_session_id
+        else _completion_records()
+    )
+    for record in records:
+        output = str(record.get("output") or "")
+        if record.get("status") in {"failed", "cancelled"} or not output.strip():
             return True
-        lowered = record["output"].lower()
+        lowered = output.lower()
         if any(marker in lowered for marker in pin_markers):
             return True
-    for record in read_collections():
+    for record in read_collections(parent_session_id=parent_session_id):
         title = str(record.get("title", ""))
         if title.startswith("audit-format-repair-") and _valid_audit(
             record.get("output")
@@ -1525,9 +1565,14 @@ def _has_terminal_worker_failure() -> bool:
     return False
 
 
-def _max_unstamped_judgments() -> bool:
+def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
     count = 0
-    for record in _completion_records():
+    records = (
+        read_collections(parent_session_id=parent_session_id)
+        if parent_session_id
+        else _completion_records()
+    )
+    for record in records:
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
         payload = next(iter(_mapping_candidates(record["output"])), None)
@@ -1540,36 +1585,60 @@ def _max_unstamped_judgments() -> bool:
     return count >= _MAX_CYCLES
 
 
-def _failure_metrics() -> tuple[float | None, int | None]:
+def _failure_metrics(
+    parent_session_id: str = "",
+) -> tuple[float | None, int | None]:
     raw = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
     if not raw:
         return None, None
     run_dir = Path(raw)
     try:
-        budget = json.loads((run_dir / "budget-state.json").read_text(encoding="utf-8"))
+        budget = read_budget_state(parent_session_id)
         cost = float(budget["cost_usd"])
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError):
         cost = None
     try:
-        calls = len(
-            (run_dir / "supervisor-tool-calls.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
+        tool_calls = [
+            json.loads(line)
+            for line in (
+                (run_dir / "supervisor-tool-calls.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+            if line.strip()
+        ]
+        calls = sum(
+            1
+            for record in tool_calls
+            if isinstance(record, dict)
+            and (
+                not parent_session_id
+                or record.get("parent_session_id") == parent_session_id
+            )
         )
-    except OSError:
+    except (OSError, ValueError, json.JSONDecodeError):
+        calls = 0
+    if calls == 0:
         calls = None
     return cost, calls
 
 
 def _mark_terminal(
-    kind: str, answer: str | None = None, *, reason: str = ""
+    kind: str,
+    answer: str | None = None,
+    *,
+    reason: str = "",
+    parent_session_id: str = "",
 ) -> None:
     raw = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
     if not raw:
         return
     if kind != "STAMP":
-        route = _next_route(read_collections())
-        cost, calls = _failure_metrics()
+        route = _next_route(
+            read_collections(parent_session_id=parent_session_id),
+            parent_session_id=parent_session_id,
+        )
+        cost, calls = _failure_metrics(parent_session_id)
         record_terminal_failure(
             kind,
             reason or route.reason or "pipeline reached a terminal failure",
@@ -1577,18 +1646,33 @@ def _mark_terminal(
             cycle=route.cycle,
             cost_usd=cost,
             calls=calls,
+            parent_session_id=parent_session_id,
         )
     try:
+        from triple_stamp_runtime_state import _parent_artifact_path
+
         run_dir = Path(raw)
-        marker = run_dir / "pipeline-terminal"
+        marker = _parent_artifact_path(
+            run_dir,
+            "pipeline-terminal",
+            parent_session_id,
+        )
         marker.write_text(kind + "\n", encoding="utf-8")
         marker.chmod(0o600)
         if answer is not None:
             data = answer.encode("utf-8")
-            relay = run_dir / "stamped-answer.bin"
+            relay = _parent_artifact_path(
+                run_dir,
+                "stamped-answer.bin",
+                parent_session_id,
+            )
             relay.write_bytes(data)
             relay.chmod(0o600)
-            digest = run_dir / "stamped-answer.sha256"
+            digest = _parent_artifact_path(
+                run_dir,
+                "stamped-answer.sha256",
+                parent_session_id,
+            )
             digest.write_text(hashlib.sha256(data).hexdigest() + "\n", encoding="ascii")
             digest.chmod(0o600)
     except OSError:
@@ -1621,7 +1705,10 @@ def supervisor_contract(
             data = event.get("data")
             raw_name = data.get("name") if isinstance(data, dict) else ""
             try:
-                append_supervisor_tool_call(str(raw_name or "unknown"))
+                append_supervisor_tool_call(
+                    str(raw_name or "unknown"),
+                    parent_session_id=parent_session_id,
+                )
             except OSError:
                 # Observability must never become routing authorization.
                 pass
@@ -1634,41 +1721,69 @@ def supervisor_contract(
         response = event.get("data")
         if not isinstance(response, str):
             return {"result": "DENY", "reason": "supervisor response is not text"}
-        latest_stamp = _latest_codex_stamp()
+        if (
+            not parent_session_id
+            and any(
+                record.get("parent_session_id")
+                for record in read_collections()
+            )
+        ):
+            if response == "":
+                return {"result": "ALLOW"}
+            return {
+                "result": "DENY",
+                "reason": (
+                    "Supervisor response lacks one authoritative root "
+                    "conversation id; cross-parent ledger reduction is forbidden."
+                ),
+            }
+        collections = read_collections(parent_session_id=parent_session_id)
+        latest_stamp = _latest_codex_stamp(parent_session_id)
         if latest_stamp is not None:
             stamped, cycle = latest_stamp
         else:
             stamped, cycle = None, 0
         if (
             stamped is not None
-            and _has_required_stage_chain(read_collections(), cycle)
+            and _has_required_stage_chain(collections, cycle)
             and response == stamped
         ):
-            _mark_terminal("STAMP", stamped)
+            _mark_terminal(
+                "STAMP",
+                stamped,
+                parent_session_id=parent_session_id,
+            )
             return {"result": "ALLOW"}
         route = _next_route(
-            read_collections(),
+            collections,
             parent_session_id=parent_session_id,
         )
         if (
             response == ""
-            and _route_dispatch_pending(route)
+            and _route_dispatch_pending(
+                route,
+                collections,
+                read_dispatches(parent_session_id=parent_session_id),
+                parent_session_id=parent_session_id,
+            )
         ):
             # The runtime continuation guard suppressed an ordinary status
             # reply after the required child was durably dispatched. Empty
             # completion keeps Omnigent in its native async waiting state.
             return {"result": "ALLOW"}
         if response.startswith(_INFRA_PREFIX) and (
-            _has_terminal_worker_failure()
+            _has_terminal_worker_failure(parent_session_id)
             or route.status == "infrastructure_failed"
         ):
             _mark_terminal(
                 "PIPELINE_INFRASTRUCTURE_ERROR",
                 reason=route.reason or "worker or native infrastructure failed",
+                parent_session_id=parent_session_id,
             )
             return {"result": "ALLOW"}
         if response.startswith(_VALIDATION_PREFIX) and (
-            _max_unstamped_judgments() or route.status == "validation_failed"
+            _max_unstamped_judgments(parent_session_id)
+            or route.status == "validation_failed"
         ):
             _mark_terminal(
                 "PIPELINE_VALIDATION_FAILED",
@@ -1677,6 +1792,7 @@ def supervisor_contract(
                     f"{_MAX_CYCLES} complete cycles ended without "
                     "Codex STAMP"
                 ),
+                parent_session_id=parent_session_id,
             )
             return {"result": "ALLOW"}
         return {
@@ -1923,7 +2039,10 @@ def _cost_snapshot_from_conversations(
     }
 
 
-def _stored_cost_snapshot(event: dict[str, Any]) -> dict[str, Any]:
+def _stored_cost_snapshot(
+    event: dict[str, Any],
+    parent_session_id: str = "",
+) -> dict[str, Any]:
     """Read the canonical per-session rows; event usage is test-only fallback."""
 
     source_error = ""
@@ -1931,7 +2050,7 @@ def _stored_cost_snapshot(event: dict[str, Any]) -> dict[str, Any]:
         from omnigent.debug_logging import runner_primary_session_id
         from omnigent.runtime import get_conversation_store
 
-        root_id = runner_primary_session_id()
+        root_id = parent_session_id or runner_primary_session_id()
         if root_id:
             store = get_conversation_store()
             cursor: str | None = None
@@ -2025,7 +2144,25 @@ def strict_cost_budget(
     def evaluate(event: dict[str, Any]) -> dict[str, Any]:
         if event.get("type") not in {"request", "tool_call", "response"}:
             return {"result": "ALLOW"}
-        snapshot = _stored_cost_snapshot(event)
+        context = event.get("context")
+        parent_session_id = (
+            str(
+                context.get("root_conversation_id")
+                or context.get("conversation_id")
+                or ""
+            )
+            if isinstance(context, dict)
+            else ""
+        )
+        if (
+            not parent_session_id
+            and any(
+                record.get("parent_session_id")
+                for record in read_collections()
+            )
+        ):
+            return {"result": "ALLOW"}
+        snapshot = _stored_cost_snapshot(event, parent_session_id)
         if snapshot.get("available") is False:
             # The runner cannot observe canonical usage in-process. Allow this
             # evaluation to fall through to the server-side policy evaluation.
@@ -2033,7 +2170,10 @@ def strict_cost_budget(
         cost = float(snapshot["total_usd"])
         reported = float(snapshot["reported_usd"])
         estimated = float(snapshot["estimated_unpriced_usd"])
-        route = _next_route(read_collections())
+        route = _next_route(
+            read_collections(parent_session_id=parent_session_id),
+            parent_session_id=parent_session_id,
+        )
         projected_stage, reserve = _project_dispatch_cost(event)
         stage = projected_stage or route.title
         remaining = max(0.0, max_cost_usd - cost)
@@ -2071,10 +2211,11 @@ def strict_cost_budget(
                 projected_reserve_usd=reserve,
                 denial_reason=denial_reason,
                 sessions=snapshot.get("sessions", []),
+                parent_session_id=parent_session_id,
             )
         if denied:
             if authoritative:
-                _cost_value, calls = _failure_metrics()
+                _cost_value, calls = _failure_metrics(parent_session_id)
                 record_terminal_failure(
                     "PIPELINE_INFRASTRUCTURE_ERROR",
                     denial_reason,
@@ -2082,6 +2223,7 @@ def strict_cost_budget(
                     cycle=route.cycle,
                     cost_usd=cost,
                     calls=calls,
+                    parent_session_id=parent_session_id,
                 )
             return {"result": "DENY", "reason": denial_reason}
         return {"result": "ALLOW"}

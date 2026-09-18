@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -160,30 +161,42 @@ def materialize_run_config(
         + "\n"
     ).encode("utf-8")
     path = run_dir / "opus-mcp.json"
+    lock_fd = os.open(
+        run_dir / ".opus-mcp.lock",
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            existing = path.read_bytes()
-        except OSError as exc:
-            raise OpusConfigurationError(
-                f"run-scoped MCP config is unreadable: {exc}"
-            ) from exc
-        if existing != data:
-            raise OpusConfigurationError(
-                "run-scoped MCP config changed within this run"
-            )
-    else:
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                try:
+                    existing = path.read_bytes()
+                except OSError as exc:
+                    raise OpusConfigurationError(
+                        f"run-scoped MCP config is unreadable: {exc}"
+                    ) from exc
+                if existing != data:
+                    raise OpusConfigurationError(
+                        "run-scoped MCP config changed within this run"
+                    )
+            else:
+                try:
+                    os.write(fd, data)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                path.chmod(0o400)
+            if stat.S_IMODE(path.stat().st_mode) != 0o400:
+                raise OpusConfigurationError(
+                    "run-scoped MCP config is not immutable mode 0400"
+                )
         finally:
-            os.close(fd)
-        path.chmod(0o400)
-    if stat.S_IMODE(path.stat().st_mode) != 0o400:
-        raise OpusConfigurationError(
-            "run-scoped MCP config is not immutable mode 0400"
-        )
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
     return path
 
 

@@ -202,6 +202,7 @@ def _install_runner_session_inbox_initialization() -> None:
 
     def guarded_create_runner_app(*args: object, **kwargs: object) -> Any:
         application = original_create_runner_app(*args, **kwargs)
+        server_client = kwargs.get("server_client")
 
         @application.middleware("http")
         async def parent_inbox_lifecycle(request: Any, call_next: Any) -> Any:
@@ -211,6 +212,17 @@ def _install_runner_session_inbox_initialization() -> None:
             )
             if operation is not None and operation[0] == "initialize":
                 ensure_parent_inbox(operation[1])
+            active_child_ids: list[str] = []
+            if operation is not None and operation[0] == "cleanup":
+                active_child_ids = [
+                    str(entry.child_session_id)
+                    for entry in runner_app.list_subagent_work(operation[1])
+                    if getattr(entry, "status", "") in {
+                        "launching",
+                        "running",
+                        "waiting",
+                    }
+                ]
             response = await call_next(request)
             if (
                 operation is not None
@@ -218,6 +230,23 @@ def _install_runner_session_inbox_initialization() -> None:
                 and response.status_code < 400
             ):
                 session_id = operation[1]
+                from triple_stamp_runtime_state import tombstone_parent_session
+
+                tombstone_parent_session(session_id)
+                if server_client is not None:
+                    for child_id in active_child_ids:
+                        try:
+                            await server_client.delete(
+                                f"/v1/sessions/{child_id}",
+                                timeout=30.0,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                            logging.getLogger(__name__).warning(
+                                "failed to cancel child %s for deleted parent %s: %s",
+                                child_id,
+                                session_id,
+                                type(exc).__name__,
+                            )
                 runner_app._session_inboxes_ref.pop(session_id, None)
                 _parent_inbox_failures.pop(session_id, None)
                 _unknown_opus_dispatches.pop(session_id, None)
@@ -394,13 +423,27 @@ def _cursor_transcript_snapshot(
             ),
             -1,
         )
+        current_dispatch = (
+            dispatches[current_index] if current_index >= 0 else {}
+        )
+        parent_session_id = str(
+            current_dispatch.get("parent_session_id") or ""
+        )
         has_prior_cursor = current_index > 0 and any(
             record.get("agent") == "cursor_workhorse"
+            and str(record.get("parent_session_id") or "")
+            == parent_session_id
             for record in dispatches[:current_index]
+        )
+        has_foreign_cursor = any(
+            record.get("agent") == "cursor_workhorse"
+            and str(record.get("parent_session_id") or "")
+            != parent_session_id
+            for record in dispatches
         )
         candidates = (
             []
-            if has_prior_cursor
+            if has_prior_cursor or has_foreign_cursor
             else sorted(project_root.glob("*/agent-transcripts/*/*.jsonl"))
         )
         if len(candidates) == 1:
@@ -410,6 +453,8 @@ def _cursor_transcript_snapshot(
             candidates = []
             if has_prior_cursor:
                 metadata_source = "forwarder-required-after-prior-dispatch"
+            elif has_foreign_cursor:
+                metadata_source = "forwarder-required-after-parent-dispatch"
 
     snapshots: list[tuple[int, int, str, bytes]] = []
     for transcript in candidates:
@@ -1115,8 +1160,35 @@ def install_parent_inbox_guard() -> None:
                     leased.append(inbox.get_nowait())
                 except asyncio.QueueEmpty:
                     break
-            dispatches = read_dispatches()
-            enriched = [_enrich_packet(payload, dispatches) for payload in leased]
+            all_dispatches = read_dispatches()
+            dispatches = read_dispatches(
+                parent_session_id=str(conversation_id or "")
+            )
+            local_payloads: list[dict[str, object]] = []
+            for payload in leased:
+                child, work_id = _packet_identity(payload)
+                owner = next(
+                    (
+                        row
+                        for row in reversed(all_dispatches)
+                        if (work_id and row.get("work_id") == work_id)
+                        or (child and row.get("child_session_id") == child)
+                    ),
+                    {},
+                )
+                owner_parent = str(owner.get("parent_session_id") or "")
+                if (
+                    owner_parent
+                    and conversation_id
+                    and owner_parent != conversation_id
+                ):
+                    ensure_parent_inbox(owner_parent).put_nowait(payload)
+                    continue
+                local_payloads.append(payload)
+            enriched = [
+                _enrich_packet(payload, dispatches)
+                for payload in local_payloads
+            ]
             complete_cursor_ids = {
                 _packet_identity(payload)
                 for payload in enriched

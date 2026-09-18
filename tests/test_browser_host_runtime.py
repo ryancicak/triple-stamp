@@ -18,11 +18,14 @@ SCREENSHOT_HOME = Path(
     "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-asctomsx/home"
 )
 RUNTIME_PYTHON = ROOT / ".omnigent/runtime-python"
-if str(RUNTIME_PYTHON) not in sys.path:
-    sys.path.insert(0, str(RUNTIME_PYTHON))
+ISAAC_LAUNCHER = ROOT / ".omnigent/isaac-launcher"
+for import_path in (RUNTIME_PYTHON, ISAAC_LAUNCHER):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
 
 import triple_stamp_browser_runtime as browser  # noqa: E402
 import triple_stamp_cursor_lifecycle as lifecycle  # noqa: E402
+import triple_stamp_runtime_state as runtime_state  # noqa: E402
 
 
 def _module(name: str, path: Path):
@@ -830,6 +833,77 @@ class BrowserHostRuntimeTests(unittest.TestCase):
                 for session_id in session_ids:
                     runner_app._session_inboxes_ref.pop(session_id, None)
                 await server_client.aclose()
+
+        asyncio.run(scenario())
+
+    def test_parent_delete_cancels_children_and_tombstones_ledger(self) -> None:
+        async def scenario() -> None:
+            from omnigent.runner import app as runner_app
+
+            parent = "browser-delete-parent"
+            child = "browser-delete-child"
+            deleted_paths: list[str] = []
+
+            def server_handler(request: httpx.Request) -> httpx.Response:
+                if request.method == "DELETE":
+                    deleted_paths.append(request.url.path)
+                return httpx.Response(200, json={"deleted": True})
+
+            server_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(server_handler),
+                base_url="http://server.test",
+            )
+            with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+                os.environ,
+                {"TRIPLE_STAMP_RUN_DIR": value},
+                clear=False,
+            ):
+                runtime_state.append_dispatch(
+                    {
+                        "parent_session_id": parent,
+                        "child_session_id": child,
+                        "work_id": "delete-work",
+                        "agent": "cursor_workhorse",
+                        "title": "cursor-cycle-1",
+                    }
+                )
+                runner_app.register_subagent_work(
+                    parent_session_id=parent,
+                    child_session_id=child,
+                    agent="cursor_workhorse",
+                    title="cursor-cycle-1",
+                )
+                application = runner_app.create_runner_app(
+                    server_client=server_client
+                )
+                try:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=application),
+                        base_url="http://runner.test",
+                    ) as client:
+                        deleted = await client.delete(
+                            f"/v1/sessions/{parent}"
+                        )
+                    self.assertEqual(deleted.status_code, 200)
+                    self.assertIn(
+                        f"/v1/sessions/{child}",
+                        deleted_paths,
+                    )
+                    self.assertEqual(
+                        runtime_state.read_dispatches(
+                            parent_session_id=parent
+                        ),
+                        [],
+                    )
+                    raw = (
+                        Path(value) / "routing-dispatches.jsonl"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn('"record_type":"parent_tombstone"', raw)
+                finally:
+                    runner_app.unregister_subagent_work_for_session(parent)
+                    runner_app.unregister_subagent_work_for_session(child)
+                    runner_app._session_inboxes_ref.pop(parent, None)
+                    await server_client.aclose()
 
         asyncio.run(scenario())
 

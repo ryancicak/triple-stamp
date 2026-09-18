@@ -84,6 +84,44 @@ def _run_dir() -> Path | None:
     return Path(raw) if raw else None
 
 
+def _parent_artifact_path(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str = "",
+) -> Path:
+    """Return a parent-owned artifact path, preserving legacy single-run names."""
+
+    if not parent_session_id:
+        return run_dir / filename
+    digest = hashlib.sha256(parent_session_id.encode("utf-8")).hexdigest()[:16]
+    path = Path(filename)
+    return run_dir / f"{path.stem}-{digest}{path.suffix}"
+
+
+def _scope_parent_records(
+    records: list[dict[str, Any]],
+    parent_session_id: str,
+) -> list[dict[str, Any]]:
+    """Return only one parent's live ledger generation."""
+
+    if not parent_session_id:
+        return records
+    scoped = [
+        record
+        for record in records
+        if record.get("parent_session_id") == parent_session_id
+    ]
+    last_tombstone = max(
+        (
+            index
+            for index, record in enumerate(scoped)
+            if record.get("record_type") == "parent_tombstone"
+        ),
+        default=-1,
+    )
+    return scoped[last_tombstone + 1 :]
+
+
 def _append(filename: str, payload: dict[str, Any]) -> None:
     run_dir = _run_dir()
     if run_dir is None:
@@ -232,7 +270,9 @@ def append_dispatch(payload: dict[str, Any]) -> None:
     prior = next(
         (
             item
-            for item in read_dispatches()
+            for item in read_dispatches(
+                parent_session_id=str(record.get("parent_session_id") or "")
+            )
             if item.get("agent") == record.get("agent")
             and item.get("title") == record.get("title")
         ),
@@ -247,8 +287,11 @@ def append_dispatch(payload: dict[str, Any]) -> None:
         begin_cursor_lifecycle(record)
 
 
-def read_dispatches() -> list[dict[str, Any]]:
-    return _read("routing-dispatches.jsonl")
+def read_dispatches(parent_session_id: str = "") -> list[dict[str, Any]]:
+    return _scope_parent_records(
+        _read("routing-dispatches.jsonl"),
+        parent_session_id,
+    )
 
 
 def _cursor_state_path(child_session_id: str) -> Path | None:
@@ -462,7 +505,11 @@ def _audit_next_dispatch_note(
     try:
         from triple_stamp_isaac_launcher import _next_route
 
-        route = _next_route([*read_collections(), record])
+        parent_session_id = str(record.get("parent_session_id") or "")
+        route = _next_route(
+            [*read_collections(parent_session_id=parent_session_id), record],
+            parent_session_id=parent_session_id,
+        )
     except (ImportError, TypeError, ValueError):
         return ""
     agent = str(getattr(route, "agent", "") or "")
@@ -1051,6 +1098,7 @@ def append_collection(payload: dict[str, Any]) -> None:
     """Record one packet plus an immutable digest-addressed artifact."""
 
     record = _add_codex_punch_metadata(dict(payload))
+    record.setdefault("collected_at_ns", time.time_ns())
     output = record.get("output")
     run_dir = _run_dir()
     if run_dir is not None and isinstance(output, str):
@@ -1083,8 +1131,25 @@ def append_collection(payload: dict[str, Any]) -> None:
     _append("routing-collections.jsonl", record)
 
 
-def read_collections() -> list[dict[str, Any]]:
-    return _read("routing-collections.jsonl")
+def read_collections(parent_session_id: str = "") -> list[dict[str, Any]]:
+    return _scope_parent_records(
+        _read("routing-collections.jsonl"),
+        parent_session_id,
+    )
+
+
+def tombstone_parent_session(parent_session_id: str) -> None:
+    """End one parent's ledger generation without affecting sibling sessions."""
+
+    if not parent_session_id:
+        return
+    marker = {
+        "record_type": "parent_tombstone",
+        "parent_session_id": parent_session_id,
+        "recorded_at_ns": time.time_ns(),
+    }
+    _append("routing-dispatches.jsonl", marker)
+    _append("routing-collections.jsonl", marker)
 
 
 def attest_codex_stamp(payload: dict[str, Any]) -> bool:
@@ -1115,6 +1180,12 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         return False
     if stamp is None:
         return False
+    parent_session_id = str(payload.get("parent_session_id") or "")
+    if (
+        not parent_session_id
+        and any(record.get("parent_session_id") for record in read_collections())
+    ):
+        return False
     check = stamp.get("voice_profile_check") if isinstance(stamp, dict) else None
     answer = stamp.get("shippable_answer") if isinstance(stamp, dict) else None
     expected_profile = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
@@ -1138,7 +1209,8 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     title = str(payload.get("title") or "")
     match = re.fullmatch(r"judge-(?:cycle|convergence)-([1-4])", title)
     if match is None or not _has_required_stage_chain(
-        read_collections(), int(match.group(1))
+        read_collections(parent_session_id=parent_session_id),
+        int(match.group(1)),
     ):
         return False
     attestation = {
@@ -1149,6 +1221,7 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         "title": title,
         "child_session_id": payload.get("child_session_id"),
         "work_id": payload.get("work_id"),
+        "parent_session_id": parent_session_id,
         "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
         "answer_length": len(answer_bytes),
         "voice_profile_sha256": expected_profile,
@@ -1165,9 +1238,20 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
             os.close(fd)
 
     try:
-        create_once(run_dir / "stamped-answer.bin", answer_bytes)
         create_once(
-            run_dir / "stamp-attestation.json",
+            _parent_artifact_path(
+                run_dir,
+                "stamped-answer.bin",
+                parent_session_id,
+            ),
+            answer_bytes,
+        )
+        create_once(
+            _parent_artifact_path(
+                run_dir,
+                "stamp-attestation.json",
+                parent_session_id,
+            ),
             (
                 json.dumps(attestation, sort_keys=True, separators=(",", ":"))
                 + "\n"
@@ -1178,11 +1262,65 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     return True
 
 
-def append_supervisor_tool_call(name: str) -> int:
+def read_attested_answer(parent_session_id: str = "") -> str:
+    """Return one parent's immutable attested answer after digest verification."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return ""
+    try:
+        attestation = json.loads(
+            _parent_artifact_path(
+                run_dir,
+                "stamp-attestation.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+        answer = _parent_artifact_path(
+            run_dir,
+            "stamped-answer.bin",
+            parent_session_id,
+        ).read_bytes()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("verdict") != "STAMP"
+        or (
+            parent_session_id
+            and attestation.get("parent_session_id") != parent_session_id
+        )
+        or attestation.get("answer_length") != len(answer)
+        or not isinstance(attestation.get("answer_sha256"), str)
+        or not hashlib.sha256(answer).hexdigest()
+        == attestation["answer_sha256"]
+    ):
+        return ""
+    try:
+        return answer.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def append_supervisor_tool_call(
+    name: str,
+    parent_session_id: str = "",
+) -> int:
     """Record and return the durable supervisor tool-call count."""
 
-    _append("supervisor-tool-calls.jsonl", {"name": str(name)})
-    return len(_read("supervisor-tool-calls.jsonl"))
+    _append(
+        "supervisor-tool-calls.jsonl",
+        {
+            "name": str(name),
+            "parent_session_id": parent_session_id,
+        },
+    )
+    return len(
+        _scope_parent_records(
+            _read("supervisor-tool-calls.jsonl"),
+            parent_session_id,
+        )
+    )
 
 
 def append_supervisor_continuation(payload: dict[str, Any]) -> None:
@@ -1193,10 +1331,15 @@ def append_supervisor_continuation(payload: dict[str, Any]) -> None:
     _append("supervisor-continuations.jsonl", record)
 
 
-def read_supervisor_continuations() -> list[dict[str, Any]]:
+def read_supervisor_continuations(
+    parent_session_id: str = "",
+) -> list[dict[str, Any]]:
     """Return the run-local supervisor continuation ledger."""
 
-    return _read("supervisor-continuations.jsonl")
+    return _scope_parent_records(
+        _read("supervisor-continuations.jsonl"),
+        parent_session_id,
+    )
 
 
 def write_budget_state(
@@ -1211,6 +1354,7 @@ def write_budget_state(
     projected_reserve_usd: float = 0.0,
     denial_reason: str = "",
     sessions: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
 ) -> None:
     """Atomically retain the latest canonical cumulative budget decision."""
 
@@ -1248,19 +1392,43 @@ def write_budget_state(
         "denial_reason": " ".join(str(denial_reason).split())[:2000],
         "sessions": sessions or [],
     }
-    temporary = run_dir / f".budget-state-{os.getpid()}.tmp"
+    destination = _parent_artifact_path(
+        run_dir,
+        "budget-state.json",
+        parent_session_id,
+    )
+    temporary = destination.with_name(f".{destination.name}-{os.getpid()}.tmp")
     try:
         temporary.write_text(
             json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         temporary.chmod(0o600)
-        os.replace(temporary, run_dir / "budget-state.json")
+        os.replace(temporary, destination)
     finally:
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def read_budget_state(parent_session_id: str = "") -> dict[str, Any]:
+    """Return the latest budget decision for one root conversation."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return {}
+    try:
+        payload = json.loads(
+            _parent_artifact_path(
+                run_dir,
+                "budget-state.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def record_terminal_failure(
@@ -1271,6 +1439,7 @@ def record_terminal_failure(
     cycle: int = 0,
     cost_usd: float | None = None,
     calls: int | None = None,
+    parent_session_id: str = "",
 ) -> str:
     """Create one immutable sanitized terminal failure result and attestation."""
 
@@ -1286,12 +1455,7 @@ def record_terminal_failure(
             f"{normalized_kind}: stage {stage or 'unknown'}, cycle {max(0, int(cycle))}; "
             f"continuation denied: {clean_reason or 'unspecified terminal failure'}"
         )
-    try:
-        budget = json.loads(
-            (run_dir / "budget-state.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError, json.JSONDecodeError):
-        budget = {}
+    budget = read_budget_state(parent_session_id)
     reported = budget.get("reported_usd")
     estimated = budget.get("estimated_unpriced_usd")
     remaining = budget.get("remaining_usd")
@@ -1323,6 +1487,7 @@ def record_terminal_failure(
         "remaining_usd": remaining,
         "max_cost_usd": maximum,
         "calls": calls,
+        "parent_session_id": parent_session_id,
     }
 
     def create_once(path: Path, data: bytes) -> None:
@@ -1334,9 +1499,20 @@ def record_terminal_failure(
             os.close(fd)
 
     for path, data in (
-        (run_dir / "terminal-failure.txt", result.encode("utf-8")),
         (
-            run_dir / "failure-attestation.json",
+            _parent_artifact_path(
+                run_dir,
+                "terminal-failure.txt",
+                parent_session_id,
+            ),
+            result.encode("utf-8"),
+        ),
+        (
+            _parent_artifact_path(
+                run_dir,
+                "failure-attestation.json",
+                parent_session_id,
+            ),
             (
                 json.dumps(attestation, sort_keys=True, separators=(",", ":"))
                 + "\n"
@@ -1348,26 +1524,30 @@ def record_terminal_failure(
         except FileExistsError:
             pass
     try:
-        return (run_dir / "terminal-failure.txt").read_text(encoding="utf-8")
+        return _parent_artifact_path(
+            run_dir,
+            "terminal-failure.txt",
+            parent_session_id,
+        ).read_text(encoding="utf-8")
     except OSError:
         return result
 
 
-def read_terminal_failure() -> str:
-    """Return the run's recorded terminal failure text, or "" if none exists.
+def read_terminal_failure(parent_session_id: str = "") -> str:
+    """Return one parent's recorded terminal failure text, or "" if absent.
 
-    `record_terminal_failure` writes `terminal-failure.txt` with `O_EXCL`, so
-    the first failure wins and this is a stable, once-only fact about the run.
-    Every writer of that file has already decided the run is over: the state
-    machine's terminal marker, a budget denial that blocked the dispatch, and
-    the supervisor guard itself. Nothing downstream should keep dispatching
-    after it exists.
+    Each parent gets an immutable file, so a sibling failure cannot terminate
+    or overwrite this conversation.
     """
 
     run_dir = _run_dir()
     if run_dir is None:
         return ""
     try:
-        return (run_dir / "terminal-failure.txt").read_text(encoding="utf-8").strip()
+        return _parent_artifact_path(
+            run_dir,
+            "terminal-failure.txt",
+            parent_session_id,
+        ).read_text(encoding="utf-8").strip()
     except OSError:
         return ""

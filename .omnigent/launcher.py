@@ -2370,17 +2370,50 @@ def _reset_pipeline_outputs(run_dir: Path) -> None:
         shutil.rmtree(run_dir / directory, ignore_errors=True)
 
 
-def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) -> int:
+def _parent_artifact_path(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str = "",
+) -> Path:
+    if not parent_session_id:
+        return run_dir / filename
+    digest = hashlib.sha256(parent_session_id.encode("utf-8")).hexdigest()[:16]
+    path = Path(filename)
+    return run_dir / f"{path.stem}-{digest}{path.suffix}"
+
+
+def _validated_pipeline_exit(
+    run_dir: Path,
+    child_code: int,
+    args: list[str],
+    parent_session_id: str = "",
+) -> int:
     """Return zero only for self-test or an immutable collected STAMP."""
 
     if any(arg in SELF_TEST_FLAGS for arg in args):
         return child_code
 
     try:
-        attestation = json.loads(
-            (run_dir / "stamp-attestation.json").read_text(encoding="utf-8")
+        attestation_path = _parent_artifact_path(
+            run_dir,
+            "stamp-attestation.json",
+            parent_session_id,
         )
-        answer = (run_dir / "stamped-answer.bin").read_bytes()
+        if not parent_session_id and not attestation_path.exists():
+            candidates = sorted(run_dir.glob("stamp-attestation-*.json"))
+            if len(candidates) == 1:
+                attestation_path = candidates[0]
+        attestation = json.loads(
+            attestation_path.read_text(encoding="utf-8")
+        )
+        attested_parent = str(
+            attestation.get("parent_session_id") or parent_session_id
+        )
+        answer = _parent_artifact_path(
+            run_dir,
+            "stamped-answer.bin",
+            attested_parent,
+        ).read_bytes()
     except (OSError, ValueError, json.JSONDecodeError):
         _ensure_terminal_failure(run_dir, child_code)
         return child_code if child_code != 0 else EXIT_PIPELINE
@@ -2405,6 +2438,12 @@ def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) ->
             .splitlines()
             if line.strip()
         ]
+        if attested_parent:
+            collections = [
+                record
+                for record in collections
+                if record.get("parent_session_id") == attested_parent
+            ]
     except OSError:
         _ensure_terminal_failure(
             run_dir,
@@ -2473,6 +2512,10 @@ def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) ->
         and required_chain
         and not observed_nonmax_opus_effort
         and attestation.get("answer_length") == len(answer)
+        and (
+            not attested_parent
+            or attestation.get("parent_session_id") == attested_parent
+        )
         and isinstance(attestation.get("answer_sha256"), str)
         and secrets.compare_digest(answer_digest, attestation["answer_sha256"])
         and isinstance(attestation.get("voice_profile_sha256"), str)
@@ -2775,7 +2818,19 @@ def _emit_attested_answer(run_dir: Path, args: list[str]) -> None:
 
     if not _prompt_mode(args):
         return
-    answer = (run_dir / "stamped-answer.bin").read_bytes()
+    answer_path = run_dir / "stamped-answer.bin"
+    if not answer_path.exists():
+        attestations = sorted(run_dir.glob("stamp-attestation-*.json"))
+        if len(attestations) == 1:
+            attestation = json.loads(
+                attestations[0].read_text(encoding="utf-8")
+            )
+            answer_path = _parent_artifact_path(
+                run_dir,
+                "stamped-answer.bin",
+                str(attestation.get("parent_session_id") or ""),
+            )
+    answer = answer_path.read_bytes()
     sys.stdout.buffer.write(answer)
     sys.stdout.buffer.flush()
 
@@ -2785,7 +2840,19 @@ def _emit_terminal_failure(run_dir: Path, args: list[str]) -> None:
 
     if not _prompt_mode(args):
         return
-    data = (run_dir / "terminal-failure.txt").read_bytes()
+    failure_path = run_dir / "terminal-failure.txt"
+    if not failure_path.exists():
+        attestations = sorted(run_dir.glob("failure-attestation-*.json"))
+        if len(attestations) == 1:
+            attestation = json.loads(
+                attestations[0].read_text(encoding="utf-8")
+            )
+            failure_path = _parent_artifact_path(
+                run_dir,
+                "terminal-failure.txt",
+                str(attestation.get("parent_session_id") or ""),
+            )
+    data = failure_path.read_bytes()
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
 

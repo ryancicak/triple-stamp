@@ -2678,6 +2678,10 @@ print("exact temp boundary: PASS")
             decision = plugin.supervisor_contract(enabled=True)(
                 {
                     "type": "response",
+                    "context": {
+                        "conversation_id": "parent",
+                        "root_conversation_id": "parent",
+                    },
                     "data": (
                         "PIPELINE_INFRASTRUCTURE_ERROR: "
                         "audit-format-repair-1 returned an invalid contract"
@@ -6010,6 +6014,13 @@ print("exact temp boundary: PASS")
 
         self.assertEqual(parent, "browser-a")
         self.assertEqual(
+            supervisor_runtime._dispatch_parent_session_id(
+                dispatches,
+                {"child-a", "child-b"},
+            ),
+            "",
+        )
+        self.assertEqual(
             completed_child_ids,
             {"540f937b5b7c4d0ea313cb8a637ffc65"},
         )
@@ -6018,6 +6029,34 @@ print("exact temp boundary: PASS")
             supervisor_runtime._records_for_session(records, parent),
             [records[0]],
         )
+
+    def test_supervisor_refuses_unscoped_multi_parent_reduction(self) -> None:
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            for parent in ("parent-a", "parent-b"):
+                runtime_state.append_collection(
+                    {
+                        **_route_packet(
+                            "cursor_workhorse",
+                            "cursor-cycle-1",
+                            parent,
+                        ),
+                        "parent_session_id": parent,
+                    }
+                )
+            contract = plugin.supervisor_contract(enabled=True)
+            denied = contract(
+                {"type": "response", "data": "union answer"}
+            )
+            self.assertEqual(denied["result"], "DENY")
+            self.assertIn("cross-parent", denied["reason"])
+            self.assertEqual(
+                contract({"type": "response", "data": ""}),
+                {"result": "ALLOW"},
+            )
 
     def test_nonterminal_runtime_suppresses_status_after_pending_dispatch(
         self,
@@ -6054,6 +6093,7 @@ print("exact temp boundary: PASS")
                     "title": "judge-convergence-2",
                     "child_session_id": "convergence-child",
                     "work_id": "convergence-work",
+                    "parent_session_id": "parent",
                 }
             )
             yield TextChunk("status prose after dispatch")
@@ -6095,7 +6135,9 @@ print("exact temp boundary: PASS")
                     "codex_judge", "judge-cycle-2", _judgment("REWORK")
                 ),
             ):
-                runtime_state.append_collection(record)
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": "parent"}
+                )
             claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
             try:
                 supervisor_runtime.install_supervisor_continuation_guard()
@@ -6134,6 +6176,10 @@ print("exact temp boundary: PASS")
             self.assertEqual(
                 [row["action"] for row in continuation],
                 ["continuation_enqueued", "ordinary_response_suppressed"],
+            )
+            self.assertIn(
+                (value, "parent"),
+                supervisor_runtime._NARRATED_STAGES,
             )
 
     def test_later_cursor_cycle_cannot_claim_prior_single_transcript(self) -> None:
@@ -7196,7 +7242,9 @@ print("exact temp boundary: PASS")
                 _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"),
                 _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
             ):
-                runtime_state.append_collection(record)
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": "misroute-parent"}
+                )
             claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
             try:
                 supervisor_runtime.install_supervisor_continuation_guard()
@@ -7293,7 +7341,9 @@ print("exact temp boundary: PASS")
                 _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"),
                 _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
             ):
-                runtime_state.append_collection(record)
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": "abstain-parent"}
+                )
             claude_sdk_executor.ClaudeSDKExecutor.run_turn = always_misroutes
             try:
                 supervisor_runtime.install_supervisor_continuation_guard()
@@ -7383,7 +7433,9 @@ print("exact temp boundary: PASS")
                 _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"),
                 _route_packet("opus_auditor", "audit-cycle-1", _audit("FAIL")),
             ):
-                runtime_state.append_collection(record)
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": "terminal-parent"}
+                )
             claude_sdk_executor.ClaudeSDKExecutor.run_turn = never_dispatches
             try:
                 supervisor_runtime.install_supervisor_continuation_guard()
@@ -7393,7 +7445,9 @@ print("exact temp boundary: PASS")
                 after = asyncio.run(collect())
             finally:
                 claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
-            recorded = runtime_state.read_terminal_failure()
+            recorded = runtime_state.read_terminal_failure(
+                parent_session_id="terminal-parent"
+            )
             actions = [
                 row["action"]
                 for row in runtime_state.read_supervisor_continuations()
@@ -7511,7 +7565,9 @@ print("exact temp boundary: PASS")
                     _judgment("NEEDS_INTERNAL"),
                 ),
             ):
-                runtime_state.append_collection(record)
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": "observer-parent"}
+                )
             claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
             try:
                 supervisor_runtime.install_supervisor_continuation_guard()
@@ -7692,6 +7748,342 @@ print("exact temp boundary: PASS")
             self.assertEqual(records[0]["cycle"], 1)
             self.assertEqual(records[0]["requester"], "opus")
             self.assertNotIn("resume_child_session_id", records[1])
+
+    def test_parent_scoped_pending_and_resume_ignore_same_title_sibling(
+        self,
+    ) -> None:
+        parent_a = "parent-math"
+        parent_b = "parent-lakebase"
+        route = plugin._Route(
+            "dispatch",
+            1,
+            "cursor_workhorse",
+            "cursor-cycle-1",
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent_a,
+                    "child_session_id": "math-child",
+                    "work_id": "math-work",
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                }
+            )
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent_b,
+                    "child_session_id": "lakebase-child",
+                    "work_id": "lakebase-work",
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                }
+            )
+            dispatches = runtime_state.read_dispatches()
+            self.assertNotIn(
+                "resume_child_session_id",
+                runtime_state.read_dispatches(
+                    parent_session_id=parent_b
+                )[-1],
+            )
+            self.assertTrue(
+                plugin._route_dispatch_pending(
+                    route,
+                    [],
+                    dispatches,
+                    parent_session_id=parent_a,
+                )
+            )
+            runtime_state.append_collection(
+                {
+                    "parent_session_id": parent_a,
+                    "child_session_id": "math-child",
+                    "work_id": "math-work",
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                    "status": "completed",
+                    "output": "4",
+                }
+            )
+            self.assertFalse(
+                plugin._route_dispatch_pending(
+                    route,
+                    runtime_state.read_collections(),
+                    dispatches,
+                    parent_session_id=parent_a,
+                )
+            )
+            self.assertTrue(
+                plugin._route_dispatch_pending(
+                    route,
+                    runtime_state.read_collections(),
+                    dispatches,
+                    parent_session_id=parent_b,
+                )
+            )
+
+    def test_stamp_and_terminal_failure_are_owned_by_parent(self) -> None:
+        parent_a = "parent-math"
+        parent_b = "parent-lakebase"
+        answer = "2 + 2 = 4."
+        stamp = json.dumps(
+            {
+                "verdict": "STAMP",
+                "needs_web": False,
+                "needs_internal": False,
+                "why": "integer arithmetic is complete",
+                "gap_materiality": "none",
+                "limitations": [],
+                "citations_that_hold": ["Stage 1 arithmetic evidence"],
+                "voice_profile_check": {
+                    "source_path": "",
+                    "sha256": "",
+                    "constraints_applied": "none",
+                },
+                "shippable_answer": answer,
+            }
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            for packet in (
+                _route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "2 + 2 = 4",
+                ),
+                _route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS"),
+                ),
+            ):
+                runtime_state.append_collection(
+                    {**packet, "parent_session_id": parent_a}
+                )
+            judge = {
+                **_route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    stamp,
+                ),
+                "parent_session_id": parent_a,
+            }
+            runtime_state.append_collection(judge)
+            self.assertTrue(runtime_state.attest_codex_stamp(judge))
+
+            # B has no Cursor/Opus chain, so A's completed chain cannot attest B.
+            foreign_judge = {**judge, "parent_session_id": parent_b}
+            runtime_state.append_collection(foreign_judge)
+            self.assertFalse(runtime_state.attest_codex_stamp(foreign_judge))
+
+            failure_b = runtime_state.record_terminal_failure(
+                "PIPELINE_VALIDATION_FAILED",
+                "Lakebase audit exhausted",
+                stage="audit-internal-2-2",
+                cycle=2,
+                parent_session_id=parent_b,
+            )
+            self.assertEqual(
+                runtime_state.read_attested_answer(parent_a),
+                answer,
+            )
+            self.assertEqual(
+                runtime_state.read_terminal_failure(parent_a),
+                "",
+            )
+            self.assertEqual(
+                runtime_state.read_terminal_failure(parent_b),
+                failure_b,
+            )
+            self.assertEqual(
+                launcher._validated_pipeline_exit(
+                    Path(value),
+                    0,
+                    [],
+                    parent_session_id=parent_a,
+                ),
+                0,
+            )
+            digest_a = hashlib.sha256(parent_a.encode()).hexdigest()[:16]
+            digest_b = hashlib.sha256(parent_b.encode()).hexdigest()[:16]
+            run = Path(value)
+            self.assertTrue(
+                (run / f"stamp-attestation-{digest_a}.json").is_file()
+            )
+            self.assertTrue(
+                (run / f"terminal-failure-{digest_b}.txt").is_file()
+            )
+            self.assertFalse((run / "terminal-failure.txt").exists())
+
+    def test_stamped_parent_relay_wins_over_sibling_failure(self) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        parent_a = "parent-math-relay"
+        parent_b = "parent-lakebase-failure"
+        answer = "2 + 2 = 4."
+        stamp = json.dumps(
+            {
+                "verdict": "STAMP",
+                "needs_web": False,
+                "needs_internal": False,
+                "why": "complete",
+                "gap_materiality": "none",
+                "limitations": [],
+                "citations_that_hold": ["arithmetic evidence"],
+                "voice_profile_check": {
+                    "source_path": "",
+                    "sha256": "",
+                    "constraints_applied": "none",
+                },
+                "shippable_answer": answer,
+            }
+        )
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+
+        async def must_not_run(*_args: object, **_kwargs: object):
+            nonlocal model_turns
+            model_turns += 1
+            yield TurnComplete(response="wrong")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    [
+                        {
+                            "role": "user",
+                            "content": "sibling wake",
+                            "session_id": parent_a,
+                        }
+                    ],
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            for packet in (
+                _route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "2 + 2 = 4",
+                ),
+                _route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS"),
+                ),
+            ):
+                runtime_state.append_collection(
+                    {**packet, "parent_session_id": parent_a}
+                )
+            judge = {
+                **_route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    stamp,
+                ),
+                "parent_session_id": parent_a,
+            }
+            runtime_state.append_collection(judge)
+            self.assertTrue(runtime_state.attest_codex_stamp(judge))
+            runtime_state.record_terminal_failure(
+                "PIPELINE_VALIDATION_FAILED",
+                "sibling exhausted internal hops",
+                stage="audit-internal-2-2",
+                cycle=2,
+                parent_session_id=parent_b,
+            )
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = must_not_run
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+
+        self.assertEqual(model_turns, 0)
+        self.assertEqual(
+            "".join(
+                event.text
+                for event in events
+                if isinstance(event, TextChunk)
+            ),
+            answer,
+        )
+        self.assertEqual(
+            [
+                event.response
+                for event in events
+                if isinstance(event, TurnComplete)
+            ],
+            [answer],
+        )
+
+    def test_budget_denial_is_parent_scoped(self) -> None:
+        snapshot = {
+            "available": True,
+            "source": "conversation_store",
+            "total_usd": 51.0,
+            "reported_usd": 51.0,
+            "estimated_unpriced_usd": 0.0,
+            "sessions": [],
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ), mock.patch.object(
+            plugin,
+            "_stored_cost_snapshot",
+            return_value=snapshot,
+        ):
+            decision = plugin.strict_cost_budget(50.0)(
+                {
+                    "type": "request",
+                    "context": {
+                        "conversation_id": "budget-parent-a",
+                        "root_conversation_id": "budget-parent-a",
+                    },
+                }
+            )
+            self.assertEqual(decision["result"], "DENY")
+            self.assertTrue(
+                runtime_state.read_terminal_failure("budget-parent-a")
+            )
+            self.assertEqual(
+                runtime_state.read_terminal_failure("budget-parent-b"),
+                "",
+            )
+            self.assertFalse(
+                (Path(value) / "terminal-failure.txt").exists()
+            )
 
 
 if __name__ == "__main__":

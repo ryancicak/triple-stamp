@@ -6,6 +6,8 @@ import os
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -179,6 +181,55 @@ class OpusLaunchTests(unittest.TestCase):
         self.assertEqual(path.name, "opus-mcp.json")
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), selected)
+
+    def test_simultaneous_materialization_never_observes_empty_config(
+        self,
+    ) -> None:
+        selected = mcp.load_generated_mcp_config(self.home)
+        second_started = threading.Event()
+        original_write = mcp.os.write
+        first_write = True
+        results: list[Path] = []
+        failures: list[BaseException] = []
+
+        def delayed_write(fd: int, data: bytes) -> int:
+            nonlocal first_write
+            if first_write:
+                first_write = False
+                self.assertTrue(second_started.wait(timeout=2.0))
+                time.sleep(0.05)
+            return original_write(fd, data)
+
+        def materialize(*, announce: bool = False) -> None:
+            if announce:
+                second_started.set()
+            try:
+                results.append(
+                    mcp.materialize_run_config(self.run_dir, selected)
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        with mock.patch.object(mcp.os, "write", side_effect=delayed_write):
+            first = threading.Thread(target=materialize)
+            second = threading.Thread(
+                target=materialize,
+                kwargs={"announce": True},
+            )
+            first.start()
+            time.sleep(0.01)
+            second.start()
+            first.join(timeout=3.0)
+            second.join(timeout=3.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(results, [self.run_dir / "opus-mcp.json"] * 2)
+        self.assertEqual(
+            json.loads(results[0].read_text(encoding="utf-8")),
+            selected,
+        )
 
     def test_absent_internal_family_becomes_audit_gap_not_launch_failure(
         self,
