@@ -34,6 +34,14 @@ _OPUS_UNKNOWN_COMPLETION_PREFIX = (
     "PIPELINE_INFRASTRUCTURE_ERROR: Opus native dispatch timed out after "
     "child creation; completion is unknown and duplicate paid launch is forbidden"
 )
+_DUPLICATE_CURSOR_DISPATCH = (
+    "Error: duplicate Cursor dispatch denied; this attempt already dispatched "
+    "or completed that cycle, or advanced to a later stage"
+)
+_DUPLICATE_OPUS_RETRY_DISPATCH = (
+    "Error: duplicate paid Opus retry denied; this attempt/cycle already "
+    "dispatched its one reserved retry"
+)
 _DISPATCH_BOOKKEEPING_ERRORS = (
     AttributeError,
     IndexError,
@@ -813,6 +821,10 @@ def install_parent_inbox_guard() -> None:
         append_dispatch,
         attest_codex_stamp,
         mutate_cursor_lifecycle,
+        parse_dispatch_title,
+        read_attempt_collections,
+        read_attempt_dispatches,
+        read_collections,
         read_cursor_lifecycle,
         read_dispatches,
         record_tool_dispatch_exception,
@@ -1073,6 +1085,51 @@ def install_parent_inbox_guard() -> None:
                 and conversation_id in _unknown_opus_dispatches
             ):
                 return _unknown_opus_dispatches[conversation_id]
+            parent_session_id = str(conversation_id or "")
+            parsed = parse_dispatch_title(title)
+            if parent_session_id and parsed is not None:
+                dispatches = read_attempt_dispatches(
+                    parent_session_id=parent_session_id
+                )
+                collections = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                active = (*dispatches, *collections)
+                if (
+                    agent == "cursor_workhorse"
+                    and parsed["stage_id"] == "cursor_grunt"
+                    and (
+                        any(record.get("title") == title for record in active)
+                        or any(
+                            (
+                                later := parse_dispatch_title(
+                                    record.get("title")
+                                )
+                            )
+                            is not None
+                            and later["cycle"] == parsed["cycle"]
+                            and later["stage_id"] != "cursor_grunt"
+                            for record in active
+                        )
+                    )
+                ):
+                    return _DUPLICATE_CURSOR_DISPATCH
+                if (
+                    agent == "opus_auditor"
+                    and parsed["stage_id"] == "audit_retry"
+                    and any(
+                        (
+                            prior := parse_dispatch_title(
+                                record.get("title")
+                            )
+                        )
+                        is not None
+                        and prior["stage_id"] == "audit_retry"
+                        and prior["cycle"] == parsed["cycle"]
+                        for record in active
+                    )
+                ):
+                    return _DUPLICATE_OPUS_RETRY_DISPATCH
             try:
                 result = await original_send(
                     args,

@@ -29,14 +29,19 @@ from triple_stamp_runtime_state import (
     current_attempt_generation,
     initialize_attempt_cost_baseline,
     parse_dispatch_title,
+    read_attempt_collections,
+    read_attempt_dispatches,
     read_attempt_cost_baseline,
     read_attested_answer,
+    read_best_effort_answer,
     read_budget_state,
     read_collections,
     read_dispatches,
+    read_terminal_failure,
     record_best_effort_answer,
     read_supervisor_tool_calls,
     record_terminal_failure,
+    reserve_opus_retry,
     write_budget_state,
 )
 
@@ -1690,7 +1695,7 @@ def _latest_codex_stamp(
     parent_session_id: str = "",
 ) -> tuple[str, int] | None:
     records = (
-        read_collections(parent_session_id=parent_session_id)
+        read_attempt_collections(parent_session_id=parent_session_id)
         if parent_session_id
         else _completion_records()
     )
@@ -1941,7 +1946,7 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
         "produced no output",
     )
     records = (
-        read_collections(parent_session_id=parent_session_id)
+        read_attempt_collections(parent_session_id=parent_session_id)
         if parent_session_id
         else _completion_records()
     )
@@ -1964,7 +1969,9 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
         lowered = output.lower()
         if any(marker in lowered for marker in pin_markers):
             return True
-    for record in read_collections(parent_session_id=parent_session_id):
+    for record in read_attempt_collections(
+        parent_session_id=parent_session_id
+    ):
         title = str(record.get("title", ""))
         if title.startswith("audit-format-repair-") and _valid_audit(
             record.get("output")
@@ -1976,7 +1983,7 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
 def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
     cycles: set[int] = set()
     records = (
-        read_collections(parent_session_id=parent_session_id)
+        read_attempt_collections(parent_session_id=parent_session_id)
         if parent_session_id
         else _completion_records()
     )
@@ -2026,7 +2033,7 @@ def _mark_terminal(
         return
     if kind != "STAMP":
         route = _next_route(
-            read_collections(parent_session_id=parent_session_id),
+            read_attempt_collections(parent_session_id=parent_session_id),
             parent_session_id=parent_session_id,
         )
         cost, calls = _failure_metrics(parent_session_id)
@@ -2107,8 +2114,9 @@ def supervisor_contract(
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Observe routing calls and enforce terminal and paid-retry safety.
 
-    The only tool-call denial is a second transient Opus retry, which must never
-    launch a duplicate paid child even if supervisor prose asks for it.
+    A transient Opus retry is atomically reserved before native dispatch, and a
+    Cursor stage can never be resumed after its first dispatch. These denials
+    prevent duplicate paid work even if stale supervisor context asks for it.
     """
 
     def evaluate(event: dict[str, Any]) -> dict[str, Any]:
@@ -2140,17 +2148,82 @@ def supervisor_contract(
                 if isinstance(arguments, dict)
                 else ""
             )
-            if (
-                str(raw_name or "").rsplit("__", 1)[-1] == "sys_session_send"
-                and re.fullmatch(r"audit-retry-[1-4]-(?:[2-9]|[1-9][0-9]+)", title)
+            if str(raw_name or "").rsplit("__", 1)[-1] != "sys_session_send":
+                return {"result": "ALLOW"}
+            if parent_session_id and (
+                read_attested_answer(parent_session_id)
+                or read_best_effort_answer(parent_session_id)
+                or read_terminal_failure(parent_session_id)
+                or _latest_codex_stamp(parent_session_id) is not None
             ):
                 return {
                     "result": "DENY",
                     "reason": (
-                        "Only one paid transient Opus retry is allowed per "
-                        "cycle; audit-retry-N-2 and higher are forbidden."
+                        "This attempt already has a terminal answer or failure; "
+                        "all further child dispatch is forbidden."
                     ),
                 }
+            parsed = _stage(title)
+            if (
+                parsed is not None
+                and parsed.kind == "cursor_grunt"
+                and parent_session_id
+            ):
+                active_records = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                active_dispatches = read_attempt_dispatches(
+                    parent_session_id=parent_session_id
+                )
+                cursor_already_spent = any(
+                    record.get("title") == title
+                    for record in (*active_dispatches, *active_records)
+                )
+                later_stage_started = any(
+                    (record_stage := _stage(record.get("title"))) is not None
+                    and record_stage.cycle == parsed.cycle
+                    and record_stage.kind != "cursor_grunt"
+                    for record in (*active_dispatches, *active_records)
+                )
+                if cursor_already_spent or later_stage_started:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"{title} was already dispatched or superseded by "
+                            "a later stage in this attempt; duplicate Cursor "
+                            "resume/relaunch is forbidden."
+                        ),
+                    }
+            if title.startswith("audit-retry-"):
+                retry = re.fullmatch(r"audit-retry-([1-4])-([1-9][0-9]*)", title)
+                if retry is None or int(retry.group(2)) != 1:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one paid transient Opus retry is allowed per "
+                            "cycle; audit-retry-N-2 and higher are forbidden."
+                        ),
+                    }
+                if not parent_session_id:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Paid transient Opus retry lacks an authoritative "
+                            "parent session; unscoped dispatch is forbidden."
+                        ),
+                    }
+                if not reserve_opus_retry(
+                    parent_session_id,
+                    int(retry.group(1)),
+                ):
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one paid transient Opus retry is allowed per "
+                            "parent, attempt generation, and cycle; the retry "
+                            "reservation is already spent or unavailable."
+                        ),
+                    }
             return {"result": "ALLOW"}
         if event_type != "response":
             return {"result": "ALLOW"}
@@ -2176,7 +2249,9 @@ def supervisor_contract(
                     "conversation id; cross-parent ledger reduction is forbidden."
                 ),
             }
-        collections = read_collections(parent_session_id=parent_session_id)
+        collections = read_attempt_collections(
+            parent_session_id=parent_session_id
+        )
         latest_stamp = _latest_codex_stamp(parent_session_id)
         if latest_stamp is not None:
             stamped, cycle = latest_stamp
@@ -2220,7 +2295,7 @@ def supervisor_contract(
             and _route_dispatch_pending(
                 route,
                 collections,
-                read_dispatches(parent_session_id=parent_session_id),
+                read_attempt_dispatches(parent_session_id=parent_session_id),
                 parent_session_id=parent_session_id,
             )
         ):
@@ -2609,8 +2684,20 @@ def _top_level_request_identity(data: object) -> str:
     if not isinstance(data, dict) or "user_content" not in data:
         return ""
     content = data.get("user_content")
-    if isinstance(content, str) and content.startswith(
-        ("[System: sub-agent task ", "TRIPLE_STAMP_NONTERMINAL_CONTINUATION")
+    if isinstance(content, list):
+        content = "\n".join(
+            str(block.get("text") or block.get("input_text") or "")
+            for block in content
+            if isinstance(block, dict)
+        )
+    elif isinstance(content, dict):
+        content = content.get("text") or content.get("user_content")
+    if isinstance(content, str) and any(
+        marker in content
+        for marker in (
+            "[System: sub-agent task ",
+            "TRIPLE_STAMP_NONTERMINAL_CONTINUATION",
+        )
     ):
         return ""
     return attempt_request_identity(data)
@@ -2690,7 +2777,7 @@ def strict_cost_budget(
             observed_estimated - baseline["estimated_unpriced_usd"],
         )
         route = _next_route(
-            read_collections(parent_session_id=parent_session_id),
+            read_attempt_collections(parent_session_id=parent_session_id),
             parent_session_id=parent_session_id,
         )
         projected_stage, reserve = _project_dispatch_cost(event)

@@ -30,6 +30,9 @@ _LOGGER = logging.getLogger(__name__)
 # flight must stay silent rather than print a second copy.
 _TERMINAL_RELAY_ACTIONS = frozenset(
     {
+        "deterministic_best_effort_relay",
+        "deterministic_stamp_relay",
+        "supervisor_failure_terminalized",
         "terminal_failure_relayed",
         "continuation_exhausted",
     }
@@ -126,11 +129,20 @@ def _route_snapshot(route: object) -> dict[str, Any]:
     }
 
 
-def _continuation_prompt(route: object) -> str:
+def _continuation_prompt(
+    route: object,
+    *,
+    original_request: str = "",
+) -> str:
     """Build one bounded prompt from the durable state-machine route."""
 
     snapshot = _route_snapshot(route)
     status = snapshot["status"]
+    request_context = (
+        "\n\nORIGINAL REQUEST (verbatim):\n" + original_request
+        if original_request
+        else ""
+    )
     if status == "dispatch":
         resume = (
             f" Resume child session {snapshot['resume_child_session_id']}."
@@ -144,6 +156,7 @@ def _continuation_prompt(route: object) -> str:
             f"title {snapshot['title']!r}.{resume} Use the already collected "
             "packets and the original request in conversation history. Do not "
             "emit status prose, poll, or answer the user."
+            f"{request_context}"
         )
     if status == "success":
         return (
@@ -201,17 +214,13 @@ def _attempt_request_identity(messages: list[dict[str, Any]]) -> str:
 
     from triple_stamp_runtime_state import attempt_request_identity
 
+    original = _original_request(messages)
+    if not original:
+        return ""
     for message in reversed(messages):
         if message.get("role") != "user":
             continue
-        content = message.get("content")
-        if (
-            isinstance(content, str)
-            and (
-                content.startswith(_CONTINUATION_PREFIX)
-                or content.startswith("[System: sub-agent task ")
-            )
-        ):
+        if _message_text(message.get("content")) != original:
             continue
         metadata = message.get("metadata")
         message_id = (
@@ -220,9 +229,45 @@ def _attempt_request_identity(messages: list[dict[str, Any]]) -> str:
             else None
         )
         return attempt_request_identity(
-            content,
+            original,
             message_id=str(message_id or ""),
         )
+    return ""
+
+
+def _message_text(content: object) -> str:
+    """Return readable user text from supported conversation shapes."""
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        nested = content.get("user_content")
+        return nested if isinstance(nested, str) else ""
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text") or block.get("input_text") or "")
+            for block in content
+            if isinstance(block, dict)
+            and isinstance(
+                block.get("text") or block.get("input_text"),
+                str,
+            )
+        )
+    return ""
+
+
+def _original_request(messages: list[dict[str, Any]]) -> str:
+    """Return the latest genuine user request, excluding runtime wakes."""
+
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = _message_text(message.get("content"))
+        if not content or content.startswith(
+            (_CONTINUATION_PREFIX, "[System: sub-agent task ")
+        ):
+            continue
+        return content
     return ""
 
 
@@ -417,8 +462,8 @@ def _progress_note(
 
     from triple_stamp_runtime_state import (
         parse_dispatch_title,
-        read_collections,
-        read_dispatches,
+        read_attempt_collections,
+        read_attempt_dispatches,
     )
 
     step, kind = _STAGE_STEP.get(agent, ("", ""))
@@ -428,8 +473,8 @@ def _progress_note(
     cycle = f"cycle {parsed['cycle']}" if parsed else "cycle ?"
     lines = [f"**Triple-stamp, {cycle} - step {step}, {kind}** (`{title}`)"]
     finished = _finished_clause(
-        read_collections(parent_session_id=parent_session_id),
-        read_dispatches(parent_session_id=parent_session_id),
+        read_attempt_collections(parent_session_id=parent_session_id),
+        read_attempt_dispatches(parent_session_id=parent_session_id),
         announced,
     )
     if finished:
@@ -570,6 +615,7 @@ def install_supervisor_continuation_guard() -> None:
         TurnComplete,
     )
     from triple_stamp_isaac_launcher import (
+        _INFRA_PREFIX,
         _failure_metrics,
         _best_effort_answer,
         _next_route,
@@ -577,7 +623,9 @@ def install_supervisor_continuation_guard() -> None:
     )
     from triple_stamp_runtime_state import (
         activate_parent_attempt,
-        read_collections,
+        attest_latest_codex_stamp,
+        read_attempt_collections,
+        read_attempt_dispatches,
         read_dispatches,
         read_attested_answer,
         read_best_effort_answer,
@@ -612,6 +660,7 @@ def install_supervisor_continuation_guard() -> None:
 
         continuation_attempt = 0
         current_messages = messages
+        original_request = _original_request(messages)
         session_id = _session_id(messages)
         if not session_id or session_id == "default":
             # Never reduce a run-global union when a wake lacks one authoritative
@@ -647,14 +696,33 @@ def install_supervisor_continuation_guard() -> None:
             set(),
         )
         while True:
+            attest_latest_codex_stamp(session_id)
             attested_answer = read_attested_answer(
                 parent_session_id=session_id
             )
             if attested_answer:
                 route = _next_route(
-                    read_collections(parent_session_id=session_id),
+                    read_attempt_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
+                if any(
+                    row.get("action") in _TERMINAL_RELAY_ACTIONS
+                    for row in read_supervisor_continuations(
+                        parent_session_id=session_id
+                    )
+                ):
+                    _record(
+                        "terminal_stamp_suppressed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "STAMP was already relayed; stale completion wake "
+                            "cannot reopen routing"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(response="", modified_by_policy=True)
+                    return
                 _record(
                     "deterministic_stamp_relay",
                     route,
@@ -673,9 +741,27 @@ def install_supervisor_continuation_guard() -> None:
             )
             if best_effort_answer:
                 route = _next_route(
-                    read_collections(parent_session_id=session_id),
+                    read_attempt_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
+                if any(
+                    row.get("action") in _TERMINAL_RELAY_ACTIONS
+                    for row in read_supervisor_continuations(
+                        parent_session_id=session_id
+                    )
+                ):
+                    _record(
+                        "terminal_best_effort_suppressed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "completed answer was already relayed; stale "
+                            "completion wake cannot reopen routing"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(response="", modified_by_policy=True)
+                    return
                 _record(
                     "deterministic_best_effort_relay",
                     route,
@@ -716,7 +802,7 @@ def install_supervisor_continuation_guard() -> None:
                     )
                 )
                 route = _next_route(
-                    read_collections(parent_session_id=session_id),
+                    read_attempt_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
                 if relayed:
@@ -809,8 +895,8 @@ def install_supervisor_continuation_guard() -> None:
             if completed is None:
                 return
 
-            records = read_collections(parent_session_id=session_id)
-            dispatches = read_dispatches(parent_session_id=session_id)
+            records = read_attempt_collections(parent_session_id=session_id)
+            dispatches = read_attempt_dispatches(parent_session_id=session_id)
             resolved_parent = _dispatch_parent_session_id(
                 read_dispatches(),
                 sent_child_session_ids,
@@ -827,12 +913,91 @@ def install_supervisor_continuation_guard() -> None:
                     usage=completed.usage,
                 )
                 return
-            records = read_collections(parent_session_id=session_id)
-            dispatches = read_dispatches(parent_session_id=session_id)
+            records = read_attempt_collections(parent_session_id=session_id)
+            dispatches = read_attempt_dispatches(parent_session_id=session_id)
             route = _next_route(records, parent_session_id=session_id)
             response = completed.response
             if not isinstance(response, str):
                 response = "".join(event.text for event in buffered_text)
+            if response.startswith(_INFRA_PREFIX):
+                if _route_dispatch_pending(
+                    route,
+                    records,
+                    dispatches,
+                    parent_session_id=session_id,
+                ):
+                    _record(
+                        "inflight_failure_claim_suppressed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "supervisor claimed infrastructure failure while "
+                            "the durable required child remains in flight"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(
+                        response="",
+                        modified_by_policy=True,
+                        usage=completed.usage,
+                    )
+                    return
+                failure_diagnostic = read_last_tool_dispatch_exception(
+                    parent_session_id=session_id,
+                    titles=sent_titles,
+                    observed_after_ns=turn_started_at_ns,
+                )
+                genuine_native_failure = (
+                    failure_diagnostic is not None
+                    and failure_diagnostic.get("phase") == "native_send"
+                    and failure_diagnostic.get("native_send_status") == "failed"
+                )
+                if (
+                    str(getattr(route, "status", "") or "")
+                    != "infrastructure_failed"
+                    and not genuine_native_failure
+                ):
+                    _record(
+                        "unverified_failure_claim_suppressed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "supervisor emitted an unverified infrastructure "
+                            "failure; no continuation or terminal mutation "
+                            "is authorized"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(
+                        response="",
+                        modified_by_policy=True,
+                        usage=completed.usage,
+                    )
+                    return
+                recorded = record_terminal_failure(
+                    "PIPELINE_INFRASTRUCTURE_ERROR",
+                    response.removeprefix(_INFRA_PREFIX).strip(),
+                    stage=str(getattr(route, "title", "") or route.status),
+                    cycle=int(getattr(route, "cycle", 0) or 0),
+                    parent_session_id=session_id,
+                )
+                _record(
+                    "supervisor_failure_terminalized",
+                    route,
+                    attempt=continuation_attempt,
+                    reason=(
+                        "supervisor emitted an infrastructure failure; "
+                        "continuation dispatch is forbidden"
+                    ),
+                    parent_session_id=session_id,
+                )
+                yield TextChunk(text=recorded)
+                yield TurnComplete(
+                    response=recorded,
+                    modified_by_policy=True,
+                    usage=completed.usage,
+                )
+                return
 
             bounded_answer = _best_effort_answer(records, route)
             if bounded_answer is not None:
@@ -1001,9 +1166,13 @@ def install_supervisor_continuation_guard() -> None:
                         parent_session_id=session_id,
                     )
                     current_messages = [
+                        *messages,
                         {
                             "role": "user",
-                            "content": _continuation_prompt(route),
+                            "content": _continuation_prompt(
+                                route,
+                                original_request=original_request,
+                            ),
                             "session_id": session_id,
                         }
                     ]
@@ -1065,9 +1234,13 @@ def install_supervisor_continuation_guard() -> None:
                     parent_session_id=session_id,
                 )
                 current_messages = [
+                    *messages,
                     {
                         "role": "user",
-                        "content": _continuation_prompt(route),
+                        "content": _continuation_prompt(
+                            route,
+                            original_request=original_request,
+                        ),
                         "session_id": session_id,
                     }
                 ]

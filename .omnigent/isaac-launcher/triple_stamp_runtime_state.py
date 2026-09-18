@@ -255,6 +255,87 @@ def current_attempt_generation(parent_session_id: str = "") -> int:
         return 1
 
 
+def reserve_opus_retry(
+    parent_session_id: str,
+    cycle: int,
+) -> bool:
+    """Atomically reserve one paid transient Opus retry for this attempt/cycle.
+
+    The reservation is created before native dispatch and is intentionally
+    never released: a timeout or unknown completion may already have launched
+    the paid child. Generation-local exclusive files make duplicate policy
+    evaluations and concurrent sends converge on one winner without trusting
+    a dispatch observer that runs only after native launch returns.
+    """
+
+    run_dir = _run_dir()
+    if (
+        run_dir is None
+        or not parent_session_id
+        or isinstance(cycle, bool)
+        or not isinstance(cycle, int)
+        or cycle < 1
+        or cycle > 4
+    ):
+        return False
+    activate_parent_attempt(parent_session_id, "")
+    root = _attempt_root(run_dir, parent_session_id)
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+        try:
+            generation = max(1, int(state.get("current_generation") or 1))
+        except (TypeError, ValueError):
+            return False
+        reservation_dir = (
+            _attempt_generation_dir(
+                run_dir,
+                parent_session_id,
+                generation,
+            )
+            / "retry-reservations"
+        )
+        reservation_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        reservation = reservation_dir / f"opus-cycle-{cycle}.json"
+        try:
+            fd = os.open(
+                reservation,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+            )
+        except FileExistsError:
+            return False
+        data = (
+            json.dumps(
+                {
+                    "version": 1,
+                    "parent_session_id": parent_session_id,
+                    "attempt_generation": generation,
+                    "cycle": cycle,
+                    "reserved_at_ns": time.time_ns(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        reservation_dir_fd = os.open(reservation_dir, os.O_RDONLY)
+        try:
+            os.fsync(reservation_dir_fd)
+        finally:
+            os.close(reservation_dir_fd)
+        return True
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def _observed_budget_totals(payload: dict[str, Any]) -> dict[str, float] | None:
     try:
         reported = float(
@@ -320,11 +401,12 @@ def activate_parent_attempt(
 ) -> int:
     """Activate exactly one generation per top-level user-message history.
 
-    Child-completion wakes reuse ``request_identity`` and therefore stay in the
-    same generation. A later user message advances the atomic ``current``
-    symlink, making every terminal artifact, budget, route ledger, and retry
-    counter from the prior question unreachable without deleting or rewriting
-    its bytes.
+    Child-completion wakes and harness-generated continuation prompts stay in
+    the same nonterminal generation even when their request-phase wrappers have
+    different text. A later user message advances the atomic ``current``
+    symlink only after the prior attempt published a terminal bundle, making
+    every terminal artifact, budget, route ledger, and retry counter from the
+    prior question unreachable without deleting or rewriting its bytes.
     """
 
     run_dir = _run_dir()
@@ -352,9 +434,10 @@ def activate_parent_attempt(
         changed = bool(
             request_identity
             and prior_identity
+            and terminal_exists
             and (
-                request_identity != prior_identity
-                or (new_request and terminal_exists)
+                new_request
+                or request_identity != prior_identity
             )
         )
         if changed:
@@ -565,6 +648,60 @@ def _scope_parent_records(
     return scoped[last_tombstone + 1 :]
 
 
+def _scope_logical_attempt_records(
+    records: list[dict[str, Any]],
+    parent_session_id: str,
+) -> list[dict[str, Any]]:
+    """Recover one attempt across nonterminal generation fragmentation.
+
+    A legitimate new attempt can start only after the preceding generation
+    atomically publishes ``terminal/``. Therefore contiguous later generations
+    without such a boundary belong to the same logical attempt even if an old
+    runtime accidentally advanced ``current_generation`` on synthetic wakes.
+    """
+
+    if not parent_session_id:
+        return records
+    run_dir = _run_dir()
+    active_generation = current_attempt_generation(parent_session_id)
+    start_generation = 1
+    if run_dir is not None:
+        root = _attempt_root(run_dir, parent_session_id)
+        try:
+            generation_dirs = tuple(root.iterdir())
+        except OSError:
+            generation_dirs = ()
+        terminal_generations: list[int] = []
+        for generation_dir in generation_dirs:
+            match = re.fullmatch(r"generation-([0-9]{8})", generation_dir.name)
+            if match is None or not generation_dir.joinpath("terminal").is_dir():
+                continue
+            generation = int(match.group(1))
+            if generation < active_generation:
+                terminal_generations.append(generation)
+        if terminal_generations:
+            start_generation = max(terminal_generations) + 1
+    scoped: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("parent_session_id") != parent_session_id:
+            continue
+        try:
+            generation = int(record.get("attempt_generation") or 1)
+        except (TypeError, ValueError):
+            continue
+        if start_generation <= generation <= active_generation:
+            scoped.append(record)
+    last_tombstone = max(
+        (
+            index
+            for index, record in enumerate(scoped)
+            if record.get("record_type") == "parent_tombstone"
+        ),
+        default=-1,
+    )
+    return scoped[last_tombstone + 1 :]
+
+
 def _append(filename: str, payload: dict[str, Any]) -> None:
     run_dir = _run_dir()
     if run_dir is None:
@@ -758,6 +895,15 @@ def append_dispatch(payload: dict[str, Any]) -> None:
 
 def read_dispatches(parent_session_id: str = "") -> list[dict[str, Any]]:
     return _scope_parent_records(
+        _read("routing-dispatches.jsonl"),
+        parent_session_id,
+    )
+
+
+def read_attempt_dispatches(parent_session_id: str = "") -> list[dict[str, Any]]:
+    """Return this logical attempt's dispatches across accidental fragments."""
+
+    return _scope_logical_attempt_records(
         _read("routing-dispatches.jsonl"),
         parent_session_id,
     )
@@ -1636,6 +1782,15 @@ def read_collections(parent_session_id: str = "") -> list[dict[str, Any]]:
     )
 
 
+def read_attempt_collections(parent_session_id: str = "") -> list[dict[str, Any]]:
+    """Return this logical attempt's packets across accidental fragments."""
+
+    return _scope_logical_attempt_records(
+        _read("routing-collections.jsonl"),
+        parent_session_id,
+    )
+
+
 def tombstone_parent_session(parent_session_id: str) -> None:
     """End one parent's ledger generation without affecting sibling sessions."""
 
@@ -1710,13 +1865,41 @@ def _publish_terminal_bundle(
 
 
 def attest_codex_stamp(payload: dict[str, Any]) -> bool:
-    """Persist an immutable attestation for one mechanically valid Codex STAMP."""
+    """Persist one valid STAMP across a contiguous logical attempt."""
 
     run_dir = _run_dir()
+    parent_session_id = str(payload.get("parent_session_id") or "")
+    if run_dir is None or payload.get("agent") != "codex_judge":
+        return False
+    attempt_records = read_attempt_collections(
+        parent_session_id=parent_session_id
+    )
+    if parent_session_id:
+        child_session_id = str(payload.get("child_session_id") or "")
+        work_id = str(payload.get("work_id") or "")
+        recorded = next(
+            (
+                record
+                for record in reversed(attempt_records)
+                if record.get("agent") == "codex_judge"
+                and record.get("title") == payload.get("title")
+                and (
+                    not child_session_id
+                    or record.get("child_session_id") == child_session_id
+                )
+                and (
+                    not work_id
+                    or record.get("work_id") == work_id
+                )
+                and record.get("output") == payload.get("output")
+            ),
+            None,
+        )
+        if recorded is None:
+            return False
+        payload = recorded
     output = payload.get("output")
-    if run_dir is None or payload.get("agent") != "codex_judge" or not isinstance(
-        output, str
-    ):
+    if not isinstance(output, str):
         return False
     try:
         from triple_stamp_isaac_launcher import (
@@ -1737,7 +1920,6 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         return False
     if stamp is None:
         return False
-    parent_session_id = str(payload.get("parent_session_id") or "")
     if (
         not parent_session_id
         and any(record.get("parent_session_id") for record in read_collections())
@@ -1767,10 +1949,9 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     match = re.fullmatch(r"judge-(?:cycle|convergence)-([1-4])", title)
     generation = current_attempt_generation(parent_session_id)
     if match is None or not _has_required_stage_chain(
-        read_collections(parent_session_id=parent_session_id),
+        attempt_records,
         int(match.group(1)),
         parent_session_id=parent_session_id,
-        attempt_generation=generation,
     ):
         return False
     attestation = {
@@ -1803,6 +1984,21 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         )
     except OSError:
         return False
+
+
+def attest_latest_codex_stamp(parent_session_id: str) -> bool:
+    """Recover an already-collected STAMP before any further routing."""
+
+    if read_attested_answer(parent_session_id):
+        return True
+    for record in reversed(read_attempt_collections(parent_session_id)):
+        if (
+            record.get("agent") == "codex_judge"
+            and record.get("status") == "completed"
+            and attest_codex_stamp(record)
+        ):
+            return True
+    return False
 
 
 def read_attested_answer(parent_session_id: str = "") -> str:
