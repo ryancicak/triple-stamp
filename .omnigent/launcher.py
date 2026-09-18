@@ -487,10 +487,9 @@ def _validate_cli_args(args: list[str]) -> tuple[list[str], bool]:
 
     if args == ["--help"] or args == ["-h"]:
         print(
-            "Usage: ./triple-stamp                       start in the browser\n"
-            "       ./triple-stamp -p 'your question'    answer once on stdout\n"
-            "       ./triple-stamp --self-test           check the install\n"
-            "       ./triple-stamp --no-session [--debug-events]\n\n"
+            "Usage: ./triple-stamp               start the browser UI and\n"
+            "                                    interactive terminal\n"
+            "       ./triple-stamp --self-test   check the install\n\n"
             "Environment (all optional):\n"
             "  TRIPLE_STAMP_VOICE_PROFILE   markdown file to render the answer\n"
             "                               in a specific voice. Unset means a\n"
@@ -515,16 +514,13 @@ def _validate_cli_args(args: list[str]) -> tuple[list[str], bool]:
             cleaned.append(arg)
             index += 1
             continue
-        if arg in {"-p", "--prompt"}:
-            if index + 1 >= len(args):
-                _die(f"{arg} requires a prompt argument", 64)
-            cleaned.extend((arg, args[index + 1]))
-            index += 2
-            continue
-        if arg.startswith("--prompt="):
-            cleaned.append(arg)
-            index += 1
-            continue
+        if arg in {"-q", "-p", "--prompt"} or arg.startswith("--prompt="):
+            _die(
+                "one-shot mode is not a supported Triple-stamp surface; "
+                "run ./triple-stamp and ask in the browser or interactive "
+                "terminal prompt",
+                64,
+            )
         _die(
             f"unsupported argument {arg!r}; this launcher rejects options that could "
             "change the bundle, model, harness, server, auth profile, or isolation",

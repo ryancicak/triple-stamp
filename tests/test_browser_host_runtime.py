@@ -859,5 +859,33 @@ class BrowserHostRuntimeTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
+class ValidateCliArgsSurfaceTests(unittest.TestCase):
+    def test_help_does_not_advertise_one_shot_flags(self) -> None:
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with self.assertRaises(SystemExit) as raised:
+                launcher._validate_cli_args(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        help_text = buffer.getvalue()
+        self.assertNotRegex(help_text, r"(^|\s)-p(\s|$)")
+        self.assertNotIn("--prompt", help_text)
+        self.assertNotIn("-q", help_text)
+        self.assertIn("browser", help_text)
+        self.assertIn("interactive terminal", help_text)
+
+    def test_one_shot_flags_point_to_browser_and_terminal(self) -> None:
+        for argv in (["-p", "hi"], ["--prompt", "hi"], ["--prompt=hi"], ["-q"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(launcher.LaunchError) as raised:
+                    launcher._validate_cli_args(argv)
+                self.assertEqual(raised.exception.code, 64)
+                message = str(raised.exception)
+                self.assertIn("browser", message)
+                self.assertIn("interactive", message)
+
+
 if __name__ == "__main__":
     unittest.main()

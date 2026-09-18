@@ -1,39 +1,47 @@
 <p align="center">
-  <img src="docs/brand/hero.png" alt="Triple-stamp — three independent models review every answer" width="840">
+  <img src="docs/brand/hero.png" alt="Triple-stamp: three independent models review every answer" width="820">
 </p>
 
-<h1 align="center">Triple-stamp</h1>
+<h3 align="center">Three models. Three companies. One answer you can trust.</h3>
 
 <p align="center">
-  <b>Three independent models, from three different companies, review every answer.</b><br>
-  Only the one that survives all three ever reaches you.
+  Only the answer that survives all three ever reaches you.
+</p>
+
+<br>
+
+<table align="center" width="100%">
+  <tr>
+    <td align="center" width="33%"><img src="docs/brand/starfish-pink.svg" width="92" alt="Pink starfish, the Cursor researcher"></td>
+    <td align="center" width="33%"><img src="docs/brand/starfish-amber.svg" width="92" alt="Amber starfish, the Opus auditor"></td>
+    <td align="center" width="33%"><img src="docs/brand/starfish-teal.svg" width="92" alt="Teal starfish, the Codex judge"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Cursor</b></td>
+    <td align="center"><b>Opus</b></td>
+    <td align="center"><b>Codex</b></td>
+  </tr>
+  <tr>
+    <td align="center">Researches the public web.</td>
+    <td align="center">Audits it against internal systems.</td>
+    <td align="center">Judges the result, then writes.</td>
+  </tr>
+  <tr>
+    <td align="center"><sub>No internal access.</sub></td>
+    <td align="center"><sub>No web access.</sub></td>
+    <td align="center"><sub>No research of its own.</sub></td>
+  </tr>
+</table>
+
+<br>
+
+<p align="center">
+  Two researchers cannot see each other's sources, so neither can cover for the other.<br>
+  The final answer is copied from Codex byte for byte.<br>
+  You get an answer that passed all three, or an honest failure. Never a guess.
 </p>
 
 ---
-
-## What it is
-
-Three agents look at your question with deliberately different reach — and only the last one is allowed to talk to you.
-
-<table align="center">
-<tr>
-  <td align="center" width="220"><img src="docs/brand/starfish-pink.svg" width="76" alt="Pink starfish"></td>
-  <td align="center" width="220"><img src="docs/brand/starfish-amber.svg" width="76" alt="Amber starfish"></td>
-  <td align="center" width="220"><img src="docs/brand/starfish-teal.svg" width="76" alt="Teal starfish"></td>
-</tr>
-<tr>
-  <td align="center"><b>Cursor</b><br><sub>Grok&nbsp;4.6&nbsp;Extra&nbsp;High</sub></td>
-  <td align="center"><b>Opus</b><br><sub>Claude&nbsp;Opus</sub></td>
-  <td align="center"><b>Codex</b><br><sub>GPT‑5.6&nbsp;Sol</sub></td>
-</tr>
-<tr>
-  <td align="center"><b>Researches the public web.</b><br>Cannot see internal systems.</td>
-  <td align="center"><b>Audits that evidence against internal systems.</b><br>Cannot browse the web.</td>
-  <td align="center"><b>Judges whether it holds up, then writes the answer.</b><br>Does no research of its own.</td>
-</tr>
-</table>
-
-Because the two researchers can't see each other's sources, neither can quietly cover for the other. The final answer is relayed **byte-for-byte** from Codex's stamp — so you either get an answer that passed all three stages, or an explicit failure. Never a guess dressed up as an answer.
 
 ## Install
 
@@ -43,7 +51,7 @@ cursor-agent login                 # once
 ./triple-stamp                     # every time
 ```
 
-> **Reference implementation.** It expects Databricks-internal infrastructure — the package proxy, Opus's Glean / Jira / Slack / Confluence / SAFE access, and a Cursor account entitled to Grok 4.6 Extra High. Outside that environment the install won't complete, but the whole design is readable here: `config.yaml` is the routing contract and `agents/*/config.yaml` are the three worker prompts.
+> **Reference implementation.** It expects Databricks-internal infrastructure: the package proxy, Opus's Glean, Jira, Slack, Confluence, and SAFE access, and a Cursor account entitled to Grok 4.6 Extra High. Outside that environment the install will not finish. The full design stays readable in `config.yaml` and `agents/*/config.yaml`.
 
 ## Use
 
@@ -51,23 +59,28 @@ cursor-agent login                 # once
 ./triple-stamp
 ```
 
-That's the only command you run. It opens **two surfaces onto the same run**:
+This is the only command you run. It opens the same run in two places:
 
-- a **browser URL** it prints to your terminal, and
-- the **interactive terminal** prompt itself.
+- a **browser URL** printed to your terminal, and
+- the **interactive terminal** prompt.
 
-Ask your question in either one. Type `/quit` in the terminal to stop the run and clean up. A real run takes roughly 15 minutes to an hour — Opus's internal audit is genuinely slow — and each stage narrates as it starts, so you can tell it's working.
+Ask your question in either one. Type `/quit` to stop the run and clean up.
+
+<sub>A real run takes about 15 minutes to an hour. Opus's internal audit is slow on purpose. Each stage prints as it starts.</sub>
+
+<br>
 
 <p align="center">
-  <img src="docs/brand/stamp-seal.svg" width="120" alt="Triple-stamp seal">
+  <img src="docs/brand/stamp-seal.svg" width="112" alt="Triple-stamp seal">
 </p>
 
 <p align="center">
   <sub>
-    Two review rounds by default, four in deep mode (<code>TRIPLE_STAMP_MAX_CYCLES=4</code>) · hard <b>$50</b> budget cap · answer relayed byte-for-byte from Codex's stamp · optional final-answer voice via <code>TRIPLE_STAMP_VOICE_PROFILE</code> · <code>./triple-stamp --self-test</code> runs the full regression suite with no models and costs nothing · macOS only.
+    2 rounds by default, 4 in deep mode (<code>TRIPLE_STAMP_MAX_CYCLES=4</code>)
+    &nbsp;·&nbsp; hard <b>$50</b> cap
+    &nbsp;·&nbsp; answer relayed byte for byte
+    &nbsp;·&nbsp; optional voice via <code>TRIPLE_STAMP_VOICE_PROFILE</code>
+    &nbsp;·&nbsp; <code>./triple-stamp --self-test</code> checks the install and costs nothing
+    &nbsp;·&nbsp; macOS only
   </sub>
-</p>
-
-<p align="center">
-  <img src="docs/brand/vs-polly-debby.png" width="440" alt="Not Polly. Not Debby.">
 </p>
