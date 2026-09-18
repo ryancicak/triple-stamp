@@ -100,17 +100,37 @@ def load_generated_mcp_config(home: Path | None = None) -> dict[str, Any]:
     path = (home or Path.home()) / ".claude.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        servers = raw["mcpServers"]
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except FileNotFoundError:
+        return {"mcpServers": {}}
+    except OSError as exc:
         raise OpusConfigurationError(
             f"generated Claude MCP configuration is unreadable: {exc}"
         ) from exc
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OpusConfigurationError(
+            f"generated Claude MCP configuration is malformed: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise OpusConfigurationError(
+            "generated Claude MCP configuration root is malformed"
+        )
+    servers = raw.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise OpusConfigurationError(
+            "generated Claude MCP server catalog is malformed"
+        )
     selected: dict[str, Any] = {}
     for name in OPUS_MCP_NAMES:
-        entry = servers.get(name) if isinstance(servers, dict) else None
+        entry = servers.get(name)
+        # Internal MCP availability changes independently of this repository.
+        # An absent family is an audit gap for Opus to report, not a launch
+        # failure; only definitions that are present must satisfy the strict
+        # read-only stdio shape below.
+        if entry is None:
+            continue
         if not isinstance(entry, dict):
             raise OpusConfigurationError(
-                f"direct MCP definition {name!r} is absent from generated .claude.json"
+                f"direct MCP definition {name!r} is malformed in generated .claude.json"
             )
         if (
             entry.get("type") != "stdio"

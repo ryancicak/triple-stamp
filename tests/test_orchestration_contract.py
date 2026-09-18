@@ -5288,6 +5288,53 @@ print("exact temp boundary: PASS")
             )
         )
 
+    def test_browser_sessions_route_from_only_their_own_ledger(self) -> None:
+        session_a = "browser-session-a"
+        session_b = "browser-session-b"
+        records = [
+            {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "CURSOR-A",
+                ),
+                "parent_session_id": session_a,
+            },
+            {
+                **_route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS"),
+                ),
+                "parent_session_id": session_a,
+            },
+            {
+                **_route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    json.dumps(
+                        {
+                            "verdict": "STAMP",
+                            "needs_web": False,
+                            "needs_internal": False,
+                            "why": "all claims hold",
+                            "gap_materiality": "none",
+                            "limitations": [],
+                            "shippable_answer": "answer-a",
+                            "citations_that_hold": ["source-a"],
+                        }
+                    ),
+                ),
+                "parent_session_id": session_a,
+            },
+        ]
+
+        route_a = plugin._next_route(records, parent_session_id=session_a)
+        route_b = plugin._next_route(records, parent_session_id=session_b)
+
+        self.assertEqual(route_a.status, "success")
+        self.assertEqual(route_b.title, "cursor-cycle-1")
+
     def test_route_table_covers_straight_web_rework_and_repairs(self) -> None:
         cursor_1 = _route_packet(
             "cursor_workhorse", "cursor-cycle-1", "CURSOR-1"
@@ -5825,16 +5872,11 @@ print("exact temp boundary: PASS")
             "__triple_stamp_headless_wait__",
             None,
         )
-        constants = list(original_code.co_consts)
-        for index, value in enumerate(constants):
-            if (
-                type(value) is int
-                and value == supervisor_runtime._HEADLESS_PIPELINE_EXTRA_TURN_LIMIT
-            ):
-                constants[index] = (
-                    supervisor_runtime._OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT
-                )
-        query_once.__code__ = original_code.replace(co_consts=tuple(constants))
+        query_once.__code__, _ = supervisor_runtime._replace_code_int_constant(
+            original_code,
+            supervisor_runtime._HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
+            supervisor_runtime._OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+        )
         with contextlib.suppress(AttributeError):
             del query_once.__triple_stamp_headless_wait__
         try:
@@ -5848,14 +5890,18 @@ print("exact temp boundary: PASS")
                 supervisor_runtime.install_headless_pipeline_wait()
             self.assertIs(chat._LOOP_TIMEOUT_S, None)
             self.assertIs(query_once.__code__, first_code)
-            self.assertNotIn(
+            _, old_matches = supervisor_runtime._replace_code_int_constant(
+                query_once.__code__,
                 supervisor_runtime._OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
-                query_once.__code__.co_consts,
+                supervisor_runtime._OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
             )
-            self.assertIn(
+            _, new_matches = supervisor_runtime._replace_code_int_constant(
+                query_once.__code__,
                 supervisor_runtime._HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
-                query_once.__code__.co_consts,
+                supervisor_runtime._HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
             )
+            self.assertEqual(old_matches, 0)
+            self.assertEqual(new_matches, 1)
             self.assertTrue(
                 getattr(query_once, "__triple_stamp_headless_wait__", False)
             )
@@ -5878,17 +5924,19 @@ print("exact temp boundary: PASS")
             "__triple_stamp_headless_wait__",
             None,
         )
-        constants = list(original_code.co_consts)
-        replaced = False
-        for index, value in enumerate(constants):
-            if type(value) is int and value in {
-                supervisor_runtime._OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+        changed, matches = supervisor_runtime._replace_code_int_constant(
+            original_code,
+            supervisor_runtime._OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+            31,
+        )
+        if matches == 0:
+            changed, matches = supervisor_runtime._replace_code_int_constant(
+                original_code,
                 supervisor_runtime._HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
-            }:
-                constants[index] = 31
-                replaced = True
-        self.assertTrue(replaced)
-        query_once.__code__ = original_code.replace(co_consts=tuple(constants))
+                31,
+            )
+        self.assertEqual(matches, 1)
+        query_once.__code__ = changed
         with contextlib.suppress(AttributeError):
             del query_once.__triple_stamp_headless_wait__
         try:
@@ -5905,6 +5953,71 @@ print("exact temp boundary: PASS")
                 del query_once.__triple_stamp_headless_wait__
             if original_marker is not None:
                 query_once.__triple_stamp_headless_wait__ = original_marker
+
+    def test_system_wake_uses_authoritative_parent_session_context(self) -> None:
+        from omnigent.runtime import telemetry
+
+        with mock.patch.object(
+            telemetry,
+            "current_session_id",
+            return_value="browser-parent",
+        ):
+            self.assertEqual(
+                supervisor_runtime._session_id(
+                    [{"role": "user", "content": "child completed"}]
+                ),
+                "browser-parent",
+            )
+
+    def test_internal_send_result_resolves_exact_concurrent_parent(self) -> None:
+        child_ids = supervisor_runtime._tool_child_session_ids(
+            '{"task_id":"child-a","handle_id":"child-a"}'
+        )
+        completed_child_ids = supervisor_runtime._tool_child_session_ids(
+            "[System: sub-agent task "
+            "540f937b5b7c4d0ea313cb8a637ffc65 completed]"
+        )
+        inbox_parents = supervisor_runtime._tool_parent_session_ids(
+            {
+                "content": [
+                    {
+                        "text": '{"parent_session_id":"browser-a"}',
+                    }
+                ]
+            }
+        )
+        dispatches = [
+            {
+                "title": "audit-cycle-1",
+                "child_session_id": "child-b",
+                "parent_session_id": "browser-b",
+            },
+            {
+                "title": "audit-cycle-1",
+                "child_session_id": "child-a",
+                "parent_session_id": "browser-a",
+            },
+        ]
+
+        parent = supervisor_runtime._dispatch_parent_session_id(
+            dispatches,
+            child_ids,
+        )
+        records = [
+            {"parent_session_id": "browser-a", "output": "A"},
+            {"parent_session_id": "browser-b", "output": "B"},
+        ]
+
+        self.assertEqual(parent, "browser-a")
+        self.assertEqual(
+            completed_child_ids,
+            {"540f937b5b7c4d0ea313cb8a637ffc65"},
+        )
+        self.assertEqual(inbox_parents, {"browser-a"})
+        self.assertEqual(
+            supervisor_runtime._records_for_session(records, parent),
+            [records[0]],
+        )
 
     def test_nonterminal_runtime_suppresses_status_after_pending_dispatch(
         self,

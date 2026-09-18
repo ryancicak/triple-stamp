@@ -225,6 +225,11 @@ from omnigent.runner import tool_dispatch
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.parser import parse
 from omnigent.tools.manager import ToolManager
+from triple_stamp_supervisor_runtime import (
+    _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
+    _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+    _replace_code_int_constant,
+)
 from triple_stamp_runtime_state import (
     add_opus_effort_observation,
     append_collection,
@@ -289,8 +294,18 @@ assert getattr(
     False,
 )
 assert chat._LOOP_TIMEOUT_S is None
-assert 30 not in chat._query_sessions_once.__code__.co_consts
-assert sys.maxsize in chat._query_sessions_once.__code__.co_consts
+_, old_turn_guards = _replace_code_int_constant(
+    chat._query_sessions_once.__code__,
+    _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+    _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+)
+_, replacement_turn_guards = _replace_code_int_constant(
+    chat._query_sessions_once.__code__,
+    _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
+    _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
+)
+assert old_turn_guards == 0
+assert replacement_turn_guards == 1
 assert getattr(
     chat._query_sessions_once,
     "__triple_stamp_headless_wait__",
@@ -685,7 +700,8 @@ def validate_launchers(
             fail(f"runtime attestation marker missing: {marker}")
     for marker in (
         "_HEADLESS_PIPELINE_TIMEOUT_S: float | None = None",
-        "_HEADLESS_PIPELINE_EXTRA_TURN_LIMIT = sys.maxsize",
+        "_HEADLESS_PIPELINE_EXTRA_TURN_LIMIT = 255",
+        "def _replace_code_int_constant(",
         "def install_headless_pipeline_wait(",
         "__triple_stamp_headless_wait__",
         "def install_supervisor_continuation_guard(",
@@ -880,8 +896,9 @@ def validate_launchers(
         fail("Opus strict MCP config is not a readable run-scoped JSON file")
     if stat.S_IMODE(opus_mcp_path.stat().st_mode) != 0o400:
         fail("Opus strict MCP config is not immutable mode 0400")
-    if set(opus_mcp_config.get("mcpServers", {})) != set(_OPUS_MCP_NAMES):
-        fail("Opus strict MCP catalog contains missing or unrelated servers")
+    configured_opus_servers = set(opus_mcp_config.get("mcpServers", {}))
+    if not configured_opus_servers.issubset(set(_OPUS_MCP_NAMES)):
+        fail("Opus strict MCP catalog contains an unrelated server")
     if any(os.environ.get(name) != value for name, value in OPUS_STARTUP_ENV.items()):
         fail("Opus exact-wrapper startup environment controls were stripped")
     argv_digest = hashlib.sha256(chr(0).join(auditor_args).encode()).hexdigest()

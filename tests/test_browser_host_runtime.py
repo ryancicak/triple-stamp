@@ -543,6 +543,37 @@ class BrowserHostRuntimeTests(unittest.TestCase):
         self.assertTrue(browser_mode)
         self.assertTrue(translated)
 
+    def test_public_help_advertises_only_interactive_surfaces(self) -> None:
+        with (
+            mock.patch("builtins.print") as output,
+            self.assertRaises(SystemExit),
+        ):
+            launcher._validate_cli_args(["--help"])
+        text = output.call_args.args[0]
+        self.assertIn("browser UI", text)
+        self.assertIn("interactive terminal", text)
+        self.assertIn("--self-test", text)
+        for hidden in ("-q", "--prompt", "--no-session", "--debug-events"):
+            self.assertNotIn(hidden, text)
+        self.assertNotRegex(text, r"(^|\s)-p(\s|$)")
+
+    def test_one_shot_flags_point_to_interactive_surfaces(self) -> None:
+        for args in (
+            ["-q"],
+            ["-p", "hello"],
+            ["--prompt", "hello"],
+            ["--prompt=hello"],
+        ):
+            with self.subTest(args=args), mock.patch.object(
+                launcher,
+                "_die",
+                side_effect=RuntimeError,
+            ) as die, self.assertRaises(RuntimeError):
+                launcher._validate_cli_args(args)
+            message = die.call_args.args[0]
+            self.assertIn("one-shot mode is not a supported", message)
+            self.assertIn("browser or interactive terminal prompt", message)
+
     def test_one_shot_no_session_is_unchanged(self) -> None:
         for args in (
             ["--no-session", "-p", "hello"],

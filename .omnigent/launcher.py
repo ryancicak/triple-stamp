@@ -531,6 +531,15 @@ def _validate_cli_args(args: list[str]) -> tuple[list[str], bool]:
     return cleaned, self_test
 
 
+def _prompt_mode(args: list[str]) -> bool:
+    """Recognize every internal Omnigent one-shot argument shape."""
+
+    return any(
+        arg in {"-p", "--prompt"} or arg.startswith("--prompt=")
+        for arg in args
+    )
+
+
 def _browser_launch_args(args: list[str]) -> tuple[list[str], bool, bool]:
     """Select Omnigent's host-backed architecture for interactive browser runs.
 
@@ -550,10 +559,7 @@ def _browser_launch_args(args: list[str]) -> tuple[list[str], bool, bool]:
     :returns: ``(runtime_args, browser_mode, translated_no_session)``.
     """
 
-    prompt_mode = any(
-        arg in {"-p", "--prompt"} or arg.startswith("--prompt=")
-        for arg in args
-    )
+    prompt_mode = _prompt_mode(args)
     browser_mode = not prompt_mode and not any(arg in SELF_TEST_FLAGS for arg in args)
     translated_no_session = browser_mode and "--no-session" in args
     runtime_args = (
@@ -1205,6 +1211,16 @@ def _runtime_env(
         if selected_provider == "databricks"
         else _detect_claude_namespace()[0]
     )
+    claude_routing_environment: dict[str, str] = {}
+    if (
+        selected_provider == "direct"
+        and effective_claude_namespace == "databricks_gateway"
+    ):
+        managed_claude_environment = _managed_claude_environment()
+        for name in ("ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_GATEWAY"):
+            value = os.environ.get(name) or managed_claude_environment.get(name)
+            if isinstance(value, str) and value:
+                claude_routing_environment[name] = value
     isolated_home = run_dir / "home"
     temp_dir = run_dir / "tmp"
     state_dir = run_dir / "state"
@@ -1255,6 +1271,8 @@ def _runtime_env(
                 "ISAAC_DISABLE_MAC_MANAGED_SETTINGS_UPDATE",
             ]
         )
+    else:
+        passthrough_names.extend(claude_routing_environment)
     passthrough = ",".join(passthrough_names)
     env = {
         "HOME": str(isolated_home),
@@ -1316,6 +1334,7 @@ def _runtime_env(
         "TRIPLE_STAMP_VOICE_PROFILE": str(VOICE_PROFILE) if VOICE_PROFILE else "",
         "TRIPLE_STAMP_VOICE_PROFILE_SHA256": voice_profile_sha256,
     }
+    env.update(claude_routing_environment)
     if selected_provider == "databricks":
         assert tools.isaac is not None
         env.update(
@@ -2258,7 +2277,7 @@ def _spawn_sandboxed(
         *args,
     ]
     capture_stdout = (
-        any(arg in {"-p", "--prompt"} for arg in args)
+        _prompt_mode(args)
         and not any(arg in SELF_TEST_FLAGS for arg in args)
     )
     stdout_handle = None
@@ -2754,7 +2773,7 @@ def _ensure_terminal_failure(
 def _emit_attested_answer(run_dir: Path, args: list[str]) -> None:
     """Emit the exact attested bytes once for terminal one-shot mode."""
 
-    if not any(arg in {"-p", "--prompt"} for arg in args):
+    if not _prompt_mode(args):
         return
     answer = (run_dir / "stamped-answer.bin").read_bytes()
     sys.stdout.buffer.write(answer)
@@ -2764,7 +2783,7 @@ def _emit_attested_answer(run_dir: Path, args: list[str]) -> None:
 def _emit_terminal_failure(run_dir: Path, args: list[str]) -> None:
     """Emit one exact sanitized failure for terminal one-shot mode."""
 
-    if not any(arg in {"-p", "--prompt"} for arg in args):
+    if not _prompt_mode(args):
         return
     data = (run_dir / "terminal-failure.txt").read_bytes()
     sys.stdout.buffer.write(data)

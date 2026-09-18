@@ -180,6 +180,42 @@ class OpusLaunchTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), selected)
 
+    def test_absent_internal_family_becomes_audit_gap_not_launch_failure(
+        self,
+    ) -> None:
+        config_path = self.home / ".claude.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        del config["mcpServers"]["safe"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        selected = mcp.load_generated_mcp_config(self.home)
+
+        self.assertEqual(
+            set(selected["mcpServers"]),
+            set(mcp.OPUS_MCP_NAMES) - {"safe"},
+        )
+
+    def test_absent_mcp_catalog_is_an_empty_optional_catalog(self) -> None:
+        config_path = self.home / ".claude.json"
+        config_path.unlink()
+        self.assertEqual(
+            mcp.load_generated_mcp_config(self.home),
+            {"mcpServers": {}},
+        )
+        config_path.write_text("{}", encoding="utf-8")
+        self.assertEqual(
+            mcp.load_generated_mcp_config(self.home),
+            {"mcpServers": {}},
+        )
+
+    def test_malformed_mcp_catalog_still_fails_closed(self) -> None:
+        (self.home / ".claude.json").write_text(
+            json.dumps({"mcpServers": []}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(mcp.OpusConfigurationError):
+            mcp.load_generated_mcp_config(self.home)
+
     def test_unavailable_mcp_server_does_not_block_opus_launch(self) -> None:
         launcher = self.import_launcher()
         selected = mcp.load_generated_mcp_config(self.home)

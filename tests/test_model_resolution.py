@@ -190,6 +190,56 @@ class ModelResolutionTests(unittest.TestCase):
             explicit,
         )
 
+    def test_direct_runtime_preserves_detected_gateway_routing_signals(
+        self,
+    ) -> None:
+        tools = launcher.Toolchain(
+            isaac=None,
+            dbcert=None,
+            databricks=None,
+            uv=Path("/uv"),
+            omnigent=Path("/omnigent"),
+            omnigent_python=Path("/python"),
+            cursor_agent=Path("/cursor"),
+            sandbox_exec=Path("/sandbox-exec"),
+            security=Path("/security"),
+            claude=Path("/claude"),
+            codex=Path("/codex"),
+        )
+        routing = {
+            "ANTHROPIC_BASE_URL": "https://example/ai-gateway/anthropic",
+            "CLAUDE_CODE_USE_GATEWAY": "1",
+        }
+        with (
+            mock.patch.dict(os.environ, routing, clear=True),
+            mock.patch.object(
+                launcher,
+                "_managed_claude_environment",
+                return_value={},
+            ),
+        ):
+            runtime = launcher._runtime_env(
+                root=ROOT,
+                real_home=Path("/Users/unit"),
+                run_dir=Path("/tmp/run"),
+                bundle=Path("/tmp/run/bundle"),
+                run_id="run",
+                sandbox_token="sandbox",
+                cursor_token="cursor",
+                omnigent_token="",
+                harness_tmp=Path("/tmp/h"),
+                tools=tools,
+                managed_python=Path("/python"),
+                voice_profile_sha256="",
+                provider="direct",
+            )
+
+        self.assertEqual(runtime["ANTHROPIC_BASE_URL"], routing["ANTHROPIC_BASE_URL"])
+        self.assertEqual(runtime["CLAUDE_CODE_USE_GATEWAY"], "1")
+        passthrough = runtime["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(",")
+        self.assertIn("ANTHROPIC_BASE_URL", passthrough)
+        self.assertIn("CLAUDE_CODE_USE_GATEWAY", passthrough)
+
     def test_provider_mapping_has_no_machine_local_override(self) -> None:
         payload = yaml.safe_load(
             (ROOT / ".omnigent/provider-models.yaml").read_text(encoding="utf-8")
