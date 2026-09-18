@@ -264,6 +264,11 @@ prompt: |
   a stable successful `turn_ended` event and a non-empty final assistant result.
   A legacy incomplete packet returns a non-terminal pending notice and arranges
   a later completion wake; do not advance, retry, or poll in response to it.
+  A definitive zero-output inactivity timeout or explicit provider-error turn
+  may route to one fresh child titled `cursor-retry-N-1`. Dispatch that exact
+  title when the runtime names it. It stays in cycle N, is separate from the
+  Opus retry budget, and is never a resume of the failed Cursor session. A
+  second Cursor transport failure is terminal.
 
   FINAL OUTPUT
   A confidence score is never a stamp. Only `verdict: STAMP` with a non-empty

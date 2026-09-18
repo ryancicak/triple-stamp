@@ -41,6 +41,7 @@ from triple_stamp_runtime_state import (
     record_best_effort_answer,
     read_supervisor_tool_calls,
     record_terminal_failure,
+    reserve_cursor_retry,
     reserve_opus_retry,
     write_budget_state,
 )
@@ -176,6 +177,10 @@ _TRANSIENT_OPUS_STREAM_MARKERS = (
 # a single fresh child recovers the overwhelmingly common one-off provider blip
 # without risking repeated spend on a persistently failing provider.
 _OPUS_TRANSIENT_RETRY_CAP = 1
+# One fresh Cursor child may recover a definitive zero-output inactivity
+# timeout or an explicit provider-error turn. It is a transport recovery in
+# the same quality cycle, not a new research/rework cycle.
+_CURSOR_RETRY_CAP = 1
 
 
 def _has_incomplete_stream_marker(text: object) -> bool:
@@ -1128,6 +1133,63 @@ def _internal_reaudit_route(
     )
 
 
+def _cursor_retries_used(
+    records: list[dict[str, Any]],
+    cycle: int,
+) -> int:
+    """Count fresh Cursor recovery children already spent this cycle."""
+
+    return sum(
+        1
+        for record in records
+        if (
+            (parsed := _stage(record.get("title"))) is not None
+            and parsed.kind == "cursor_retry"
+            and parsed.cycle == cycle
+        )
+    )
+
+
+def _retryable_cursor_failure(record: dict[str, Any]) -> bool:
+    """Classify only definitive, safe-to-retry Cursor transport failures."""
+
+    if record.get("status") == "completed":
+        return False
+    output = str(record.get("output") or "")
+    return (
+        output.startswith("CURSOR_WORKER_TIMEOUT: kind=inactivity")
+        and "assistant_chars=0" in output
+    ) or output.startswith(
+        "CURSOR_WORKER_FAILED: Cursor turn ended with status "
+    )
+
+
+def _cursor_retry_route(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    reason: str,
+) -> _Route:
+    """Recover one definitive Cursor transport failure without a new cycle."""
+
+    used = _cursor_retries_used(records, cycle)
+    if used >= _CURSOR_RETRY_CAP:
+        return _Route(
+            "infrastructure_failed",
+            cycle,
+            reason=(
+                f"Cursor recovery retry exhausted in cycle {cycle}: {reason}"
+            ),
+        )
+    return _Route(
+        "dispatch",
+        cycle,
+        "cursor_workhorse",
+        f"cursor-retry-{cycle}-{used + 1}",
+        reason=reason,
+    )
+
+
 def _opus_transient_retries_used(
     records: list[dict[str, Any]],
     cycle: int,
@@ -1351,7 +1413,10 @@ def _next_route(
     while records:
         trailing = records[-1]
         trailing_stage = _stage(trailing.get("title"))
-        if trailing_stage is None or trailing_stage.kind != "cursor_grunt":
+        if trailing_stage is None or trailing_stage.kind not in {
+            "cursor_grunt",
+            "cursor_retry",
+        }:
             break
         title = trailing.get("title")
         if not any(
@@ -1385,6 +1450,15 @@ def _next_route(
             parsed.cycle,
             reason="Opus native audit stream ended mid-response",
         )
+    if (
+        parsed.kind in {"cursor_grunt", "cursor_retry"}
+        and _retryable_cursor_failure(last)
+    ):
+        return _cursor_retry_route(
+            records,
+            parsed.cycle,
+            reason="Cursor produced no complete packet after a retryable transport failure",
+        )
     if last.get("status") != "completed" or not str(last.get("output", "")).strip():
         return _Route(
             "infrastructure_failed",
@@ -1392,7 +1466,7 @@ def _next_route(
             reason="failed, cancelled, or empty worker result",
         )
     cycle = parsed.cycle
-    if parsed.kind == "cursor_grunt":
+    if parsed.kind in {"cursor_grunt", "cursor_retry"}:
         return _Route("dispatch", cycle, "opus_auditor", f"audit-cycle-{cycle}")
     if parsed.kind == "cursor_web":
         if parsed.requester == "opus":
@@ -1668,7 +1742,10 @@ def _has_required_stage_chain(
             continue
         if (
             record.get("agent") == "cursor_workhorse"
-            and record.get("title") == f"cursor-cycle-{cycle}"
+            and (
+                record.get("title") == f"cursor-cycle-{cycle}"
+                or record.get("title") == f"cursor-retry-{cycle}-1"
+            )
             and bool(str(record.get("output") or "").strip())
         ):
             cursor_seen = True
@@ -1870,7 +1947,11 @@ def _best_effort_answer(
             for record in reversed(records)
             if record.get("agent") == "cursor_workhorse"
             and record.get("status") == "completed"
-            and record.get("title") == f"cursor-cycle-{route.cycle}"
+            and record.get("title")
+            in {
+                f"cursor-cycle-{route.cycle}",
+                f"cursor-retry-{route.cycle}-1",
+            }
             and _safe_customer_answer(record.get("output"))
         ),
         None,
@@ -1953,11 +2034,22 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
     for record in records:
         output = str(record.get("output") or "")
         if record.get("status") in {"failed", "cancelled"} or not output.strip():
+            parsed = _stage(record.get("title"))
+            if (
+                parsed is not None
+                and parsed.kind in {"cursor_grunt", "cursor_retry"}
+                and _retryable_cursor_failure(record)
+                and (
+                    parsed.kind == "cursor_grunt"
+                    or _cursor_retries_used(records, parsed.cycle)
+                    < _CURSOR_RETRY_CAP
+                )
+            ):
+                continue
             # A transient Opus stream death is only terminal once its bounded
             # retry budget for the cycle is spent. While a fresh retry child is
             # still available, this is recoverable, not a terminal failure, and
             # the user must not see PIPELINE_INFRASTRUCTURE_ERROR.
-            parsed = _stage(record.get("title"))
             if (
                 parsed is not None
                 and parsed.kind in _OPUS_AUDIT_KINDS
@@ -2164,6 +2256,51 @@ def supervisor_contract(
                     ),
                 }
             parsed = _stage(title)
+            if title.startswith("cursor-retry-"):
+                retry = re.fullmatch(r"cursor-retry-([1-4])-([1-9][0-9]*)", title)
+                if retry is None or int(retry.group(2)) != 1:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one Cursor transport retry is allowed per "
+                            "cycle; cursor-retry-N-2 and higher are forbidden."
+                        ),
+                    }
+                if not parent_session_id:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Cursor retry lacks an authoritative parent "
+                            "session; unscoped dispatch is forbidden."
+                        ),
+                    }
+                active_records = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                route = _next_route(
+                    active_records,
+                    parent_session_id=parent_session_id,
+                )
+                if route.status != "dispatch" or route.title != title:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"{title} is not the durable next route for this "
+                            "attempt; speculative Cursor retry is forbidden."
+                        ),
+                    }
+                if not reserve_cursor_retry(
+                    parent_session_id,
+                    int(retry.group(1)),
+                ):
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one Cursor transport retry is allowed per "
+                            "parent, attempt generation, and cycle; the retry "
+                            "reservation is already spent or unavailable."
+                        ),
+                    }
             if (
                 parsed is not None
                 and parsed.kind == "cursor_grunt"

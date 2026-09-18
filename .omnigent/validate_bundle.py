@@ -517,6 +517,7 @@ def validate_spec(
             "runtime exposes only those two MCP tools",
             "routing authorization never parses or compares handoff prose",
             "cursor-cycle-N",
+            "cursor-retry-N-1",
             "cursor-web-opus-N-H",
             "cursor-web-codex-N-H",
             "audit-cycle-N",
@@ -706,6 +707,7 @@ def validate_launchers(
         "def append_supervisor_continuation(",
         "def parse_dispatch_title(",
         "def record_tool_dispatch_exception(",
+        'r"cursor-retry-([1-4])-(1)"',
         'r"audit-internal-([1-4])-([1-2])"',
         'r"audit-retry-([1-4])-(1)"',
     ):
@@ -767,10 +769,13 @@ def validate_launchers(
         "forwarder-required-after-prior-dispatch",
         "turn_ended_success",
         "_CURSOR_STAGE_ABSOLUTE_S = 15 * 60",
+        "def _cursor_retry_note(",
         "def _observe_dispatch_bookkeeping(",
         "def ensure_parent_inbox(",
         "def _install_runner_session_inbox_initialization(",
         "__triple_stamp_parent_inbox_probe__",
+        "missing_work_entry",
+        "recovered_assistant_output",
         "retry denied",
     ):
         if marker not in runtime_guard_source:
@@ -1047,6 +1052,25 @@ def validate_launchers(
         "audit-retry-1-1",
     ):
         fail("transient Opus stream death did not resolve to a fresh retry child")
+    cursor_retry = _next_route(
+        [
+            {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "failed",
+                "output": (
+                    "CURSOR_WORKER_TIMEOUT: kind=inactivity "
+                    "inactivity_s=301 inactivity_limit_s=300; assistant_chars=0"
+                ),
+            }
+        ]
+    )
+    if (cursor_retry.status, cursor_retry.agent, cursor_retry.title) != (
+        "dispatch",
+        "cursor_workhorse",
+        "cursor-retry-1-1",
+    ):
+        fail("zero-output Cursor inactivity did not resolve to one fresh retry")
 
     runner_env = _build_runner_env(
         os.environ,

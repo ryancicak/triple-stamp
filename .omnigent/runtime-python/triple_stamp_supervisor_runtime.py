@@ -1003,47 +1003,57 @@ def install_supervisor_continuation_guard() -> None:
                     != "infrastructure_failed"
                     and not genuine_native_failure
                 ):
+                    if str(getattr(route, "title", "") or "").startswith(
+                        "cursor-retry-"
+                    ):
+                        # The model's generic "required child failed" rule is
+                        # stale for this one mechanically retryable transport
+                        # failure. Continue into the bounded deterministic
+                        # dispatch path instead of accepting or surfacing it.
+                        response = ""
+                    else:
+                        _record(
+                            "unverified_failure_claim_suppressed",
+                            route,
+                            attempt=continuation_attempt,
+                            reason=(
+                                "supervisor emitted an unverified infrastructure "
+                                "failure; no continuation or terminal mutation "
+                                "is authorized"
+                            ),
+                            parent_session_id=session_id,
+                        )
+                        yield TurnComplete(
+                            response="",
+                            modified_by_policy=True,
+                            usage=completed.usage,
+                        )
+                        return
+                else:
+                    recorded = record_terminal_failure(
+                        "PIPELINE_INFRASTRUCTURE_ERROR",
+                        response.removeprefix(_INFRA_PREFIX).strip(),
+                        stage=str(getattr(route, "title", "") or route.status),
+                        cycle=int(getattr(route, "cycle", 0) or 0),
+                        parent_session_id=session_id,
+                    )
                     _record(
-                        "unverified_failure_claim_suppressed",
+                        "supervisor_failure_terminalized",
                         route,
                         attempt=continuation_attempt,
                         reason=(
-                            "supervisor emitted an unverified infrastructure "
-                            "failure; no continuation or terminal mutation "
-                            "is authorized"
+                            "supervisor emitted an infrastructure failure; "
+                            "continuation dispatch is forbidden"
                         ),
                         parent_session_id=session_id,
                     )
+                    yield TextChunk(text=recorded)
                     yield TurnComplete(
-                        response="",
+                        response=recorded,
                         modified_by_policy=True,
                         usage=completed.usage,
                     )
                     return
-                recorded = record_terminal_failure(
-                    "PIPELINE_INFRASTRUCTURE_ERROR",
-                    response.removeprefix(_INFRA_PREFIX).strip(),
-                    stage=str(getattr(route, "title", "") or route.status),
-                    cycle=int(getattr(route, "cycle", 0) or 0),
-                    parent_session_id=session_id,
-                )
-                _record(
-                    "supervisor_failure_terminalized",
-                    route,
-                    attempt=continuation_attempt,
-                    reason=(
-                        "supervisor emitted an infrastructure failure; "
-                        "continuation dispatch is forbidden"
-                    ),
-                    parent_session_id=session_id,
-                )
-                yield TextChunk(text=recorded)
-                yield TurnComplete(
-                    response=recorded,
-                    modified_by_policy=True,
-                    usage=completed.usage,
-                )
-                return
 
             bounded_answer = _best_effort_answer(records, route)
             if bounded_answer is not None:

@@ -17,6 +17,7 @@ from urllib.parse import quote
 _LOGGER = logging.getLogger(__name__)
 _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-cycle-([1-4])", "cursor_grunt", ""),
+    (r"cursor-retry-([1-4])-(1)", "cursor_retry", ""),
     (r"audit-cycle-([1-4])", "audit", "opus"),
     (r"audit-cycle-([1-4])-web-([1-2])", "audit_web", "opus"),
     (r"audit-retry-([1-4])-(1)", "audit_retry", "opus"),
@@ -34,7 +35,14 @@ _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-web-codex-([1-4])-([1-2])", "cursor_web", "codex"),
 )
 _HOP_STAGE_IDS = frozenset(
-    {"audit_web", "audit_retry", "audit_internal", "audit_repair_web", "cursor_web"}
+    {
+        "audit_web",
+        "audit_retry",
+        "audit_internal",
+        "audit_repair_web",
+        "cursor_retry",
+        "cursor_web",
+    }
 )
 _TOOL_DISPATCH_EXCEPTIONS = (
     AttributeError,
@@ -255,15 +263,17 @@ def current_attempt_generation(parent_session_id: str = "") -> int:
         return 1
 
 
-def reserve_opus_retry(
+def _reserve_stage_retry(
     parent_session_id: str,
     cycle: int,
+    *,
+    stage: str,
 ) -> bool:
-    """Atomically reserve one paid transient Opus retry for this attempt/cycle.
+    """Atomically reserve one retry for this attempt, stage, and cycle.
 
     The reservation is created before native dispatch and is intentionally
     never released: a timeout or unknown completion may already have launched
-    the paid child. Generation-local exclusive files make duplicate policy
+    the child. Generation-local exclusive files make duplicate policy
     evaluations and concurrent sends converge on one winner without trusting
     a dispatch observer that runs only after native launch returns.
     """
@@ -276,6 +286,7 @@ def reserve_opus_retry(
         or not isinstance(cycle, int)
         or cycle < 1
         or cycle > 4
+        or stage not in {"cursor", "opus"}
     ):
         return False
     activate_parent_attempt(parent_session_id, "")
@@ -297,7 +308,7 @@ def reserve_opus_retry(
             / "retry-reservations"
         )
         reservation_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        reservation = reservation_dir / f"opus-cycle-{cycle}.json"
+        reservation = reservation_dir / f"{stage}-cycle-{cycle}.json"
         try:
             fd = os.open(
                 reservation,
@@ -312,6 +323,7 @@ def reserve_opus_retry(
                     "version": 1,
                     "parent_session_id": parent_session_id,
                     "attempt_generation": generation,
+                    "stage": stage,
                     "cycle": cycle,
                     "reserved_at_ns": time.time_ns(),
                 },
@@ -334,6 +346,32 @@ def reserve_opus_retry(
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+
+
+def reserve_opus_retry(
+    parent_session_id: str,
+    cycle: int,
+) -> bool:
+    """Reserve the one paid transient Opus retry independently of Cursor."""
+
+    return _reserve_stage_retry(
+        parent_session_id,
+        cycle,
+        stage="opus",
+    )
+
+
+def reserve_cursor_retry(
+    parent_session_id: str,
+    cycle: int,
+) -> bool:
+    """Reserve the one fresh Cursor recovery child independently of Opus."""
+
+    return _reserve_stage_retry(
+        parent_session_id,
+        cycle,
+        stage="cursor",
+    )
 
 
 def _observed_budget_totals(payload: dict[str, Any]) -> dict[str, float] | None:
@@ -2119,7 +2157,8 @@ def record_best_effort_answer(
             record
             for record in reversed(scoped)
             if complete(record, "cursor_workhorse")
-            and record.get("title") == f"cursor-cycle-{cycle}"
+            and record.get("title")
+            in {f"cursor-cycle-{cycle}", f"cursor-retry-{cycle}-1"}
         ),
         None,
     )

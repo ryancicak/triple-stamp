@@ -533,6 +533,7 @@ class OrchestrationContractTests(unittest.TestCase):
             prompt,
         )
         self.assertIn("At most two web hops for each", prompt)
+        self.assertIn("cursor-retry-N-1", prompt)
 
     def test_final_response_policy_atomically_reserves_one_paid_retry(
         self,
@@ -674,6 +675,241 @@ class OrchestrationContractTests(unittest.TestCase):
                 thread.join(timeout=2)
             self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual(sorted(results), ["ALLOW", "DENY"])
+
+    def test_cursor_timeout_gets_one_same_cycle_retry_then_terminal(self) -> None:
+        timeout = (
+            "CURSOR_WORKER_TIMEOUT: kind=inactivity elapsed_s=561.208 "
+            "inactivity_s=300.529 inactivity_limit_s=300.000; "
+            "assistant_chars=0"
+        )
+        original = {
+            **_route_packet(
+                "cursor_workhorse",
+                "cursor-cycle-1",
+                timeout,
+            ),
+            "status": "failed",
+        }
+        first = plugin._next_route([original])
+        self.assertEqual(
+            (first.status, first.agent, first.title, first.cycle),
+            ("dispatch", "cursor_workhorse", "cursor-retry-1-1", 1),
+        )
+        retry = {
+            **_route_packet(
+                "cursor_workhorse",
+                "cursor-retry-1-1",
+                timeout,
+            ),
+            "status": "failed",
+        }
+        exhausted = plugin._next_route([original, retry])
+        self.assertEqual(exhausted.status, "infrastructure_failed")
+        self.assertEqual(exhausted.cycle, 1)
+        self.assertIn("recovery retry exhausted", exhausted.reason)
+
+        completed_retry = {
+            **retry,
+            "status": "completed",
+            "output": "complete retry evidence",
+        }
+        recovered = plugin._next_route([original, completed_retry])
+        self.assertEqual(
+            (recovered.agent, recovered.title, recovered.cycle),
+            ("opus_auditor", "audit-cycle-1", 1),
+        )
+        provider_error = {
+            **original,
+            "output": (
+                "CURSOR_WORKER_FAILED: Cursor turn ended with status error "
+                "before a complete packet; recovered_assistant_output="
+                '"Python printed 4."'
+            ),
+        }
+        self.assertEqual(
+            plugin._next_route([provider_error]).title,
+            "cursor-retry-1-1",
+        )
+        with mock.patch.object(
+            plugin,
+            "read_attempt_collections",
+            return_value=[original],
+        ):
+            self.assertFalse(
+                plugin._has_terminal_worker_failure("cursor-retry-parent")
+            )
+        with mock.patch.object(
+            plugin,
+            "read_attempt_collections",
+            return_value=[original, completed_retry],
+        ):
+            self.assertFalse(
+                plugin._has_terminal_worker_failure("cursor-retry-parent")
+            )
+        with mock.patch.object(
+            plugin,
+            "read_attempt_collections",
+            return_value=[original, retry],
+        ):
+            self.assertTrue(
+                plugin._has_terminal_worker_failure("cursor-retry-parent")
+            )
+
+    def test_cursor_retry_reservation_is_separate_and_unknown_safe(self) -> None:
+        parent = "cursor-retry-reservation-parent"
+        timeout = (
+            "CURSOR_WORKER_TIMEOUT: kind=inactivity elapsed_s=301 "
+            "inactivity_s=301 inactivity_limit_s=300; assistant_chars=0"
+        )
+        retry_call = {
+            "type": "tool_call",
+            "data": {
+                "name": "sys_session_send",
+                "arguments": {
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-retry-1-1",
+                },
+            },
+            "context": {
+                "conversation_id": parent,
+                "root_conversation_id": parent,
+            },
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            runtime_state.append_collection(
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        timeout,
+                    ),
+                    "parent_session_id": parent,
+                    "status": "failed",
+                }
+            )
+            contract = plugin.supervisor_contract(enabled=True)
+            self.assertEqual(contract(retry_call)["result"], "ALLOW")
+            # No dispatch observer row is written, modeling unknown completion.
+            duplicate = contract(retry_call)
+            self.assertEqual(duplicate["result"], "DENY")
+            self.assertIn("reservation is already spent", duplicate["reason"])
+            self.assertTrue(runtime_state.reserve_opus_retry(parent, 1))
+
+    def test_supervisor_failure_prose_cannot_cancel_cursor_retry(self) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, ToolCallRequest, TurnComplete
+
+        parent = "cursor-retry-continuation-parent"
+        original_run_turn = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+        failure = (
+            "PIPELINE_INFRASTRUCTURE_ERROR: cursor-cycle-1 failed after "
+            "a retryable transport error"
+        )
+
+        async def scripted(
+            _self: object,
+            _messages: object,
+            _tools: object,
+            _system_prompt: object,
+            _config: object = None,
+        ):
+            nonlocal model_turns
+            model_turns += 1
+            if model_turns == 1:
+                yield TextChunk(failure)
+                yield TurnComplete(response=failure)
+                return
+            yield ToolCallRequest(
+                name="mcp__omnigent__sys_session_send",
+                args={
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-retry-1-1",
+                },
+            )
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": "cursor-retry-child",
+                    "work_id": "cursor-retry-work",
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-retry-1-1",
+                }
+            )
+            yield TurnComplete(response="")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        messages = [
+            {
+                "role": "user",
+                "content": "2+2=?",
+                "session_id": parent,
+            }
+        ]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    messages,
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+            },
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            runtime_state.append_collection(
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        (
+                            "CURSOR_WORKER_TIMEOUT: kind=inactivity "
+                            "inactivity_s=301 inactivity_limit_s=300; "
+                            "assistant_chars=0"
+                        ),
+                    ),
+                    "parent_session_id": parent,
+                    "status": "failed",
+                }
+            )
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original_run_turn
+
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                runtime_state.read_dispatches(parent)[-1]["title"],
+                "cursor-retry-1-1",
+            )
+
+        self.assertEqual(model_turns, 2)
+        self.assertNotIn(
+            "PIPELINE_INFRASTRUCTURE_ERROR",
+            "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            ),
+        )
 
     def test_voice_profile_digest_propagates_current_bytes(self) -> None:
         required = (
@@ -7587,6 +7823,7 @@ print("exact temp boundary: PASS")
     ) -> None:
         forms = (
             ("cursor-cycle-{cycle}", "cursor_grunt", "", False),
+            ("cursor-retry-{cycle}-{hop}", "cursor_retry", "", True),
             ("audit-cycle-{cycle}", "audit", "opus", False),
             ("audit-cycle-{cycle}-web-{hop}", "audit_web", "opus", True),
             ("audit-retry-{cycle}-{hop}", "audit_retry", "opus", True),
@@ -7652,7 +7889,7 @@ print("exact temp boundary: PASS")
             for form, stage_id, requester, has_hop in forms:
                 boundaries = (
                     ((1, 1), (4, 1))
-                    if stage_id == "audit_retry"
+                    if stage_id in {"audit_retry", "cursor_retry"}
                     else ((1, 1), (4, 2))
                 )
                 for cycle, hop in boundaries:
@@ -7699,7 +7936,7 @@ print("exact temp boundary: PASS")
                             form.format(cycle=1, hop=3),
                         }
                     )
-                    if _stage_id == "audit_retry":
+                    if _stage_id in {"audit_retry", "cursor_retry"}:
                         malformed.add(form.format(cycle=1, hop=2))
             for title in sorted(malformed):
                 with self.subTest(malformed=title):
