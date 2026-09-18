@@ -975,6 +975,75 @@ class CursorLifecycleTests(unittest.TestCase):
                     work_id,
                 )
                 self.assertTrue(committed["delivery_committed"])
+                self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+
+    def test_failed_cursor_without_collection_terminalizes_parent_attempt(
+        self,
+    ) -> None:
+        parent = "failed-no-collection-parent"
+        child = "failed-no-collection-child"
+        work_id = "failed-no-collection-work"
+        output = (
+            "CURSOR_WORKER_FAILED: Cursor process ended before a successful "
+            "turn_ended result; assistant_chars=0 process_state=failed "
+            'process_reason="injected prompt was not acknowledged"'
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(
+                parent,
+                runtime_state.attempt_request_identity("2 + 2 = ?"),
+            )
+            self._dispatch(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+                title="cursor-cycle-1",
+            )
+            lifecycle.ensure_parent_inbox(parent)
+            entry = runner_app.register_subagent_work(
+                parent_session_id=parent,
+                child_session_id=child,
+                agent="cursor_workhorse",
+                title="cursor-cycle-1",
+            )
+            entry.work_id = work_id
+
+            def ready(
+                generation: dict[str, object],
+                _state: dict[str, object],
+            ) -> None:
+                generation["terminal_status"] = "failed"
+                generation["terminal_output"] = output
+                generation["terminal_phase"] = "ready"
+
+            runtime_state.mutate_cursor_lifecycle(child, work_id, ready)
+            try:
+                acknowledgement = runner_app.mark_subagent_work_terminal(
+                    child,
+                    status="failed",
+                    output=output,
+                )
+                self.assertTrue(acknowledgement.delivered)
+                self.assertEqual(runtime_state.read_attempt_collections(parent), [])
+                self.assertTrue(runtime_state.read_terminal_failure(parent))
+                self.assertEqual(
+                    runtime_state.activate_parent_attempt(
+                        parent,
+                        runtime_state.attempt_request_identity(
+                            "question after terminal Cursor failure"
+                        ),
+                        new_request=True,
+                    ),
+                    2,
+                )
+                self.assertEqual(runtime_state.read_terminal_failure(parent), "")
             finally:
                 runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)

@@ -1697,6 +1697,30 @@ print("exact temp boundary: PASS")
         self.assertEqual(event_context["conversation_id"], "child")
         self.assertEqual(event_context["root_conversation_id"], "root")
 
+    def test_native_request_hook_stamps_non_ui_provenance(self) -> None:
+        from omnigent import native_policy_hook
+
+        prior = native_policy_hook.hook_payload_to_evaluation_request
+        native_policy_hook.hook_payload_to_evaluation_request = getattr(
+            prior,
+            "__triple_stamp_original__",
+            prior,
+        )
+        try:
+            runtime_guard._install_native_request_provenance()
+            request = native_policy_hook.hook_payload_to_evaluation_request(
+                "UserPromptSubmit",
+                {"prompt": "rendered supervisor wrapper"},
+            )
+            self.assertIsInstance(request, dict)
+            assert request is not None
+            self.assertEqual(
+                request["event"]["context"]["harness"],
+                "triple-stamp-native-hook",
+            )
+        finally:
+            native_policy_hook.hook_payload_to_evaluation_request = prior
+
     def test_required_isaac_launcher_failure_cannot_fall_back_to_claude(self) -> None:
         from omnigent import claude_launcher
 
@@ -10111,6 +10135,126 @@ print("exact temp boundary: PASS")
             )
             self.assertEqual(decision["result"], "ALLOW")
             self.assertEqual(runtime_state.current_attempt_generation(parent), 1)
+
+    def test_first_ui_request_child_injection_and_wake_are_one_attempt(
+        self,
+    ) -> None:
+        parent = "live-single-ui-request-parent"
+        child = "live-single-ui-request-child"
+        zero_cost = {
+            "available": True,
+            "source": "fixture",
+            "total_usd": 0.0,
+            "reported_usd": 0.0,
+            "estimated_unpriced_usd": 0.0,
+            "sessions": [],
+        }
+        root_context = {
+            "conversation_id": parent,
+            "root_conversation_id": parent,
+        }
+        first = {
+            "type": "request",
+            "data": {
+                "user_content": "2 + 2 = ?",
+                "attachments": [],
+            },
+            "context": root_context,
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ), mock.patch.object(
+            plugin,
+            "_stored_cost_snapshot",
+            return_value=zero_cost,
+        ):
+            budget = plugin.strict_cost_budget(50.0)
+            self.assertEqual(budget(first)["result"], "ALLOW")
+            first_identity = plugin._top_level_request_identity(first["data"])
+
+            child_injection = {
+                **first,
+                "data": {
+                    "user_content": "full Cursor handoff for the original request",
+                    "attachments": [],
+                },
+                "context": {
+                    "conversation_id": child,
+                    "root_conversation_id": parent,
+                },
+            }
+            self.assertEqual(budget(child_injection)["result"], "ALLOW")
+
+            native_wrapper = {
+                **first,
+                "data": {
+                    "user_content": "rendered native wrapper around a parent wake",
+                    "attachments": [],
+                },
+                "context": {
+                    **root_context,
+                    "harness": "triple-stamp-native-hook",
+                },
+            }
+            self.assertEqual(budget(native_wrapper)["result"], "ALLOW")
+
+            runtime_state.append_dispatch(
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        "",
+                        child=child,
+                    ),
+                    "parent_session_id": parent,
+                    "work_id": "live-single-ui-work",
+                }
+            )
+            wake = {
+                **first,
+                "data": {
+                    "user_content": (
+                        "[System: sub-agent cursor_workhorse/cursor-cycle-1 "
+                        "finished (failed) — 1 result waiting in inbox. "
+                        "Call sys_read_inbox to collect.]"
+                    ),
+                    "attachments": [],
+                },
+            }
+            self.assertEqual(budget(wake)["result"], "ALLOW")
+            self.assertEqual(
+                supervisor_runtime._original_request(
+                    [
+                        {"role": "user", "content": "2 + 2 = ?"},
+                        {
+                            "role": "user",
+                            "content": wake["data"]["user_content"],
+                        },
+                    ]
+                ),
+                "2 + 2 = ?",
+            )
+            self.assertEqual(runtime_state.current_attempt_generation(parent), 1)
+            state = json.loads(
+                runtime_state._attempt_state_path(
+                    Path(value),
+                    parent,
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["request_identity"], first_identity)
+
+            distinct_second = {
+                **first,
+                "data": {
+                    "user_content": "a distinct second user question",
+                    "attachments": [],
+                },
+            }
+            denied = budget(distinct_second)
+            self.assertEqual(denied["result"], "DENY")
+            self.assertIn("prior attempt still in flight", denied["reason"])
 
     def test_child_wakes_and_late_cursor_never_discard_inflight_audit(
         self,

@@ -130,6 +130,13 @@ _COMPLETION = re.compile(
     r"(?:(?: returned: | error: |: )(?P<output>.*))?\]$",
     re.DOTALL,
 )
+_WAKE_NOTICE = re.compile(
+    r"^\[System: sub-agent "
+    r"(?P<agent>cursor_workhorse|opus_auditor|codex_judge)/"
+    r"(?P<title>[^\s\]]+) finished "
+    r"\((?P<status>completed|failed|cancelled)\) — "
+    r"\d+ results? waiting in inbox\. Call sys_read_inbox to collect\.\]$"
+)
 _NO_OUTPUT = re.compile(
     r"^\[System: sub-agent task \S+ completed — "
     r"(?P<agent>cursor_workhorse|opus_auditor|codex_judge)"
@@ -2833,6 +2840,57 @@ def _top_level_request_identity(data: object) -> str:
     return attempt_request_identity(data)
 
 
+def _request_text(data: object) -> str:
+    """Return policy request text without assigning request provenance."""
+
+    if not isinstance(data, dict):
+        return ""
+    content = data.get("user_content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        nested = content.get("text") or content.get("user_content")
+        return nested if isinstance(nested, str) else ""
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text") or block.get("input_text") or "")
+            for block in content
+            if isinstance(block, dict)
+            and isinstance(
+                block.get("text") or block.get("input_text"),
+                str,
+            )
+        )
+    return ""
+
+
+def _authenticated_child_wake(data: object, parent_session_id: str) -> bool:
+    """Recognize only framework wakes backed by this parent's dispatch ledger."""
+
+    text = _request_text(data).strip()
+    wake = _WAKE_NOTICE.fullmatch(text)
+    completion = _COMPLETION.fullmatch(text)
+    if wake is None and completion is None:
+        return False
+    match = wake or completion
+    assert match is not None
+    expected_title = match.group("title") or ""
+    expected_child = match.group("id") if completion is not None else ""
+    return any(
+        record.get("parent_session_id") == parent_session_id
+        and record.get("agent") == match.group("agent")
+        and (
+            not expected_title
+            or record.get("title") == expected_title
+        )
+        and (
+            not expected_child
+            or record.get("child_session_id") == expected_child
+        )
+        for record in read_dispatches()
+    )
+
+
 def strict_cost_budget(
     max_cost_usd: float = 50.0,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -2864,9 +2922,32 @@ def strict_cost_budget(
             return {"result": "ALLOW"}
         is_request = event.get("type") == "request"
         harness = context.get("harness") if isinstance(context, dict) else None
+        conversation_id = (
+            str(context.get("conversation_id") or "")
+            if isinstance(context, dict)
+            else ""
+        )
+        is_root_request = bool(
+            parent_session_id
+            and conversation_id
+            and conversation_id == parent_session_id
+        )
+        is_child_wake = (
+            is_request
+            and is_root_request
+            and _authenticated_child_wake(
+                event.get("data"),
+                parent_session_id,
+            )
+        )
         request_identity = (
             _top_level_request_identity(event.get("data"))
-            if is_request and not harness
+            if (
+                is_request
+                and is_root_request
+                and not harness
+                and not is_child_wake
+            )
             else ""
         )
         if request_identity:

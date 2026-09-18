@@ -220,6 +220,7 @@ from omnigent import claude_launcher
 from omnigent import chat
 from omnigent import codex_native_app_server
 from omnigent import cursor_native_permissions as permissions
+from omnigent import native_policy_hook
 from omnigent.inner import claude_sdk_executor
 from omnigent.policies import function as policy_function
 from omnigent.runner import tool_dispatch
@@ -287,6 +288,11 @@ assert getattr(
 assert getattr(
     policy_function.FunctionPolicy.evaluate,
     "__triple_stamp_policy_identity_context__",
+    False,
+)
+assert getattr(
+    native_policy_hook.hook_payload_to_evaluation_request,
+    "__triple_stamp_request_provenance__",
     False,
 )
 assert getattr(

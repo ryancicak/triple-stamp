@@ -24,6 +24,12 @@ _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT = 30
 # ``LOAD_SMALL_INT`` instruction.
 _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT = 255
 _CONTINUATION_PREFIX = "TRIPLE_STAMP_NONTERMINAL_CONTINUATION"
+_FRAMEWORK_WAKE = re.compile(
+    r"^\[System: sub-agent "
+    r"(?:cursor_workhorse|opus_auditor|codex_judge)/[^\s\]]+ finished "
+    r"\((?:completed|failed|cancelled)\) — "
+    r"\d+ results? waiting in inbox\. Call sys_read_inbox to collect\.\]$"
+)
 _LOGGER = logging.getLogger(__name__)
 # Every ledger action after which the guard has already streamed the recorded
 # terminal failure to the reader. A later wake from a child that was still in
@@ -264,8 +270,12 @@ def _original_request(messages: list[dict[str, Any]]) -> str:
         if message.get("role") != "user":
             continue
         content = _message_text(message.get("content"))
-        if not content or content.startswith(
-            (_CONTINUATION_PREFIX, "[System: sub-agent task ")
+        if (
+            not content
+            or content.startswith(
+                (_CONTINUATION_PREFIX, "[System: sub-agent task ")
+            )
+            or _FRAMEWORK_WAKE.fullmatch(content.strip()) is not None
         ):
             continue
         return content

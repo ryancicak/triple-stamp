@@ -267,9 +267,54 @@ def _install_policy_identity_context() -> None:
     policy_function.FunctionPolicy.evaluate = evaluate_with_identity
 
 
+def _install_native_request_provenance() -> None:
+    """Stamp native hook requests so they cannot impersonate browser submits."""
+
+    from omnigent import native_policy_hook
+
+    original = native_policy_hook.hook_payload_to_evaluation_request
+    if getattr(original, "__triple_stamp_request_provenance__", False):
+        return
+
+    def with_request_provenance(
+        hook_event: str,
+        payload: dict[str, object],
+    ) -> object:
+        request = original(hook_event, payload)
+        if hook_event != "UserPromptSubmit" or not isinstance(request, dict):
+            return request
+        event = request.get("event")
+        if not isinstance(event, dict):
+            return request
+        context = event.get("context")
+        if not isinstance(context, dict):
+            context = {}
+            event["context"] = context
+        context.setdefault("harness", "triple-stamp-native-hook")
+        return request
+
+    with_request_provenance.__triple_stamp_request_provenance__ = True
+    with_request_provenance.__triple_stamp_original__ = original
+    native_policy_hook.hook_payload_to_evaluation_request = with_request_provenance
+
+    for module_name in (
+        "omnigent.claude_native_hook",
+        "omnigent.codex_native_hook",
+        "omnigent.kimi_native_hook",
+    ):
+        module = sys.modules.get(module_name)
+        if (
+            module is not None
+            and getattr(module, "hook_payload_to_evaluation_request", None)
+            is original
+        ):
+            module.hook_payload_to_evaluation_request = with_request_provenance
+
+
 if os.environ.get(_ENV_NAME) == _MODE:
     try:
         _install_policy_identity_context()
+        _install_native_request_provenance()
     except Exception:  # noqa: BLE001 - missing identity would weaken the route cap
         os._exit(78)
 

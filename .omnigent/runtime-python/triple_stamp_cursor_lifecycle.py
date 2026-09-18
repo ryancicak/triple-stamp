@@ -290,6 +290,31 @@ def _cursor_retry_note(title: str) -> str:
     )
 
 
+def _cursor_failure_requires_terminal_latch(
+    title: str,
+    status: str,
+    output: str,
+) -> bool:
+    """Return whether a delivered Cursor failure has no recovery route."""
+
+    if status != "failed":
+        return False
+    if re.fullmatch(r"cursor-retry-[1-4]-1", title):
+        return True
+    if re.fullmatch(r"cursor-cycle-[1-4]", title):
+        retryable = (
+            output.startswith("CURSOR_WORKER_TIMEOUT: kind=inactivity")
+            and "assistant_chars=0" in output
+        ) or output.startswith(
+            "CURSOR_WORKER_FAILED: Cursor turn ended with status "
+        )
+        return not retryable
+    return re.fullmatch(
+        r"cursor-web-(?:opus|codex)-[1-4]-[1-2]",
+        title,
+    ) is not None
+
+
 def _install_codex_voice_environment() -> None:
     """Thread the validated voice profile into codex-native app-server env."""
 
@@ -1511,6 +1536,22 @@ def install_parent_inbox_guard() -> None:
                     current["terminal_phase"] = "delivered"
 
                 mutate_cursor_lifecycle(child_session_id, work_id, commit)
+                title = str(record.get("title") or "")
+                if _cursor_failure_requires_terminal_latch(
+                    title,
+                    status,
+                    output,
+                ):
+                    parsed = parse_dispatch_title(title) or {}
+                    record_terminal_failure(
+                        "PIPELINE_INFRASTRUCTURE_ERROR",
+                        output,
+                        stage=title or "cursor",
+                        cycle=int(parsed.get("cycle") or 0),
+                        parent_session_id=str(
+                            record.get("parent_session_id") or ""
+                        ),
+                    )
             return acknowledgement
 
         guarded_mark_terminal.__triple_stamp_lifecycle_gate__ = True
