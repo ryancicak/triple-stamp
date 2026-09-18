@@ -9939,6 +9939,196 @@ print("exact temp boundary: PASS")
         self.assertIn("terminal_stamp_suppressed", actions)
         self.assertNotIn("continuation_enqueued", actions)
 
+    def test_raw_stamp_format_repair_exhaustion_relays_best_effort(
+        self,
+    ) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        parent = "raw-stamp-format-repair-parent"
+        answer = "4"
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+
+        async def refuses_format_repair(*_args: object, **_kwargs: object):
+            nonlocal model_turns
+            model_turns += 1
+            yield TurnComplete(response="")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        messages = [
+            {
+                "role": "user",
+                "content": "2+2=?",
+                "session_id": parent,
+            }
+        ]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    messages,
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "/voice/profile.md",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "expected-digest",
+            },
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(
+                parent,
+                supervisor_runtime._attempt_request_identity(messages),
+            )
+            raw_stamp = json.dumps(
+                {
+                    "verdict": "STAMP",
+                    "needs_web": False,
+                    "needs_internal": False,
+                    "why": "correct arithmetic",
+                    "gap_materiality": "none",
+                    "limitations": [],
+                    "citations_that_hold": ["Peano derivation"],
+                    "voice_profile_check": {
+                        "source_path": "",
+                        "sha256": "",
+                        "constraints_applied": "voice rendering disabled",
+                    },
+                    "shippable_answer": answer,
+                    "evidence_appendix": [],
+                }
+            )
+            records = (
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        "cursor evidence",
+                    ),
+                    "parent_session_id": parent,
+                },
+                {
+                    **_route_packet(
+                        "opus_auditor",
+                        "audit-cycle-1",
+                        _audit("PASS"),
+                    ),
+                    "parent_session_id": parent,
+                },
+                {
+                    **_route_packet(
+                        "codex_judge",
+                        "judge-cycle-1",
+                        raw_stamp,
+                    ),
+                    "parent_session_id": parent,
+                },
+            )
+            for record in records:
+                runtime_state.append_collection(record)
+            route = plugin._next_route(
+                runtime_state.read_attempt_collections(parent),
+                parent_session_id=parent,
+            )
+            self.assertEqual(route.title, "judge-format-repair-1")
+
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = refuses_format_repair
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+                stale = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+
+            self.assertEqual(
+                runtime_state.read_best_effort_answer(parent),
+                answer,
+            )
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+
+        self.assertEqual(model_turns, 3)
+        self.assertEqual(
+            "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            ),
+            answer,
+        )
+        self.assertFalse(any(isinstance(event, TextChunk) for event in stale))
+        self.assertIn("judge_format_repair_best_effort_relay", actions)
+        self.assertNotIn("continuation_exhausted_abstained", actions)
+
+    def test_voice_profile_reaches_codex_native_judge_environment(self) -> None:
+        from omnigent import codex_native_app_server
+
+        prior_builder = codex_native_app_server.build_codex_native_server
+        prior_terminal_env = codex_native_app_server.codex_terminal_env
+        codex_native_app_server.build_codex_native_server = getattr(
+            prior_builder,
+            "__triple_stamp_original__",
+            prior_builder,
+        )
+        codex_native_app_server.codex_terminal_env = getattr(
+            prior_terminal_env,
+            "__triple_stamp_original__",
+            prior_terminal_env,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+                os.environ,
+                {
+                    "TRIPLE_STAMP_VOICE_PROFILE": "/voice/profile.md",
+                    "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "voice-digest",
+                },
+                clear=False,
+            ):
+                cursor_lifecycle._install_codex_voice_environment()
+                server = codex_native_app_server.build_codex_native_server(
+                    socket_path=Path(value) / "codex.sock",
+                    codex_home=Path(value) / "codex-home",
+                    cwd=Path(value),
+                    model=None,
+                    profile=None,
+                    bridge_dir=Path(value) / "bridge",
+                    codex_path="/bin/echo",
+                )
+                self.assertEqual(
+                    server.env["TRIPLE_STAMP_VOICE_PROFILE"],
+                    "/voice/profile.md",
+                )
+                self.assertEqual(
+                    server.env["TRIPLE_STAMP_VOICE_PROFILE_SHA256"],
+                    "voice-digest",
+                )
+                terminal_env = codex_native_app_server.codex_terminal_env(
+                    server
+                )
+                self.assertEqual(
+                    terminal_env["TRIPLE_STAMP_VOICE_PROFILE"],
+                    "/voice/profile.md",
+                )
+                self.assertEqual(
+                    terminal_env["TRIPLE_STAMP_VOICE_PROFILE_SHA256"],
+                    "voice-digest",
+                )
+        finally:
+            codex_native_app_server.build_codex_native_server = prior_builder
+            codex_native_app_server.codex_terminal_env = prior_terminal_env
+
     def test_same_chat_reask_invokes_model_before_old_failure_relay(
         self,
     ) -> None:

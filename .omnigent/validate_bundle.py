@@ -218,6 +218,7 @@ import sys
 from pathlib import Path
 from omnigent import claude_launcher
 from omnigent import chat
+from omnigent import codex_native_app_server
 from omnigent import cursor_native_permissions as permissions
 from omnigent.inner import claude_sdk_executor
 from omnigent.policies import function as policy_function
@@ -291,6 +292,16 @@ assert getattr(
 assert getattr(
     claude_sdk_executor.ClaudeSDKExecutor.run_turn,
     "__triple_stamp_continuation_guard__",
+    False,
+)
+assert getattr(
+    codex_native_app_server.build_codex_native_server,
+    "__triple_stamp_voice_environment__",
+    False,
+)
+assert getattr(
+    codex_native_app_server.codex_terminal_env,
+    "__triple_stamp_voice_environment__",
     False,
 )
 assert chat._LOOP_TIMEOUT_S is None

@@ -32,6 +32,7 @@ _TERMINAL_RELAY_ACTIONS = frozenset(
     {
         "deterministic_best_effort_relay",
         "deterministic_stamp_relay",
+        "judge_format_repair_best_effort_relay",
         "supervisor_failure_terminalized",
         "terminal_failure_relayed",
         "continuation_exhausted",
@@ -381,6 +382,51 @@ def _attested_stamp_answer(
         if answer is not None and _has_required_stage_chain(records, cycle):
             return answer
     return None
+
+
+def _raw_stamp_fallback_answer(
+    route: object,
+    records: list[dict[str, Any]],
+) -> str:
+    """Recover a safe answer when a raw STAMP's format repair cannot launch.
+
+    This is deliberately a BEST_EFFORT candidate, not a STAMP: fields such as
+    the configured voice-profile receipt may still be invalid. The completed
+    Cursor-to-Opus chain and raw Codex verdict must nevertheless agree that the
+    answer is shippable, so bounded supervisor refusal cannot leave the UI empty.
+    """
+
+    from triple_stamp_isaac_launcher import (
+        _has_required_stage_chain,
+        _mapping_candidates,
+        _safe_customer_answer,
+    )
+
+    title = str(getattr(route, "title", "") or "")
+    match = re.fullmatch(r"judge-format-repair-([1-4])", title)
+    if match is None:
+        return ""
+    cycle = int(match.group(1))
+    if not _has_required_stage_chain(records, cycle):
+        return ""
+    for record in reversed(records):
+        if (
+            record.get("agent") != "codex_judge"
+            or record.get("status") != "completed"
+            or record.get("title") != f"judge-cycle-{cycle}"
+        ):
+            continue
+        for payload in _mapping_candidates(str(record.get("output") or "")):
+            if (
+                payload.get("verdict") != "STAMP"
+                or payload.get("needs_web") is not False
+                or payload.get("needs_internal") is not False
+            ):
+                continue
+            answer = _safe_customer_answer(payload.get("shippable_answer"))
+            if answer and "\u2014" not in answer:
+                return answer
+    return ""
 
 
 def _thousands(value: object) -> str:
@@ -1246,6 +1292,37 @@ def install_supervisor_continuation_guard() -> None:
                 ]
                 continue
 
+            fallback = _raw_stamp_fallback_answer(route, records)
+            if fallback:
+                persisted = record_best_effort_answer(
+                    fallback,
+                    records,
+                    cycle=int(getattr(route, "cycle", 0) or 0),
+                    reason=(
+                        "raw Codex STAMP contained a shippable answer, but "
+                        "judge format repair could not be dispatched within "
+                        "the deterministic continuation bound"
+                    ),
+                    parent_session_id=session_id,
+                )
+                if persisted:
+                    _record(
+                        "judge_format_repair_best_effort_relay",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "bounded format-repair dispatch failed; relayed "
+                            "the raw STAMP answer as unapproved BEST_EFFORT"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TextChunk(text=persisted)
+                    yield TurnComplete(
+                        response=persisted,
+                        modified_by_policy=True,
+                        usage=completed.usage,
+                    )
+                    return
             reason = (
                 "supervisor exhausted deterministic continuation prompts "
                 f"without dispatching {getattr(route, 'title', '') or route.status}; "

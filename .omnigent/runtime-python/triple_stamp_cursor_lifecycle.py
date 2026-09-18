@@ -56,6 +56,48 @@ _parent_inbox_failures: dict[str, str] = {}
 _unknown_opus_dispatches: dict[str, str] = {}
 
 
+def _install_codex_voice_environment() -> None:
+    """Thread the validated voice profile into codex-native app-server env."""
+
+    from omnigent import codex_native_app_server
+
+    original = codex_native_app_server.build_codex_native_server
+    if getattr(original, "__triple_stamp_voice_environment__", False):
+        return
+
+    def voice_aware_server(*args: object, **kwargs: object) -> Any:
+        server = original(*args, **kwargs)
+        for name in (
+            "TRIPLE_STAMP_VOICE_PROFILE",
+            "TRIPLE_STAMP_VOICE_PROFILE_SHA256",
+        ):
+            value = os.environ.get(name, "")
+            if value:
+                server.env[name] = value
+        return server
+
+    voice_aware_server.__triple_stamp_voice_environment__ = True
+    voice_aware_server.__triple_stamp_original__ = original
+    codex_native_app_server.build_codex_native_server = voice_aware_server
+
+    original_terminal_env = codex_native_app_server.codex_terminal_env
+
+    def voice_aware_terminal_env(server: Any) -> dict[str, str]:
+        env = original_terminal_env(server)
+        for name in (
+            "TRIPLE_STAMP_VOICE_PROFILE",
+            "TRIPLE_STAMP_VOICE_PROFILE_SHA256",
+        ):
+            value = server.env.get(name)
+            if isinstance(value, str) and value:
+                env[name] = value
+        return env
+
+    voice_aware_terminal_env.__triple_stamp_voice_environment__ = True
+    voice_aware_terminal_env.__triple_stamp_original__ = original_terminal_env
+    codex_native_app_server.codex_terminal_env = voice_aware_terminal_env
+
+
 def _observe_dispatch_bookkeeping(
     result: object,
     *,
@@ -830,6 +872,7 @@ def install_parent_inbox_guard() -> None:
         record_tool_dispatch_exception,
     )
 
+    _install_codex_voice_environment()
     _install_runner_session_inbox_initialization()
 
     original_chats_root = cursor_forwarder._cursor_chats_root
