@@ -926,7 +926,7 @@ class CursorLifecycleTests(unittest.TestCase):
                 runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)
 
-    def test_repeated_missing_work_entry_forces_terminal_packet_and_wake(
+    def test_exhausted_parent_wake_retries_until_queued_packet_wakes(
         self,
     ) -> None:
         parent = "repeated-missing-work-parent"
@@ -960,20 +960,29 @@ class CursorLifecycleTests(unittest.TestCase):
             runner_app.unregister_subagent_work(child)
             runner_app._session_inboxes_ref.pop(parent, None)
             client = _MissingWorkClient(child, missing_attempts=2)
-            wake = mock.AsyncMock(return_value=True)
+            wake = mock.AsyncMock(side_effect=[False, False, True])
+
+            async def deliver_and_wait_for_wake() -> None:
+                await _native_post_delivery.post_external_session_status(
+                    client,
+                    session_id=child,
+                    status="idle",
+                )
+                retry = lifecycle._cursor_parent_wake_tasks[parent]
+                await asyncio.wait_for(retry, timeout=1.0)
+                await asyncio.sleep(0)
+
             try:
                 with mock.patch.object(
                     runner_app,
                     "_deliver_subagent_wake_post",
                     wake,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_cursor_parent_wake_retry_sleep",
+                    mock.AsyncMock(return_value=None),
                 ):
-                    asyncio.run(
-                        _native_post_delivery.post_external_session_status(
-                            client,
-                            session_id=child,
-                            status="idle",
-                        )
-                    )
+                    asyncio.run(deliver_and_wait_for_wake())
 
                 entry = runner_app.get_subagent_work(child)
                 self.assertIsNotNone(entry)
@@ -992,8 +1001,12 @@ class CursorLifecycleTests(unittest.TestCase):
                     work_id,
                 )
                 self.assertTrue(committed["delivery_committed"])
+                self.assertFalse(committed["parent_wake_pending"])
+                self.assertEqual(committed["parent_wake_attempts"], 2)
+                self.assertIn("parent_wake_delivered_at_ns", committed)
                 self.assertEqual(client.posts, 2)
-                wake.assert_awaited_once()
+                self.assertEqual(wake.await_count, 3)
+                self.assertNotIn(parent, lifecycle._cursor_parent_wake_tasks)
             finally:
                 runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)

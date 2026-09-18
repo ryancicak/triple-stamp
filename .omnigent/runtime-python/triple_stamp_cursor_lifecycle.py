@@ -24,6 +24,8 @@ _CURSOR_STAGE_INACTIVITY_S = 5 * 60
 _CURSOR_STAGE_ABSOLUTE_S = 15 * 60
 _CURSOR_POST_CLAIM_S = 30.0
 _INBOX_TIME_CONTRACT_S = 5.0
+_CURSOR_PARENT_WAKE_RETRY_BASE_S = 1.0
+_CURSOR_PARENT_WAKE_RETRY_MAX_S = 30.0
 _NO_OUTPUT = "[System: sub-agent completed with no output]"
 _PENDING_PREFIX = "[System: sub-agent task pending —"
 _MISSING_PARENT_INBOX = "Error: sys_session_send requires parent session inbox"
@@ -55,6 +57,95 @@ PARENT_INBOX_PROBE_VALUE = "v1"
 PARENT_INBOX_READY = "TRIPLE_STAMP_PARENT_INBOX_READY:v1"
 _parent_inbox_failures: dict[str, str] = {}
 _unknown_opus_dispatches: dict[str, str] = {}
+_cursor_parent_wake_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+async def _cursor_parent_wake_retry_sleep(seconds: float) -> None:
+    """Pace stranded parent-wake retries without a hot loop."""
+
+    await asyncio.sleep(seconds)
+
+
+async def _retry_cursor_parent_wake(
+    *,
+    client: Any,
+    parent_session_id: str,
+    child_session_id: str,
+    work_id: str,
+    notice: str,
+    created_by: str | None,
+) -> None:
+    """Retry one already-queued Cursor completion until its parent wakes."""
+
+    from omnigent.runner import app as runner_app
+    from triple_stamp_runtime_state import mutate_cursor_lifecycle
+
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            delivered = await runner_app._deliver_subagent_wake_post(
+                client,
+                parent_session_id,
+                notice,
+                created_by=created_by,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - stranded wake remains retryable
+            delivered = False
+
+        def observe(
+            generation: dict[str, Any],
+            _state: dict[str, Any],
+        ) -> None:
+            generation["parent_wake_attempts"] = attempts
+            generation["parent_wake_pending"] = not delivered
+            if delivered:
+                generation["parent_wake_delivered_at_ns"] = time.time_ns()
+
+        mutate_cursor_lifecycle(child_session_id, work_id, observe)
+        if delivered:
+            return
+        delay = min(
+            _CURSOR_PARENT_WAKE_RETRY_BASE_S * (2 ** min(attempts - 1, 8)),
+            _CURSOR_PARENT_WAKE_RETRY_MAX_S,
+        )
+        await _cursor_parent_wake_retry_sleep(delay)
+
+
+def _schedule_cursor_parent_wake_retry(
+    *,
+    client: Any,
+    parent_session_id: str,
+    child_session_id: str,
+    work_id: str,
+    notice: str,
+    created_by: str | None,
+) -> None:
+    """Keep exactly one paced stranded-wake task per parent."""
+
+    existing = _cursor_parent_wake_tasks.get(parent_session_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _retry_cursor_parent_wake(
+            client=client,
+            parent_session_id=parent_session_id,
+            child_session_id=child_session_id,
+            work_id=work_id,
+            notice=notice,
+            created_by=created_by,
+        ),
+        name=f"triple-stamp-cursor-wake-{parent_session_id}",
+    )
+    _cursor_parent_wake_tasks[parent_session_id] = task
+
+    def clear(completed: asyncio.Task[None]) -> None:
+        if _cursor_parent_wake_tasks.get(parent_session_id) is completed:
+            _cursor_parent_wake_tasks.pop(parent_session_id, None)
+
+    task.add_done_callback(clear)
 
 
 def _cursor_retry_note(title: str) -> str:
@@ -317,6 +408,9 @@ def _install_runner_session_inbox_initialization() -> None:
                 runner_app._session_inboxes_ref.pop(session_id, None)
                 _parent_inbox_failures.pop(session_id, None)
                 _unknown_opus_dispatches.pop(session_id, None)
+                wake_task = _cursor_parent_wake_tasks.pop(session_id, None)
+                if wake_task is not None:
+                    wake_task.cancel()
             return response
 
         # ``add_middleware`` prepends. Move this layer behind the runner's
@@ -1174,12 +1268,33 @@ def install_parent_inbox_guard() -> None:
                             status=entry.status,
                             pending=parent_inbox.qsize(),
                         )
-                        await runner_app._deliver_subagent_wake_post(
+                        wake_delivered = await runner_app._deliver_subagent_wake_post(
                             client,
                             parent_session_id,
                             notice,
                             created_by=entry.created_by,
                         )
+                        if not wake_delivered:
+                            def mark_wake_pending(
+                                current: dict[str, Any],
+                                _state: dict[str, Any],
+                            ) -> None:
+                                current["parent_wake_pending"] = True
+                                current["parent_wake_attempts"] = 0
+
+                            mutate_cursor_lifecycle(
+                                session_id,
+                                work_id,
+                                mark_wake_pending,
+                            )
+                            _schedule_cursor_parent_wake_retry(
+                                client=client,
+                                parent_session_id=parent_session_id,
+                                child_session_id=session_id,
+                                work_id=work_id,
+                                notice=notice,
+                                created_by=entry.created_by,
+                            )
                     return
             reason = (
                 "Cursor terminal delivery recovery exhausted after one "
