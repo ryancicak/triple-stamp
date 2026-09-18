@@ -71,6 +71,16 @@ Ask your question in either one. Type `/quit` to stop the run and clean up.
 <br>
 
 <p align="center">
+  <img src="docs/brand/vs-polly-debby.png" width="720" alt="Debby and Polly answer in a single pass, while Triple-stamp runs the same question through three separate models before it reaches you">
+</p>
+
+<p align="center">
+  Debby and Polly get you an answer fast. Triple-stamp is for the questions you cannot afford to get wrong.
+</p>
+
+<br>
+
+<p align="center">
   <img src="docs/brand/stamp-seal.svg" width="112" alt="Triple-stamp seal">
 </p>
 
