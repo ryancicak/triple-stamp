@@ -1153,9 +1153,20 @@ def _verdict_route(
     return _Route("success", cycle)
 
 
-def _next_route(records: list[dict[str, Any]]) -> _Route:
+def _next_route(
+    records: list[dict[str, Any]],
+    parent_session_id: str = "",
+) -> _Route:
     """Reduce the ledger to one deterministic next transition."""
 
+    if parent_session_id and any(
+        record.get("parent_session_id") for record in records
+    ):
+        records = [
+            record
+            for record in records
+            if record.get("parent_session_id") == parent_session_id
+        ]
     if not records:
         return _Route("dispatch", 1, "cursor_workhorse", "cursor-cycle-1")
     last = records[-1]
@@ -1596,6 +1607,16 @@ def supervisor_contract(
 
     def evaluate(event: dict[str, Any]) -> dict[str, Any]:
         event_type = event.get("type")
+        event_context = event.get("context")
+        parent_session_id = (
+            str(
+                event_context.get("root_conversation_id")
+                or event_context.get("conversation_id")
+                or ""
+            )
+            if isinstance(event_context, dict)
+            else ""
+        )
         if event_type == "tool_call":
             data = event.get("data")
             raw_name = data.get("name") if isinstance(data, dict) else ""
@@ -1625,7 +1646,10 @@ def supervisor_contract(
         ):
             _mark_terminal("STAMP", stamped)
             return {"result": "ALLOW"}
-        route = _next_route(read_collections())
+        route = _next_route(
+            read_collections(),
+            parent_session_id=parent_session_id,
+        )
         if (
             response == ""
             and _route_dispatch_pending(route)

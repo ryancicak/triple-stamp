@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import dis
+import json
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import AsyncIterator
+from types import CodeType
 from typing import Any
 
 _CONTINUATION_LIMIT = 1
 _HEADLESS_PIPELINE_TIMEOUT_S: float | None = None
 _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT = 30
-_HEADLESS_PIPELINE_EXTRA_TURN_LIMIT = sys.maxsize
+# More than the pipeline can ever consume (two or four complete cycles plus
+# bounded hunts/repairs), while still encodable by Python 3.14's
+# ``LOAD_SMALL_INT`` instruction.
+_HEADLESS_PIPELINE_EXTRA_TURN_LIMIT = 255
 _CONTINUATION_PREFIX = "TRIPLE_STAMP_NONTERMINAL_CONTINUATION"
 _LOGGER = logging.getLogger(__name__)
 # Every ledger action after which the guard has already streamed the recorded
@@ -156,6 +163,19 @@ def _continuation_prompt(route: object) -> str:
 
 
 def _session_id(messages: list[dict[str, Any]]) -> str:
+    # Omnigent's executor adapter installs the authoritative parent session in
+    # telemetry context before entering ``run_turn``. System-generated child
+    # completion wakes do not always repeat ``session_id`` in their message,
+    # so consulting only the messages collapses those wakes to ``default`` and
+    # makes a healthy session look like it has no collected stages.
+    try:
+        from omnigent.runtime.telemetry import current_session_id
+
+        active_session_id = current_session_id()
+    except (ImportError, RuntimeError):
+        active_session_id = None
+    if active_session_id:
+        return str(active_session_id)
     for message in reversed(messages):
         value = message.get("session_id")
         if value:
@@ -164,6 +184,90 @@ def _session_id(messages: list[dict[str, Any]]) -> str:
         if isinstance(metadata, dict) and metadata.get("session_id"):
             return str(metadata["session_id"])
     return "default"
+
+
+def _tool_child_session_ids(result: object) -> set[str]:
+    """Extract routed child ids from an internal ``sys_session_send`` result."""
+
+    if isinstance(result, str):
+        try:
+            return _tool_child_session_ids(json.loads(result))
+        except (json.JSONDecodeError, TypeError):
+            return set(
+                re.findall(r"\btask ([0-9a-f]{32})\b", result)
+            )
+    if isinstance(result, dict):
+        found = {
+            str(result[name])
+            for name in ("task_id", "handle_id", "conversation_id")
+            if result.get(name)
+        }
+        for value in result.values():
+            found.update(_tool_child_session_ids(value))
+        return found
+    if isinstance(result, (list, tuple)):
+        found: set[str] = set()
+        for value in result:
+            found.update(_tool_child_session_ids(value))
+        return found
+    return set()
+
+
+def _tool_parent_session_ids(result: object) -> set[str]:
+    """Extract parent ids from packets returned by ``sys_read_inbox``."""
+
+    if isinstance(result, str):
+        try:
+            return _tool_parent_session_ids(json.loads(result))
+        except (json.JSONDecodeError, TypeError):
+            return set()
+    if isinstance(result, dict):
+        found = (
+            {str(result["parent_session_id"])}
+            if result.get("parent_session_id")
+            else set()
+        )
+        for value in result.values():
+            found.update(_tool_parent_session_ids(value))
+        return found
+    if isinstance(result, (list, tuple)):
+        found: set[str] = set()
+        for value in result:
+            found.update(_tool_parent_session_ids(value))
+        return found
+    return set()
+
+
+def _dispatch_parent_session_id(
+    dispatches: list[dict[str, Any]],
+    child_session_ids: set[str],
+) -> str:
+    """Resolve the parent from the exact child returned by this turn's tool."""
+
+    parents = {
+        str(record["parent_session_id"])
+        for record in dispatches
+        if str(record.get("child_session_id") or "") in child_session_ids
+        and record.get("parent_session_id")
+    }
+    return next(iter(parents)) if len(parents) == 1 else ""
+
+
+def _records_for_session(
+    records: list[dict[str, Any]],
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Scope durable packets after a concrete browser/terminal parent is known."""
+
+    if not session_id or session_id == "default":
+        return records
+    if not any(record.get("parent_session_id") for record in records):
+        return records
+    return [
+        record
+        for record in records
+        if record.get("parent_session_id") == session_id
+    ]
 
 
 def _attested_stamp_answer(
@@ -320,6 +424,50 @@ def _record(action: str, route: object, *, attempt: int, reason: str) -> None:
     )
 
 
+def _replace_code_int_constant(
+    code: CodeType,
+    old: int,
+    new: int,
+) -> tuple[CodeType, int]:
+    """Replace one integer constant anywhere in a function's code tree."""
+
+    constants = list(code.co_consts)
+    bytecode = bytearray(code.co_code)
+    matches = 0
+    changed = False
+    for index, value in enumerate(constants):
+        if type(value) is int and value == old:
+            constants[index] = new
+            matches += 1
+            changed = True
+        elif isinstance(value, CodeType):
+            replacement, nested_matches = _replace_code_int_constant(
+                value,
+                old,
+                new,
+            )
+            matches += nested_matches
+            if replacement is not value:
+                constants[index] = replacement
+                changed = True
+    for instruction in dis.get_instructions(code, show_caches=True):
+        if instruction.opname != "LOAD_SMALL_INT" or instruction.argval != old:
+            continue
+        if not 0 <= new <= 255:
+            raise RuntimeError(
+                "replacement for Python LOAD_SMALL_INT is not byte-encodable"
+            )
+        bytecode[instruction.offset + 1] = new
+        matches += 1
+        changed = True
+    if not changed:
+        return code, matches
+    return code.replace(
+        co_code=bytes(bytecode),
+        co_consts=tuple(constants),
+    ), matches
+
+
 def install_headless_pipeline_wait() -> None:
     """Remove Omnigent's unrelated one-shot timeout and 30-turn deadline."""
 
@@ -331,21 +479,18 @@ def install_headless_pipeline_wait() -> None:
     query_once = chat._query_sessions_once
     if getattr(query_once, "__triple_stamp_headless_wait__", False):
         return
-    code = query_once.__code__
-    matches = [
-        index
-        for index, value in enumerate(code.co_consts)
-        if type(value) is int and value == _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT
-    ]
-    if len(matches) != 1:
+    replacement, matches = _replace_code_int_constant(
+        query_once.__code__,
+        _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT,
+        _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT,
+    )
+    if matches != 1:
         raise RuntimeError(
             "Omnigent 0.12 headless extra-turn guard drifted; expected one "
             f"{_OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT}-turn constant, found "
-            f"{len(matches)}"
+            f"{matches}"
         )
-    constants = list(code.co_consts)
-    constants[matches[0]] = _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT
-    query_once.__code__ = code.replace(co_consts=tuple(constants))
+    query_once.__code__ = replacement
     query_once.__triple_stamp_headless_wait__ = True
 
 
@@ -357,6 +502,7 @@ def install_supervisor_continuation_guard() -> None:
     from omnigent.inner import claude_sdk_executor
     from omnigent.inner.executor import (
         TextChunk,
+        ToolCallComplete,
         ToolCallRequest,
         TurnComplete,
     )
@@ -428,7 +574,10 @@ def install_supervisor_continuation_guard() -> None:
                     row.get("action") in _TERMINAL_RELAY_ACTIONS
                     for row in read_supervisor_continuations()
                 )
-                route = _next_route(read_collections())
+                route = _next_route(
+                    read_collections(),
+                    parent_session_id=session_id,
+                )
                 if relayed:
                     # A child that was already in flight when the run died still
                     # wakes this loop once. The reader has the reason; repeating
@@ -457,6 +606,8 @@ def install_supervisor_continuation_guard() -> None:
             completed: TurnComplete | None = None
             send_attempted = False
             sent_titles: list[str] = []
+            sent_child_session_ids: set[str] = set()
+            observed_parent_session_ids: set[str] = set()
             turn_started_at_ns = time.time_ns()
             async for event in original(
                 self,
@@ -491,6 +642,21 @@ def install_supervisor_continuation_guard() -> None:
                                 yield TextChunk(text=note)
                     yield event
                     continue
+                if isinstance(event, ToolCallComplete):
+                    normalized = event.name.rsplit("__", 1)[-1]
+                    if normalized == "sys_session_send":
+                        sent_child_session_ids.update(
+                            _tool_child_session_ids(event.result)
+                        )
+                    elif normalized == "sys_read_inbox":
+                        sent_child_session_ids.update(
+                            _tool_child_session_ids(event.result)
+                        )
+                        observed_parent_session_ids.update(
+                            _tool_parent_session_ids(event.result)
+                        )
+                    yield event
+                    continue
                 if isinstance(event, TurnComplete):
                     completed = event
                     continue
@@ -501,6 +667,15 @@ def install_supervisor_continuation_guard() -> None:
 
             records = read_collections()
             dispatches = read_dispatches()
+            resolved_parent = _dispatch_parent_session_id(
+                dispatches,
+                sent_child_session_ids,
+            )
+            if resolved_parent:
+                session_id = resolved_parent
+            elif len(observed_parent_session_ids) == 1:
+                session_id = next(iter(observed_parent_session_ids))
+            records = _records_for_session(records, session_id)
             route = _next_route(records)
             response = completed.response
             if not isinstance(response, str):
