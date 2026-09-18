@@ -546,6 +546,63 @@ class BrowserHostRuntimeTests(unittest.TestCase):
         self.assertTrue(browser_mode)
         self.assertTrue(translated)
 
+    def test_non_tty_browser_client_waits_without_starting_repl(self) -> None:
+        with (
+            mock.patch.object(
+                browser,
+                "announce_after_browser_preflight",
+                return_value="http://127.0.0.1:6767/c/session-1",
+            ) as announce,
+            mock.patch.object(browser, "_wait_for_browser_shutdown") as wait,
+            mock.patch(
+                "omnigent.conversation_browser.open_conversation_link_if_enabled"
+            ) as opener,
+        ):
+            browser._run_non_tty_browser_client(
+                "http://127.0.0.1:6767",
+                "triple-stamp",
+                None,
+                resume_conversation_id="session-1",
+                auto_open_conversation=True,
+            )
+
+        self.assertEqual(announce.call_args.kwargs["conversation_id"], "session-1")
+        self.assertEqual(
+            announce.call_args.kwargs["base_url"],
+            "http://127.0.0.1:6767",
+        )
+        opener.assert_called_once_with(
+            base_url="http://127.0.0.1:6767",
+            conversation_id="session-1",
+            enabled=True,
+            warn=mock.ANY,
+        )
+        wait.assert_called_once_with()
+
+    def test_non_tty_browser_client_installs_only_without_tty(self) -> None:
+        from omnigent import chat
+
+        installed = chat._run_repl
+
+        def original(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        try:
+            chat._run_repl = original
+            with mock.patch.object(browser.sys.stdin, "isatty", return_value=True):
+                browser._install_non_tty_browser_client()
+            self.assertIs(chat._run_repl, original)
+
+            with mock.patch.object(browser.sys.stdin, "isatty", return_value=False):
+                browser._install_non_tty_browser_client()
+            self.assertIs(chat._run_repl, browser._run_non_tty_browser_client)
+            self.assertIs(
+                browser._run_non_tty_browser_client.__triple_stamp_original__,
+                original,
+            )
+        finally:
+            chat._run_repl = installed
+
     def test_public_help_advertises_only_interactive_surfaces(self) -> None:
         with (
             mock.patch("builtins.print") as output,
