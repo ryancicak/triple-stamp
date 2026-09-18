@@ -19,6 +19,7 @@ _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-cycle-([1-4])", "cursor_grunt", ""),
     (r"audit-cycle-([1-4])", "audit", "opus"),
     (r"audit-cycle-([1-4])-web-([1-2])", "audit_web", "opus"),
+    (r"audit-retry-([1-4])-([1-2])", "audit_retry", "opus"),
     (r"audit-internal-([1-4])-([1-2])", "audit_internal", "codex"),
     (r"judge-cycle-([1-4])", "judge", "codex"),
     (r"judge-convergence-([1-4])", "judge_convergence", "codex"),
@@ -33,7 +34,7 @@ _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-web-codex-([1-4])-([1-2])", "cursor_web", "codex"),
 )
 _HOP_STAGE_IDS = frozenset(
-    {"audit_web", "audit_internal", "audit_repair_web", "cursor_web"}
+    {"audit_web", "audit_retry", "audit_internal", "audit_repair_web", "cursor_web"}
 )
 _TOOL_DISPATCH_EXCEPTIONS = (
     AttributeError,
@@ -434,12 +435,13 @@ _INTERNAL_SYSTEMS = ("glean", "jira", "slack", "confluence", "safe")
 _OPUS_STAGE_TITLE = re.compile(
     r"(?:"
     r"audit-cycle-[1-4](?:-web-[1-2])?"
+    r"|audit-retry-[1-4]-[1-2]"
     r"|audit-internal-[1-4]-[1-2]"
     r"|audit-format-repair-[1-4](?:-web-[1-2])?"
     r")"
 )
 _AUDIT_CYCLE_HOP = re.compile(
-    r"^audit-(?:cycle|internal)-(?P<cycle>[1-4])(?:-web-(?P<hop>[1-2]))?"
+    r"^audit-(?:cycle|internal|retry)-(?P<cycle>[1-4])(?:-web-(?P<hop>[1-2]))?"
 )
 
 
@@ -785,7 +787,7 @@ async def observe_opus_internal_mcp_calls(
     """Observe persisted Opus tool uses through the authenticated server API."""
 
     cycle_match = re.search(
-        r"(?:cycle-|repair-|internal-)([1-4])(?:-|$)", title
+        r"(?:cycle-|repair-|internal-|retry-)([1-4])(?:-|$)", title
     )
     cycle = int(cycle_match.group(1)) if cycle_match else 0
     base = {

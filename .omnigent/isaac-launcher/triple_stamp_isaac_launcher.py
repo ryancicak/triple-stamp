@@ -125,6 +125,72 @@ _NO_OUTPUT = re.compile(
 _INFRA_PREFIX = "PIPELINE_INFRASTRUCTURE_ERROR:"
 _VALIDATION_PREFIX = "PIPELINE_VALIDATION_FAILED:"
 
+# Every Opus audit-stage kind. A transient platform stream death on any of
+# these can be recovered by a fresh child under a unique title, exactly the way
+# NEEDS_WEB and NEEDS_INTERNAL already relaunch fresh Opus children.
+_OPUS_AUDIT_KINDS = frozenset(
+    {
+        "audit",
+        "audit_web",
+        "audit_retry",
+        "audit_internal",
+        "audit_repair",
+        "audit_repair_web",
+    }
+)
+# Lower-cased substrings that mark a transient, platform-side Opus stream death:
+# the native Claude process began (or completed) a turn whose response the model
+# provider cut off mid-stream. These are distinct from a genuine worker failure
+# (a native timeout, a pin/harness break, or empty output), which stays
+# terminal. Detection is marker-based so a plain "native timeout" is never
+# misclassified as recoverable.
+_TRANSIENT_OPUS_STREAM_MARKERS = (
+    "server error mid-response",
+    "the response above may be incomplete",
+    "response may be incomplete",
+    "api error: server error",
+    "api error: overloaded",
+    "overloaded_error",
+    "internal server error",
+    "error streaming response",
+    "stream disconnected",
+    "connection reset by peer",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 529",
+)
+# One fresh retry per cycle. A transient death dispatches audit-retry-N-1; a
+# second transient death (on that retry) is terminal infrastructure failure.
+# The bound is deliberately conservative: every retry is a paid Opus launch, and
+# a single fresh child recovers the overwhelmingly common one-off provider blip
+# without risking repeated spend on a persistently failing provider. The title
+# grammar still admits hop 2 so the cap can be raised by this one constant with
+# no title or parser change.
+_OPUS_TRANSIENT_RETRY_CAP = 1
+
+
+def _has_incomplete_stream_marker(text: object) -> bool:
+    """Return whether text bears a transient mid-stream truncation marker."""
+
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _TRANSIENT_OPUS_STREAM_MARKERS)
+
+
+def _is_transient_opus_stream_error(record: dict[str, Any]) -> bool:
+    """Classify one Opus record as a recoverable, transient stream death.
+
+    True only when the record carries a concrete transient platform marker in
+    its output. A failed record without such a marker (for example a native
+    timeout, a model/harness pin break, or empty output) is a genuine worker
+    failure and stays terminal.
+    """
+
+    return _has_incomplete_stream_marker(record.get("output"))
+
 
 def _voice_profile_path() -> str:
     """The configured voice profile, or "" when voice rendering is off."""
@@ -627,6 +693,11 @@ def _audit_payload_and_validation(
     lowered = text.lower()
     if "tool use: bash" in lowered or "cursor-agent --version" in lowered:
         return None, None
+    # An Opus turn the provider truncated mid-stream can leave a syntactically
+    # parseable verdict object behind. Incomplete output must never be treated
+    # as audit evidence; the router recovers it with a fresh retry child.
+    if _has_incomplete_stream_marker(lowered):
+        return None, None
     payloads = [
         candidate
         for candidate in _mapping_candidates(text)
@@ -1040,6 +1111,71 @@ def _internal_reaudit_route(
     )
 
 
+def _opus_transient_retries_used(
+    records: list[dict[str, Any]],
+    cycle: int,
+) -> int:
+    """Count fresh transient-retry Opus children already spent this cycle."""
+
+    return sum(
+        1
+        for record in records
+        if (
+            (parsed := _stage(record.get("title"))) is not None
+            and parsed.kind == "audit_retry"
+            and parsed.cycle == cycle
+        )
+    )
+
+
+def _opus_transient_retry_available(
+    records: list[dict[str, Any]],
+    cycle: int,
+) -> bool:
+    """Return whether another transient Opus retry is still within budget."""
+
+    return _opus_transient_retries_used(records, cycle) < _OPUS_TRANSIENT_RETRY_CAP
+
+
+def _opus_transient_retry_route(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    reason: str = "",
+) -> _Route:
+    """Recover a transient Opus stream death with a fresh, unique-title child.
+
+    This is not a model-quality cycle: it never advances the cycle counter, is
+    scoped to one parent's ledger, and the truncated packet that triggered it is
+    never read as audit evidence. Bounded to two retries per cycle; a third
+    transient death is terminal infrastructure failure.
+    """
+
+    used = _opus_transient_retries_used(records, cycle)
+    if used >= _OPUS_TRANSIENT_RETRY_CAP:
+        return _Route(
+            "infrastructure_failed",
+            cycle,
+            reason=(
+                f"Opus transient stream-error retries exhausted in cycle {cycle}"
+                + (f": {reason}" if reason else "")
+            ),
+        )
+    hop = used + 1
+    return _Route(
+        "dispatch",
+        cycle,
+        "opus_auditor",
+        f"audit-retry-{cycle}-{hop}",
+        requester="opus",
+        hop=hop,
+        reason=(
+            "transient Opus stream death recovered with a fresh child"
+            + (f": {reason}" if reason else "")
+        ),
+    )
+
+
 def _prior_equivalent_rework(
     records: list[dict[str, Any]],
     cycle: int,
@@ -1200,6 +1336,18 @@ def _next_route(
             parsed.cycle,
             reason=f"cycle {parsed.cycle} exceeds configured maximum {_MAX_CYCLES}",
         )
+    # A transient, platform-side Opus stream death (server error mid-response,
+    # truncated stream) on any audit stage is recoverable with a fresh child
+    # under a unique title. Intercept it before the generic failure guard and
+    # before any audit parsing, so an incomplete packet is never read as
+    # evidence and a genuine failure (native timeout, empty output, pin break)
+    # still falls through to terminal infrastructure failure below.
+    if parsed.kind in _OPUS_AUDIT_KINDS and _is_transient_opus_stream_error(last):
+        return _opus_transient_retry_route(
+            records,
+            parsed.cycle,
+            reason="Opus native audit stream ended mid-response",
+        )
     if last.get("status") != "completed" or not str(last.get("output", "")).strip():
         return _Route(
             "infrastructure_failed",
@@ -1237,13 +1385,7 @@ def _next_route(
                 parent_session_id=parent_session_id,
             ),
         )
-    if parsed.kind in {
-        "audit",
-        "audit_web",
-        "audit_internal",
-        "audit_repair",
-        "audit_repair_web",
-    }:
+    if parsed.kind in _OPUS_AUDIT_KINDS:
         audit_observation = (
             last.get("internal_mcp_observation")
             if isinstance(last.get("internal_mcp_observation"), dict)
@@ -1479,7 +1621,8 @@ def _has_required_stage_chain(records: list[dict[str, Any]], cycle: int) -> bool
         } or (
             cursor_seen
             and re.fullmatch(
-                rf"audit-(?:cycle|format-repair)-{cycle}-web-[1-2]",
+                rf"audit-(?:cycle|format-repair)-{cycle}-web-[1-2]"
+                rf"|audit-retry-{cycle}-[1-2]",
                 title,
             )
             is not None
@@ -1750,6 +1893,18 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
     for record in records:
         output = str(record.get("output") or "")
         if record.get("status") in {"failed", "cancelled"} or not output.strip():
+            # A transient Opus stream death is only terminal once its bounded
+            # retry budget for the cycle is spent. While a fresh retry child is
+            # still available, this is recoverable, not a terminal failure, and
+            # the user must not see PIPELINE_INFRASTRUCTURE_ERROR.
+            parsed = _stage(record.get("title"))
+            if (
+                parsed is not None
+                and parsed.kind in _OPUS_AUDIT_KINDS
+                and _is_transient_opus_stream_error(record)
+                and _opus_transient_retry_available(records, parsed.cycle)
+            ):
+                continue
             return True
         lowered = output.lower()
         if any(marker in lowered for marker in pin_markers):

@@ -231,6 +231,57 @@ class OpusLaunchTests(unittest.TestCase):
             selected,
         )
 
+    def test_concurrent_claude_json_replacement_is_deterministic_or_fails_closed(
+        self,
+    ) -> None:
+        """`.claude.json` is read before the run-config lock.
+
+        `prepare_opus_mcp_config` loads `~/.claude.json` outside the exclusive
+        run-config lock, so a replacement between two calls (for example the
+        original Opus audit and its fresh transient retry) can be observed with
+        divergent content. The immutable run-scoped `opus-mcp.json` must stay
+        first-writer-wins: an identical later read is idempotent, and a divergent
+        later read fails closed rather than silently substituting a different
+        catalog.
+        """
+
+        config_path = self.home / ".claude.json"
+        env = {
+            "HOME": str(self.home),
+            "TRIPLE_STAMP_RUN_DIR": str(self.run_dir),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            first = mcp.prepare_opus_mcp_config()
+            self.assertEqual(first.name, "opus-mcp.json")
+            self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o400)
+            authoritative = json.loads(first.read_text(encoding="utf-8"))
+            self.assertEqual(set(authoritative["mcpServers"]), set(mcp.OPUS_MCP_NAMES))
+
+            # Idempotent: an unchanged `.claude.json` re-read (the retry reusing
+            # the same catalog) returns the same immutable config, no error.
+            second = mcp.prepare_opus_mcp_config()
+            self.assertEqual(second, first)
+            self.assertEqual(
+                json.loads(second.read_text(encoding="utf-8")),
+                authoritative,
+            )
+
+            # Divergent: `.claude.json` is replaced (a server dropped) before the
+            # next call. The read-before-lock sees new content, but the run
+            # config is immutable, so this fails closed.
+            replaced = json.loads(config_path.read_text(encoding="utf-8"))
+            del replaced["mcpServers"]["safe"]
+            config_path.write_text(json.dumps(replaced), encoding="utf-8")
+            with self.assertRaises(mcp.OpusConfigurationError):
+                mcp.prepare_opus_mcp_config()
+
+            # The originally materialized catalog is untouched by the failure.
+            self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o400)
+            self.assertEqual(
+                json.loads(first.read_text(encoding="utf-8")),
+                authoritative,
+            )
+
     def test_absent_internal_family_becomes_audit_gap_not_launch_failure(
         self,
     ) -> None:

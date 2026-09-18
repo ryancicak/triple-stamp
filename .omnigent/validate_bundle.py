@@ -510,6 +510,7 @@ def validate_spec(
             "cursor-web-codex-N-H",
             "audit-cycle-N",
             "audit-cycle-N-web-H",
+            "audit-retry-N-H",
             "FRESH `opus_auditor` child",
             "judge-cycle-N",
             "judge-format-repair-N",
@@ -695,6 +696,7 @@ def validate_launchers(
         "def parse_dispatch_title(",
         "def record_tool_dispatch_exception(",
         'r"audit-internal-([1-4])-([1-2])"',
+        'r"audit-retry-([1-4])-([1-2])"',
     ):
         if marker not in runtime_state_source:
             fail(f"runtime attestation marker missing: {marker}")
@@ -1007,6 +1009,33 @@ def validate_launchers(
         fresh_reaudit.resume_child_session_id,
     ) != ("opus_auditor", "audit-cycle-1-web-1", ""):
         fail("Opus web re-audit did not resolve to a fresh native child")
+
+    transient_retry = _next_route(
+        [
+            {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "completed",
+                "output": "cursor packet",
+            },
+            {
+                "agent": "opus_auditor",
+                "title": "audit-cycle-1",
+                "status": "failed",
+                "output": (
+                    "API Error: Server error mid-response. The response above "
+                    "may be incomplete."
+                ),
+                "child_session_id": "dead-opus-child",
+            },
+        ]
+    )
+    if (transient_retry.status, transient_retry.agent, transient_retry.title) != (
+        "dispatch",
+        "opus_auditor",
+        "audit-retry-1-1",
+    ):
+        fail("transient Opus stream death did not resolve to a fresh retry child")
 
     runner_env = _build_runner_env(
         os.environ,

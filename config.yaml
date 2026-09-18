@@ -92,6 +92,12 @@ prompt: |
      If exact-child mechanical validation rejects an Opus `tools_called` name,
      launch the same fresh `audit-internal-N-H` path before Codex. Never ask
      Cursor to repair internal receipts or internal-system evidence.
+     If the collected Opus packet is a transient mid-stream death, launch a fresh
+     Opus child and native process titled `audit-retry-N-H`, skipping Cursor.
+     Its self-contained handoff is the same audit request: original request and
+     current-cycle Cursor evidence. Never continue or resume the dead terminal;
+     the child returns a complete fresh audit object. The truncated packet is not
+     evidence and carries no verdict.
   3. After Opus completes with PASS, PASS_WITH_GAPS, or FAIL, dispatch
      `codex_judge` with title `judge-cycle-N`, including the original request,
      current-cycle Cursor evidence, and the final audit. The runtime retains
@@ -238,9 +244,19 @@ prompt: |
   ROUTING FAILURES
   Make one `sys_session_send` attempt for a transition. If Omnigent returns a
   genuine native launch or infrastructure error, do not retry alternate payload
-  wording. One failed fresh Opus launch is terminal; never retry it under the
-  same or another title. Return one `PIPELINE_INFRASTRUCTURE_ERROR` with that
-  failure.
+  wording. A genuine failed fresh Opus launch is terminal; never retry that same
+  failed launch under the same or another title with reworded payload. Return one
+  `PIPELINE_INFRASTRUCTURE_ERROR` with that failure.
+  A transient Opus stream death is not a genuine launch failure. When a collected
+  Opus audit packet reports a mid-stream provider error (for example "server
+  error mid-response" or "the response above may be incomplete"), its output is
+  truncated and must never be read as an audit verdict. The runtime recovers it
+  deterministically: the `[System-required next dispatch: ...]` line, or the
+  continuation prompt, names a fresh `audit-retry-N-H` child. Dispatch exactly
+  that title. This is a new native Claude process and session, never a resume of
+  the dead terminal, and it does not advance the cycle counter. At most two such
+  retries per cycle are allowed; a third mid-stream death is terminal
+  `PIPELINE_INFRASTRUCTURE_ERROR`.
 
   CURSOR DELIVERY
   Treat only a completed Cursor packet as stage output. The generated runtime

@@ -5529,6 +5529,180 @@ print("exact temp boundary: PASS")
         self.assertEqual(terminal.status, "infrastructure_failed")
         self.assertEqual(terminal.agent, "")
 
+    def _dead_opus(self, title: str, *, child: str = "") -> dict[str, str]:
+        """A transient mid-stream Opus death packet for the given title."""
+
+        return dict(
+            _route_packet("opus_auditor", title, "", child=child or f"opus-{title}"),
+            status="failed",
+            output=(
+                "API Error: Server error mid-response. The response above may "
+                "be incomplete."
+            ),
+        )
+
+    def test_transient_opus_stream_death_recovers_with_fresh_retry(self) -> None:
+        """A transient mid-stream Opus death routes to a fresh unique-title child."""
+
+        lead = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet(
+                "opus_auditor", "audit-cycle-1", _audit("PASS"), child="opus-1"
+            ),
+            _route_packet(
+                "codex_judge",
+                "judge-cycle-1",
+                _judgment("REWORK"),
+                child="judge-1",
+            ),
+            _route_packet("cursor_workhorse", "cursor-cycle-2", "CURSOR-2"),
+        ]
+        route = plugin._next_route([*lead, self._dead_opus("audit-cycle-2")])
+        self.assertEqual(
+            (route.status, route.agent, route.title, route.requester),
+            ("dispatch", "opus_auditor", "audit-retry-2-1", "opus"),
+        )
+        # Recovery is not a model-quality cycle and never resumes the dead
+        # terminal: the cycle counter is unchanged and there is no resume id.
+        self.assertEqual(route.cycle, 2)
+        self.assertEqual(route.resume_child_session_id, "")
+
+        # A genuine, non-transient worker failure (native timeout) is still
+        # terminal — the retry path must not swallow real failures.
+        genuine = dict(
+            _route_packet("opus_auditor", "audit-cycle-2", "", child="opus-2"),
+            status="failed",
+            output="native timeout",
+        )
+        terminal = plugin._next_route([*lead, genuine])
+        self.assertEqual(terminal.status, "infrastructure_failed")
+        self.assertEqual(terminal.agent, "")
+
+    def test_transient_opus_retry_is_bounded_then_terminal(self) -> None:
+        """One fresh retry per cycle; a second stream death is terminal."""
+
+        self.assertEqual(plugin._OPUS_TRANSIENT_RETRY_CAP, 1)
+        base = [_route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1")]
+        first = plugin._next_route([*base, self._dead_opus("audit-cycle-1")])
+        self.assertEqual((first.status, first.title), ("dispatch", "audit-retry-1-1"))
+        # The single retry also died mid-stream -> terminal, not another retry.
+        second = plugin._next_route(
+            [
+                *base,
+                self._dead_opus("audit-cycle-1"),
+                self._dead_opus("audit-retry-1-1"),
+            ]
+        )
+        self.assertEqual(second.status, "infrastructure_failed")
+        self.assertEqual(second.agent, "")
+        self.assertIn("retries exhausted", second.reason)
+
+    def test_unknown_opus_completion_never_retries_to_avoid_duplicate_launch(
+        self,
+    ) -> None:
+        """A timed-out/unknown completion stays terminal; a fresh paid retry is unsafe."""
+
+        base = [_route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1")]
+        unknown = dict(
+            _route_packet("opus_auditor", "audit-cycle-1", "", child="opus-1"),
+            status="failed",
+            output=(
+                "PIPELINE_INFRASTRUCTURE_ERROR: Opus native dispatch timed out "
+                "after child creation; completion is unknown and duplicate paid "
+                "launch is forbidden: ReadTimeout; child=opus-1; "
+                "task=running,busy=True. Retry is latched until `/quit` reaps "
+                "the run."
+            ),
+        )
+        route = plugin._next_route([*base, unknown])
+        self.assertEqual(route.status, "infrastructure_failed")
+        self.assertEqual(route.agent, "")
+        self.assertFalse(plugin._is_transient_opus_stream_error(unknown))
+
+    def test_incomplete_opus_output_is_never_audit_evidence(self) -> None:
+        """A truncated audit with a valid-looking verdict is never usable evidence."""
+
+        truncated = (
+            _audit("PASS")
+            + "\n\nAPI Error: Server error mid-response. The response above may "
+            "be incomplete."
+        )
+        self.assertIsNone(plugin._valid_audit(truncated))
+        payload, validation = plugin._audit_payload_and_validation(truncated)
+        self.assertIsNone(payload)
+        self.assertIsNone(validation)
+        # A completed packet carrying truncated output routes to a fresh retry,
+        # never to the judge and never adjudicated as PASS.
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet("opus_auditor", "audit-cycle-1", truncated, child="opus-1"),
+        ]
+        route = plugin._next_route(records)
+        self.assertEqual(
+            (route.status, route.agent, route.title),
+            ("dispatch", "opus_auditor", "audit-retry-1-1"),
+        )
+
+    def test_completed_retry_audit_routes_like_normal_audit(self) -> None:
+        """A completed retry audit judges normally and completes the stage chain."""
+
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            self._dead_opus("audit-cycle-1"),
+            _route_packet(
+                "opus_auditor",
+                "audit-retry-1-1",
+                _audit("PASS"),
+                child="opus-retry-1",
+            ),
+        ]
+        route = plugin._next_route(records)
+        self.assertEqual(
+            (route.agent, route.title), ("codex_judge", "judge-cycle-1")
+        )
+        self.assertTrue(plugin._has_required_stage_chain(records, 1))
+        self.assertEqual(
+            runtime_state.parse_dispatch_title("audit-retry-1-2"),
+            {
+                "stage_id": "audit_retry",
+                "cycle": 1,
+                "hop": 2,
+                "requester": "opus",
+            },
+        )
+
+    def test_transient_opus_failure_is_recoverable_worker_state(self) -> None:
+        """A transient Opus death is terminal only after its retry budget is spent."""
+
+        recoverable = [
+            _record("cursor_workhorse", "CURSOR-1", title="cursor-cycle-1"),
+            _record(
+                "opus_auditor",
+                "API Error: Server error mid-response. The response above may "
+                "be incomplete.",
+                status="failed",
+                title="audit-cycle-1",
+            ),
+        ]
+        with mock.patch.object(
+            plugin, "_completion_records", return_value=recoverable
+        ), mock.patch.object(plugin, "read_collections", return_value=recoverable):
+            self.assertFalse(plugin._has_terminal_worker_failure())
+
+        exhausted = [
+            *recoverable,
+            _record(
+                "opus_auditor",
+                "Server error mid-response; the response above may be incomplete",
+                status="failed",
+                title="audit-retry-1-1",
+            ),
+        ]
+        with mock.patch.object(
+            plugin, "_completion_records", return_value=exhausted
+        ), mock.patch.object(plugin, "read_collections", return_value=exhausted):
+            self.assertTrue(plugin._has_terminal_worker_failure())
+
     def test_run_00jfpj73_nonterminal_judge_stays_live_and_bounds_terminal_routes(
         self,
     ) -> None:
@@ -6962,6 +7136,7 @@ print("exact temp boundary: PASS")
             ("cursor-cycle-{cycle}", "cursor_grunt", "", False),
             ("audit-cycle-{cycle}", "audit", "opus", False),
             ("audit-cycle-{cycle}-web-{hop}", "audit_web", "opus", True),
+            ("audit-retry-{cycle}-{hop}", "audit_retry", "opus", True),
             (
                 "audit-internal-{cycle}-{hop}",
                 "audit_internal",
