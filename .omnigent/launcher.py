@@ -487,8 +487,8 @@ def _validate_cli_args(args: list[str]) -> tuple[list[str], bool]:
 
     if args == ["--help"] or args == ["-h"]:
         print(
-            "Usage: ./triple-stamp               start the host-backed browser UI\n"
-            "                                     and interactive terminal\n"
+            "Usage: ./triple-stamp               start the browser UI and\n"
+            "                                    interactive terminal\n"
             "       ./triple-stamp --self-test   check the install\n\n"
             "Environment (all optional):\n"
             "  TRIPLE_STAMP_VOICE_PROFILE   markdown file to render the answer\n"
