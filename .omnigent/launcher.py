@@ -750,8 +750,14 @@ raise SystemExit(0 if ok else 1)
 class _PluginInstallLock:
     """Serialize changes to the shared managed-Python plugin metadata."""
 
-    def __init__(self, root: Path) -> None:
-        self.path = root / ".omnigent/isaac-launcher/.install.lock"
+    def __init__(self, managed_python: Path) -> None:
+        target = managed_python.resolve(strict=False)
+        target_key = hashlib.sha256(str(target).encode("utf-8")).hexdigest()[:16]
+        self.path = (
+            Path(tempfile.gettempdir())
+            / f"omnigent-triple-stamp-{os.getuid()}"
+            / f"isaac-plugin-{target_key}.install.lock"
+        )
         self.handle: object | None = None
 
     def __enter__(self) -> Self:
@@ -878,7 +884,10 @@ def _ensure_plugin(
     tools: Toolchain,
     host_env: dict[str, str],
 ) -> None:
-    with _PluginInstallLock(root):
+    # Editable registration mutates the target interpreter globally. The lock
+    # is keyed by that interpreter, not by checkout, so two worktrees cannot
+    # concurrently retarget or repair the same managed-Python metadata.
+    with _PluginInstallLock(tools.omnigent_python):
         status, check = _plugin_probe(root, tools, host_env)
         if check.returncode == 0 and status.get("ok") is True:
             return
@@ -2283,23 +2292,15 @@ def _spawn_sandboxed(
         stdout_handle = (Path(runtime_env["TRIPLE_STAMP_RUN_DIR"]) / "child-stdout.bin").open(
             "wb"
         )
-    try:
-        child = subprocess.Popen(
-            command,
-            env=runtime_env,
-            cwd=root,
-            start_new_session=True,
-            stdout=stdout_handle,
-        )
-    finally:
-        if stdout_handle is not None:
-            stdout_handle.close()
+    child: subprocess.Popen[bytes] | None = None
     received_signal: int | None = None
     stop_deadline: float | None = None
+    force_shutdown = False
 
     def forward(signum: int, _frame: object) -> None:
-        nonlocal received_signal, stop_deadline
+        nonlocal received_signal, stop_deadline, force_shutdown
         force = received_signal is not None
+        force_shutdown = force_shutdown or force
         if received_signal is None:
             received_signal = signum
         stop_deadline = (
@@ -2307,13 +2308,29 @@ def _spawn_sandboxed(
             if force
             else time.monotonic() + STOP_GRACE_SECONDS
         )
-        _signal_sandbox_child(child, signum, force=force)
+        if child is not None:
+            _signal_sandbox_child(child, signum, force=force)
 
-    old_handlers = {
-        signum: signal.signal(signum, forward)
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    }
+    old_handlers: dict[int, object] = {}
     try:
+        # Install handlers before Popen creates a detached process group. A
+        # signal delivered between Popen's return and STORE_FAST is retained
+        # above and forwarded immediately after the child reference is stored.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            old_handlers[signum] = signal.signal(signum, forward)
+        child = subprocess.Popen(
+            command,
+            env=runtime_env,
+            cwd=root,
+            start_new_session=True,
+            stdout=stdout_handle,
+        )
+        if received_signal is not None:
+            _signal_sandbox_child(
+                child,
+                received_signal,
+                force=force_shutdown,
+            )
         while True:
             try:
                 return_code = child.wait(timeout=0.25)
@@ -2327,7 +2344,15 @@ def _spawn_sandboxed(
                     child.kill()
                 return_code = child.wait()
                 break
+    except BaseException:
+        # Once Popen succeeds, every exceptional path owns and terminates the
+        # detached child; otherwise it could survive as an orphaned paid run.
+        if child is not None:
+            _terminate_sandbox_child(child)
+        raise
     finally:
+        if stdout_handle is not None:
+            stdout_handle.close()
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
     if received_signal is not None:
@@ -2363,6 +2388,24 @@ def _signal_sandbox_child(
             child.kill()
         else:
             child.terminate()
+
+
+def _terminate_sandbox_child(child: subprocess.Popen[bytes]) -> None:
+    """Best-effort bounded teardown for a successfully spawned sandbox child."""
+
+    if child.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        _signal_sandbox_child(child, signal.SIGTERM, force=False)
+    try:
+        child.wait(timeout=STOP_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        _signal_sandbox_child(child, signal.SIGTERM, force=True)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        child.wait(timeout=5)
 
 
 def _record_external_signal(run_dir: Path, signum: int) -> None:

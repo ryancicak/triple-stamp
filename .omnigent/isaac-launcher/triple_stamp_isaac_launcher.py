@@ -2821,26 +2821,14 @@ def _project_dispatch_cost(event: dict[str, Any]) -> tuple[str, float]:
 
 
 def _top_level_request_identity(data: object) -> str:
-    """Identify only a genuine user submit, never a child-completion wake."""
+    """Fingerprint request data without inferring provenance from user text.
+
+    The request policy's trusted harness context decides whether this is a UI
+    submit or a synthetic hook invocation. Marker-like text remains valid user
+    input and must never erase a genuine request identity.
+    """
 
     if not isinstance(data, dict) or "user_content" not in data:
-        return ""
-    content = data.get("user_content")
-    if isinstance(content, list):
-        content = "\n".join(
-            str(block.get("text") or block.get("input_text") or "")
-            for block in content
-            if isinstance(block, dict)
-        )
-    elif isinstance(content, dict):
-        content = content.get("text") or content.get("user_content")
-    if isinstance(content, str) and any(
-        marker in content
-        for marker in (
-            "[System: sub-agent task ",
-            "TRIPLE_STAMP_NONTERMINAL_CONTINUATION",
-        )
-    ):
         return ""
     return attempt_request_identity(data)
 

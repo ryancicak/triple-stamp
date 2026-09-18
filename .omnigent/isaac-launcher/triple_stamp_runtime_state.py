@@ -539,11 +539,13 @@ def activate_parent_attempt(
             )
         changed = bool(
             request_identity
-            and prior_identity
             and terminal_exists
             and (
                 new_request
-                or request_identity != prior_identity
+                or (
+                    prior_identity
+                    and request_identity != prior_identity
+                )
             )
         )
         if changed:

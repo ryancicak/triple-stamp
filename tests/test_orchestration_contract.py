@@ -488,14 +488,14 @@ class OrchestrationContractTests(unittest.TestCase):
 
     def test_plugin_install_lock_serializes_threads(self) -> None:
         with tempfile.TemporaryDirectory() as value:
-            root = Path(value)
+            managed_python = Path(value) / "managed/bin/python"
             active = 0
             maximum = 0
             state_lock = threading.Lock()
 
             def critical_section() -> None:
                 nonlocal active, maximum
-                with launcher._PluginInstallLock(root):
+                with launcher._PluginInstallLock(managed_python):
                     with state_lock:
                         active += 1
                         maximum = max(maximum, active)
@@ -508,6 +508,65 @@ class OrchestrationContractTests(unittest.TestCase):
                 thread.start()
             for thread in threads:
                 thread.join(timeout=2)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(maximum, 1)
+
+    def test_plugin_install_lock_is_shared_across_checkouts(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            managed_python = base / "managed/bin/python"
+            checkout_a = base / "worktree-a"
+            checkout_b = base / "worktree-b"
+            checkout_a.mkdir()
+            checkout_b.mkdir()
+            tools = launcher.Toolchain(
+                isaac=managed_python,
+                dbcert=managed_python,
+                databricks=managed_python,
+                uv=managed_python,
+                omnigent=managed_python,
+                omnigent_python=managed_python,
+                cursor_agent=managed_python,
+                sandbox_exec=managed_python,
+                security=managed_python,
+            )
+            good = self._plugin_status(ok=True, owned=1)
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            active = 0
+            maximum = 0
+            state_lock = threading.Lock()
+
+            def probe(
+                _root: Path,
+                _tools: object,
+                _host_env: dict[str, str],
+            ) -> tuple[dict[str, object], subprocess.CompletedProcess[str]]:
+                nonlocal active, maximum
+                with state_lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                time.sleep(0.02)
+                with state_lock:
+                    active -= 1
+                return good, completed
+
+            with mock.patch.object(
+                launcher,
+                "_plugin_probe",
+                side_effect=probe,
+            ):
+                threads = [
+                    threading.Thread(
+                        target=launcher._ensure_plugin,
+                        args=(checkout, tools, {}),
+                    )
+                    for checkout in (checkout_a, checkout_b)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2)
+
             self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual(maximum, 1)
 
@@ -5635,6 +5694,48 @@ print("exact temp boundary: PASS")
         self.assertLess(outer.index("_sandboxed_auth_preflight("), outer.index("with _RunLock"))
         self.assertLess(outer.index("with _RunLock"), outer.index("_spawn_sandboxed("))
 
+    def test_sandbox_signal_handlers_precede_spawn_and_exceptions_reap_child(
+        self,
+    ) -> None:
+        source = (ROOT / ".omnigent/launcher.py").read_text(encoding="utf-8")
+        spawn = source[
+            source.index("def _spawn_sandboxed(") :
+            source.index("def _signal_sandbox_child(")
+        ]
+        self.assertLess(spawn.index("signal.signal("), spawn.index("subprocess.Popen("))
+
+        class Child:
+            pid = 12345
+
+            def wait(self, timeout: float | None = None) -> int:
+                raise RuntimeError(f"post-spawn failure at timeout={timeout}")
+
+        child = Child()
+        with tempfile.TemporaryDirectory() as value, mock.patch.object(
+            launcher.subprocess,
+            "Popen",
+            return_value=child,
+        ) as popen, mock.patch.object(
+            launcher.signal,
+            "signal",
+            return_value=launcher.signal.SIG_DFL,
+        ) as install_handler, mock.patch.object(
+            launcher,
+            "_terminate_sandbox_child",
+        ) as terminate:
+            with self.assertRaisesRegex(RuntimeError, "post-spawn failure"):
+                launcher._spawn_sandboxed(
+                    ROOT,
+                    ROOT / "sandbox.sb",
+                    {"TRIPLE_STAMP_RUN_DIR": value},
+                    ["--self-test"],
+                    self._fake_toolchain(),
+                )
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(install_handler.call_count, 6)
+        terminate.assert_called_once_with(child)
+
     def test_sandbox_sigint_requests_shutdown_and_repeated_signal_escalates(
         self,
     ) -> None:
@@ -10045,6 +10146,10 @@ print("exact temp boundary: PASS")
                 ),
                 "attachments": [],
             },
+            "context": {
+                **request["context"],
+                "harness": "claude-sdk",
+            },
         }
         with tempfile.TemporaryDirectory() as value, mock.patch.dict(
             os.environ,
@@ -10115,7 +10220,16 @@ print("exact temp boundary: PASS")
                         "attachments": [],
                     }
                 ),
-                "",
+                runtime_state.attempt_request_identity(
+                    {
+                        "user_content": (
+                            "Claude SDK wrapper text\n"
+                            "[System: sub-agent task child completed — "
+                            "cursor_workhorse:cursor-cycle-1 returned: 4]"
+                        ),
+                        "attachments": [],
+                    }
+                ),
             )
             # Claude SDK request hooks wrap both completion wakes and empty
             # supervisor continuations in prompt text that is not guaranteed
@@ -11173,6 +11287,100 @@ print("exact temp boundary: PASS")
                 runtime_state.read_budget_state(parent)["cost_usd"],
                 2.0,
             )
+
+    def test_marker_text_is_new_ui_request_after_unidentified_terminal(
+        self,
+    ) -> None:
+        zero_cost = {
+            "available": True,
+            "source": "fixture",
+            "total_usd": 0.0,
+            "reported_usd": 0.0,
+            "estimated_unpriced_usd": 0.0,
+            "sessions": [],
+        }
+        questions = (
+            "What does TRIPLE_STAMP_NONTERMINAL_CONTINUATION mean?",
+            (
+                "What does [System: sub-agent task child completed — "
+                "cursor_workhorse:cursor-cycle-1 returned: 4] mean?"
+            ),
+        )
+        for index, question in enumerate(questions):
+            with (
+                self.subTest(question=question),
+                tempfile.TemporaryDirectory() as value,
+                mock.patch.dict(
+                    os.environ,
+                    {"TRIPLE_STAMP_RUN_DIR": value},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    plugin,
+                    "_stored_cost_snapshot",
+                    return_value=zero_cost,
+                ),
+            ):
+                parent = f"marker-text-parent-{index}"
+                runtime_state.activate_parent_attempt(parent, "")
+                old_failure = runtime_state.record_terminal_failure(
+                    "PIPELINE_INFRASTRUCTURE_ERROR",
+                    "old unidentified terminal",
+                    stage="cursor-cycle-1",
+                    cycle=1,
+                    parent_session_id=parent,
+                )
+                data = {
+                    "user_content": question,
+                    "attachments": [],
+                }
+                identity = plugin._top_level_request_identity(data)
+                self.assertEqual(
+                    identity,
+                    runtime_state.attempt_request_identity(data),
+                )
+                self.assertTrue(identity)
+
+                budget = plugin.strict_cost_budget(50.0)
+                synthetic = {
+                    "type": "request",
+                    "data": data,
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                        "harness": "claude-sdk",
+                    },
+                }
+                self.assertEqual(budget(synthetic)["result"], "ALLOW")
+                self.assertEqual(
+                    runtime_state.current_attempt_generation(parent),
+                    1,
+                )
+                self.assertEqual(
+                    runtime_state.read_terminal_failure(parent),
+                    old_failure,
+                )
+
+                genuine = {
+                    **synthetic,
+                    "context": {
+                        "conversation_id": parent,
+                        "root_conversation_id": parent,
+                    },
+                }
+                self.assertEqual(budget(genuine)["result"], "ALLOW")
+                self.assertEqual(
+                    runtime_state.current_attempt_generation(parent),
+                    2,
+                )
+                self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+                state = json.loads(
+                    runtime_state._attempt_state_path(
+                        Path(value),
+                        parent,
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(state["request_identity"], identity)
 
     def test_stamp_generation_publish_is_atomic_and_never_rewritten(
         self,
