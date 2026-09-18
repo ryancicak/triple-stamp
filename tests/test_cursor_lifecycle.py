@@ -246,6 +246,59 @@ class CursorLifecycleTests(unittest.TestCase):
             }
         )
 
+    def _seed_stranded_completion(
+        self,
+        *,
+        parent: str,
+        child: str,
+        work_id: str,
+    ) -> None:
+        output = "CURSOR_WORKER_FAILED: stranded terminal packet"
+        self._dispatch(
+            parent=parent,
+            child=child,
+            work_id=work_id,
+            title="cursor-cycle-1",
+        )
+        inbox = lifecycle.ensure_parent_inbox(parent)
+        entry = runner_app.register_subagent_work(
+            parent_session_id=parent,
+            child_session_id=child,
+            agent="cursor_workhorse",
+            title="cursor-cycle-1",
+        )
+        entry.work_id = work_id
+        entry.status = "failed"
+        entry.output = output
+        entry.completed_at = time.time()
+        entry.delivered = True
+        inbox.put_nowait(
+            {
+                "type": "sub_agent",
+                "work_id": work_id,
+                "task_id": child,
+                "handle_id": child,
+                "conversation_id": child,
+                "tool_name": "cursor_workhorse",
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "failed",
+                "output": output,
+            }
+        )
+
+        def stranded(
+            generation: dict[str, object],
+            _state: dict[str, object],
+        ) -> None:
+            generation["terminal_status"] = "failed"
+            generation["terminal_output"] = output
+            generation["terminal_phase"] = "delivered"
+            generation["delivery_committed"] = True
+            generation["parent_wake_pending"] = True
+
+        runtime_state.mutate_cursor_lifecycle(child, work_id, stranded)
+
     def test_retained_transport_waits_for_real_turn_then_wakes_once(self) -> None:
         parent = FIXTURE["parent_session_id"]
         child = FIXTURE["child_session_id"]
@@ -969,7 +1022,9 @@ class CursorLifecycleTests(unittest.TestCase):
                     session_id=child,
                     status="idle",
                 )
-                retry = lifecycle._cursor_parent_wake_tasks[parent]
+                retry = lifecycle._cursor_parent_wake_tasks[
+                    (parent, child, work_id)
+                ]
                 await asyncio.wait_for(retry, timeout=1.0)
                 await asyncio.sleep(0)
 
@@ -1007,7 +1062,10 @@ class CursorLifecycleTests(unittest.TestCase):
                 self.assertIn("parent_wake_delivered_at_ns", committed)
                 self.assertEqual(client.posts, 2)
                 self.assertEqual(wake.await_count, 3)
-                self.assertNotIn(parent, lifecycle._cursor_parent_wake_tasks)
+                self.assertNotIn(
+                    (parent, child, work_id),
+                    lifecycle._cursor_parent_wake_tasks,
+                )
             finally:
                 runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)
@@ -1055,7 +1113,9 @@ class CursorLifecycleTests(unittest.TestCase):
                     session_id=child,
                     status="idle",
                 )
-                retry = lifecycle._cursor_parent_wake_tasks[parent]
+                retry = lifecycle._cursor_parent_wake_tasks[
+                    (parent, child, work_id)
+                ]
                 await asyncio.wait_for(retry, timeout=1.0)
                 await asyncio.sleep(0)
 
@@ -1107,9 +1167,139 @@ class CursorLifecycleTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(wake.await_count, 3)
-                self.assertNotIn(parent, lifecycle._cursor_parent_wake_tasks)
+                self.assertNotIn(
+                    (parent, child, work_id),
+                    lifecycle._cursor_parent_wake_tasks,
+                )
             finally:
                 runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+                runner_app._session_event_queues_ref.pop(parent, None)
+
+    def test_inflight_wake_is_cancelled_at_remaining_deadline(self) -> None:
+        parent = "inflight-deadline-parent"
+        child = "inflight-deadline-child"
+        work_id = "inflight-deadline-work"
+
+        async def never_returns(*_args: object, **_kwargs: object) -> bool:
+            await asyncio.Event().wait()
+            return False
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            self._seed_stranded_completion(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+            )
+            started = time.monotonic()
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    never_returns,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_CURSOR_PARENT_WAKE_DEADLINE_S",
+                    0.02,
+                ):
+                    asyncio.run(
+                        lifecycle._retry_cursor_parent_wake(
+                            client=object(),
+                            parent_session_id=parent,
+                            child_session_id=child,
+                            work_id=work_id,
+                            notice="wake",
+                            created_by=None,
+                        )
+                    )
+
+                self.assertLess(time.monotonic() - started, 0.5)
+                state = runtime_state.read_cursor_lifecycle(child, work_id)
+                self.assertTrue(state["parent_wake_exhausted"])
+                self.assertFalse(state["parent_wake_pending"])
+                self.assertFalse(state["delivery_committed"])
+                self.assertTrue(runtime_state.read_terminal_failure(parent))
+                event = runner_app._session_event_queues_ref[
+                    parent
+                ].get_nowait()
+                self.assertEqual(event["status"], "failed")
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+                runner_app._session_event_queues_ref.pop(parent, None)
+
+    def test_two_stranded_children_each_own_bounded_terminal_recovery(
+        self,
+    ) -> None:
+        parent = "two-stranded-children-parent"
+        children = (
+            ("two-stranded-child-a", "two-stranded-work-a"),
+            ("two-stranded-child-b", "two-stranded-work-b"),
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            for child, work_id in children:
+                self._seed_stranded_completion(
+                    parent=parent,
+                    child=child,
+                    work_id=work_id,
+                )
+            wake = mock.AsyncMock(return_value=False)
+
+            async def schedule_and_wait() -> None:
+                for child, work_id in children:
+                    lifecycle._schedule_cursor_parent_wake_retry(
+                        client=object(),
+                        parent_session_id=parent,
+                        child_session_id=child,
+                        work_id=work_id,
+                        notice=f"wake-{child}",
+                        created_by=None,
+                    )
+                tasks = tuple(lifecycle._cursor_parent_wake_tasks.values())
+                self.assertEqual(len(tasks), 2)
+                await asyncio.gather(*tasks)
+                await asyncio.sleep(0)
+
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    wake,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_CURSOR_PARENT_WAKE_MAX_ATTEMPTS",
+                    1,
+                ):
+                    asyncio.run(schedule_and_wait())
+
+                self.assertEqual(wake.await_count, 2)
+                self.assertEqual(lifecycle._cursor_parent_wake_tasks, {})
+                inbox = runner_app._session_inboxes_ref[parent]
+                self.assertEqual(inbox.qsize(), 2)
+                for child, work_id in children:
+                    entry = runner_app.get_subagent_work(child)
+                    self.assertIsNotNone(entry)
+                    assert entry is not None
+                    self.assertEqual(entry.status, "failed")
+                    state = runtime_state.read_cursor_lifecycle(child, work_id)
+                    self.assertTrue(state["parent_wake_exhausted"])
+                    self.assertFalse(state["parent_wake_pending"])
+                    self.assertFalse(state["delivery_committed"])
+            finally:
+                for child, _work_id in children:
+                    runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)
                 runner_app._session_event_queues_ref.pop(parent, None)
 

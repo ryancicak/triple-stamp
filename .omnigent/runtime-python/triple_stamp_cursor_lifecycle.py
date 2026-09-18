@@ -59,7 +59,8 @@ PARENT_INBOX_PROBE_VALUE = "v1"
 PARENT_INBOX_READY = "TRIPLE_STAMP_PARENT_INBOX_READY:v1"
 _parent_inbox_failures: dict[str, str] = {}
 _unknown_opus_dispatches: dict[str, str] = {}
-_cursor_parent_wake_tasks: dict[str, asyncio.Task[None]] = {}
+_CursorWakeKey = tuple[str, str, str]
+_cursor_parent_wake_tasks: dict[_CursorWakeKey, asyncio.Task[None]] = {}
 
 
 async def _cursor_parent_wake_retry_sleep(seconds: float) -> None:
@@ -76,6 +77,7 @@ async def _retry_cursor_parent_wake(
     work_id: str,
     notice: str,
     created_by: str | None,
+    started_at_monotonic: float | None = None,
 ) -> None:
     """Retry one queued Cursor completion, then terminalize if unreachable."""
 
@@ -87,18 +89,30 @@ async def _retry_cursor_parent_wake(
     )
 
     attempts = 0
-    started = time.monotonic()
+    started = (
+        started_at_monotonic
+        if started_at_monotonic is not None
+        else time.monotonic()
+    )
     while (
         attempts < _CURSOR_PARENT_WAKE_MAX_ATTEMPTS
         and time.monotonic() - started < _CURSOR_PARENT_WAKE_DEADLINE_S
     ):
+        remaining = _CURSOR_PARENT_WAKE_DEADLINE_S - (
+            time.monotonic() - started
+        )
+        if remaining <= 0:
+            break
         attempts += 1
         try:
-            delivered = await runner_app._deliver_subagent_wake_post(
-                client,
-                parent_session_id,
-                notice,
-                created_by=created_by,
+            delivered = await asyncio.wait_for(
+                runner_app._deliver_subagent_wake_post(
+                    client,
+                    parent_session_id,
+                    notice,
+                    created_by=created_by,
+                ),
+                timeout=remaining,
             )
         except asyncio.CancelledError:
             raise
@@ -231,10 +245,12 @@ def _schedule_cursor_parent_wake_retry(
     work_id: str,
     notice: str,
     created_by: str | None,
+    started_at_monotonic: float | None = None,
 ) -> None:
-    """Keep exactly one paced stranded-wake task per parent."""
+    """Keep exactly one paced stranded-wake task per child generation."""
 
-    existing = _cursor_parent_wake_tasks.get(parent_session_id)
+    key = (parent_session_id, child_session_id, work_id)
+    existing = _cursor_parent_wake_tasks.get(key)
     if existing is not None and not existing.done():
         return
     task = asyncio.create_task(
@@ -245,14 +261,15 @@ def _schedule_cursor_parent_wake_retry(
             work_id=work_id,
             notice=notice,
             created_by=created_by,
+            started_at_monotonic=started_at_monotonic,
         ),
         name=f"triple-stamp-cursor-wake-{parent_session_id}",
     )
-    _cursor_parent_wake_tasks[parent_session_id] = task
+    _cursor_parent_wake_tasks[key] = task
 
     def clear(completed: asyncio.Task[None]) -> None:
-        if _cursor_parent_wake_tasks.get(parent_session_id) is completed:
-            _cursor_parent_wake_tasks.pop(parent_session_id, None)
+        if _cursor_parent_wake_tasks.get(key) is completed:
+            _cursor_parent_wake_tasks.pop(key, None)
 
     task.add_done_callback(clear)
 
@@ -517,9 +534,10 @@ def _install_runner_session_inbox_initialization() -> None:
                 runner_app._session_inboxes_ref.pop(session_id, None)
                 _parent_inbox_failures.pop(session_id, None)
                 _unknown_opus_dispatches.pop(session_id, None)
-                wake_task = _cursor_parent_wake_tasks.pop(session_id, None)
-                if wake_task is not None:
-                    wake_task.cancel()
+                for key, wake_task in tuple(_cursor_parent_wake_tasks.items()):
+                    if key[0] == session_id:
+                        _cursor_parent_wake_tasks.pop(key, None)
+                        wake_task.cancel()
             return response
 
         # ``add_middleware`` prepends. Move this layer behind the runner's
@@ -1377,12 +1395,19 @@ def install_parent_inbox_guard() -> None:
                             status=entry.status,
                             pending=parent_inbox.qsize(),
                         )
-                        wake_delivered = await runner_app._deliver_subagent_wake_post(
-                            client,
-                            parent_session_id,
-                            notice,
-                            created_by=entry.created_by,
-                        )
+                        wake_started = time.monotonic()
+                        try:
+                            wake_delivered = await asyncio.wait_for(
+                                runner_app._deliver_subagent_wake_post(
+                                    client,
+                                    parent_session_id,
+                                    notice,
+                                    created_by=entry.created_by,
+                                ),
+                                timeout=_CURSOR_PARENT_WAKE_DEADLINE_S,
+                            )
+                        except TimeoutError:
+                            wake_delivered = False
                         if not wake_delivered:
                             def mark_wake_pending(
                                 current: dict[str, Any],
@@ -1403,6 +1428,7 @@ def install_parent_inbox_guard() -> None:
                                 work_id=work_id,
                                 notice=notice,
                                 created_by=entry.created_by,
+                                started_at_monotonic=wake_started,
                             )
                     return
             reason = (
