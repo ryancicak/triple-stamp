@@ -628,6 +628,15 @@ def _terminal_response_allowed(
     return False
 
 
+def _customer_safe_terminal_failure() -> str:
+    """Return a retryable reader-facing failure without policy internals."""
+
+    return (
+        "I couldn't complete this request because the research run ended "
+        "unexpectedly. Please ask again to start a fresh attempt."
+    )
+
+
 def _record(
     action: str,
     route: object,
@@ -733,6 +742,7 @@ def install_supervisor_continuation_guard() -> None:
     )
     from triple_stamp_isaac_launcher import (
         _INFRA_PREFIX,
+        _Route,
         _failure_metrics,
         _best_effort_answer,
         _next_route,
@@ -918,7 +928,8 @@ def install_supervisor_continuation_guard() -> None:
             # minutes past its own death notice: a full `cursor-cycle-2` ran to
             # completion and `audit-cycle-2` was dispatched and then killed
             # mid-tool-call, because nothing consulted that file again. Relay
-            # the recorded text instead. The exit code does not depend on the
+            # a customer-safe retry message instead of exposing policy or
+            # infrastructure internals. The exit code does not depend on the
             # event shape: `_validated_pipeline_exit` returns zero only for a
             # STAMP attestation with a valid stage chain.
             recorded_failure = read_terminal_failure(
@@ -955,15 +966,17 @@ def install_supervisor_continuation_guard() -> None:
                     reason="parent already has a recorded terminal failure",
                     parent_session_id=session_id,
                 )
-                yield TextChunk(text=recorded_failure)
+                safe_failure = _customer_safe_terminal_failure()
+                yield TextChunk(text=safe_failure)
                 yield TurnComplete(
-                    response=recorded_failure,
+                    response=safe_failure,
                     modified_by_policy=True,
                 )
                 return
             buffered_text: list[TextChunk] = []
             completed: TurnComplete | None = None
             send_attempted = False
+            terminal_dispatch_suppressed = False
             sent_titles: list[str] = []
             sent_child_session_ids: set[str] = set()
             observed_parent_session_ids: set[str] = set()
@@ -981,6 +994,18 @@ def install_supervisor_continuation_guard() -> None:
                 if isinstance(event, ToolCallRequest):
                     normalized = event.name.rsplit("__", 1)[-1]
                     if normalized == "sys_session_send":
+                        if (
+                            read_attested_answer(parent_session_id=session_id)
+                            or read_best_effort_answer(parent_session_id=session_id)
+                            or read_terminal_failure(parent_session_id=session_id)
+                        ):
+                            # A child can terminalize the attempt while this
+                            # already-started model turn is still streaming.
+                            # Drop the raced dispatch before it reaches the UI;
+                            # the native send boundary also turns it into a
+                            # no-op, so no paid child can launch.
+                            terminal_dispatch_suppressed = True
+                            continue
                         send_attempted = True
                         arguments = event.args if isinstance(event.args, dict) else {}
                         sent_title = str(arguments.get("title") or "<missing>")
@@ -1004,6 +1029,11 @@ def install_supervisor_continuation_guard() -> None:
                     continue
                 if isinstance(event, ToolCallComplete):
                     normalized = event.name.rsplit("__", 1)[-1]
+                    if (
+                        normalized == "sys_session_send"
+                        and terminal_dispatch_suppressed
+                    ):
+                        continue
                     if normalized == "sys_session_send":
                         sent_child_session_ids.update(
                             _tool_child_session_ids(event.result)
@@ -1024,6 +1054,10 @@ def install_supervisor_continuation_guard() -> None:
 
             if completed is None:
                 return
+            if terminal_dispatch_suppressed:
+                # Re-enter the terminal checks. They relay an undelivered
+                # terminal once or suppress an already-delivered stale wake.
+                continue
 
             records = read_attempt_collections(parent_session_id=session_id)
             dispatches = read_attempt_dispatches(parent_session_id=session_id)
@@ -1049,6 +1083,49 @@ def install_supervisor_continuation_guard() -> None:
             response = completed.response
             if not isinstance(response, str):
                 response = "".join(event.text for event in buffered_text)
+            if (
+                str(getattr(route, "status", "") or "")
+                == "infrastructure_failed"
+                and records
+                and str(records[-1].get("title") or "").startswith(
+                    "judge-format-repair-"
+                )
+            ):
+                fallback_route = _Route(
+                    "best_effort",
+                    int(getattr(route, "cycle", 0) or 0),
+                    reason=(
+                        "completed evidence contains a safe supported answer, "
+                        "but the judge format repair was unrecoverable"
+                    ),
+                )
+                fallback = _best_effort_answer(records, fallback_route)
+                if fallback:
+                    persisted = record_best_effort_answer(
+                        fallback,
+                        records,
+                        cycle=fallback_route.cycle,
+                        reason=fallback_route.reason,
+                        parent_session_id=session_id,
+                    )
+                    if persisted:
+                        _record(
+                            "judge_format_repair_best_effort_relay",
+                            fallback_route,
+                            attempt=continuation_attempt,
+                            reason=(
+                                "unrecoverable format repair fell back to the "
+                                "validated best-supported answer"
+                            ),
+                            parent_session_id=session_id,
+                        )
+                        yield TextChunk(text=persisted)
+                        yield TurnComplete(
+                            response=persisted,
+                            modified_by_policy=True,
+                            usage=completed.usage,
+                        )
+                        return
             if response.startswith(_INFRA_PREFIX):
                 if _route_dispatch_pending(
                     route,
@@ -1114,7 +1191,7 @@ def install_supervisor_continuation_guard() -> None:
                         )
                         return
                 else:
-                    recorded = record_terminal_failure(
+                    record_terminal_failure(
                         "PIPELINE_INFRASTRUCTURE_ERROR",
                         response.removeprefix(_INFRA_PREFIX).strip(),
                         stage=str(getattr(route, "title", "") or route.status),
@@ -1131,9 +1208,10 @@ def install_supervisor_continuation_guard() -> None:
                         ),
                         parent_session_id=session_id,
                     )
-                    yield TextChunk(text=recorded)
+                    safe_failure = _customer_safe_terminal_failure()
+                    yield TextChunk(text=safe_failure)
                     yield TurnComplete(
-                        response=recorded,
+                        response=safe_failure,
                         modified_by_policy=True,
                         usage=completed.usage,
                     )

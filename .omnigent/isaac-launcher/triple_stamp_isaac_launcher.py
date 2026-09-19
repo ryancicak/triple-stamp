@@ -2260,13 +2260,12 @@ def supervisor_contract(
                 or read_terminal_failure(parent_session_id)
                 or _latest_codex_stamp(parent_session_id) is not None
             ):
-                return {
-                    "result": "DENY",
-                    "reason": (
-                        "This attempt already has a terminal answer or failure; "
-                        "all further child dispatch is forbidden."
-                    ),
-                }
+                # A terminal artifact is still an absolute no-spend boundary.
+                # The native dispatch wrapper converts this raced/stale call to
+                # an internal no-op, while the response guard relays the terminal
+                # once or stays silent. Returning DENY here leaked policy text as
+                # the newest customer-visible output on delayed child wakes.
+                return {"result": "ALLOW"}
             parsed = _stage(title)
             if title.startswith("cursor-retry-"):
                 retry = re.fullmatch(r"cursor-retry-([1-4])-([1-9][0-9]*)", title)

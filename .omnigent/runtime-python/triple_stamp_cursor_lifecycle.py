@@ -47,6 +47,14 @@ _DUPLICATE_OPUS_RETRY_DISPATCH = (
     "Error: duplicate paid Opus retry denied; this attempt/cycle already "
     "dispatched its one reserved retry"
 )
+_TERMINAL_DISPATCH_NOOP = json.dumps(
+    {
+        "result": "NOOP",
+        "suppressed": True,
+        "reason": "parent attempt is already terminal",
+    },
+    separators=(",", ":"),
+)
 _DISPATCH_BOOKKEEPING_ERRORS = (
     AttributeError,
     IndexError,
@@ -1264,9 +1272,12 @@ def install_parent_inbox_guard() -> None:
         parse_dispatch_title,
         read_attempt_collections,
         read_attempt_dispatches,
+        read_attested_answer,
+        read_best_effort_answer,
         read_collections,
         read_cursor_lifecycle,
         read_dispatches,
+        read_terminal_failure,
         release_retry_reservation,
         record_terminal_failure,
         record_tool_dispatch_exception,
@@ -1698,6 +1709,18 @@ def install_parent_inbox_guard() -> None:
         ) -> str:
             if conversation_id in _parent_inbox_failures:
                 return _parent_inbox_failures[conversation_id]
+            parent_session_id = str(conversation_id or "")
+            if parent_session_id and (
+                read_attested_answer(parent_session_id)
+                or read_best_effort_answer(parent_session_id)
+                or read_terminal_failure(parent_session_id)
+            ):
+                # This is the final no-spend boundary. The response guard normally
+                # consumes stale completion wakes before they reach a tool call,
+                # but a terminal artifact can be written while a model turn is
+                # already streaming. Treat that raced dispatch as an internal
+                # no-op rather than launching a child or returning a policy error.
+                return _TERMINAL_DISPATCH_NOOP
             agent = args.get("agent") if isinstance(args, dict) else None
             title = args.get("title") if isinstance(args, dict) else None
             if (
@@ -1705,7 +1728,6 @@ def install_parent_inbox_guard() -> None:
                 and conversation_id in _unknown_opus_dispatches
             ):
                 return _unknown_opus_dispatches[conversation_id]
-            parent_session_id = str(conversation_id or "")
             parsed = parse_dispatch_title(title)
             if parent_session_id and parsed is not None:
                 dispatches = read_attempt_dispatches(
@@ -1867,6 +1889,77 @@ def install_parent_inbox_guard() -> None:
             if inbox is None:
                 return "Error: sys_read_inbox requires parent session inbox"
             if inbox.empty():
+                parent_session_id = str(conversation_id or "")
+                dispatches = read_attempt_dispatches(
+                    parent_session_id=parent_session_id
+                )
+                if dispatches:
+                    latest = dispatches[-1]
+                    child = str(latest.get("child_session_id") or "")
+                    work_id = str(latest.get("work_id") or "")
+                    collections = read_attempt_collections(
+                        parent_session_id=parent_session_id
+                    )
+                    recovered = next(
+                        (
+                            record
+                            for record in reversed(collections)
+                            if (
+                                (work_id and record.get("work_id") == work_id)
+                                or (
+                                    child
+                                    and record.get("child_session_id") == child
+                                )
+                            )
+                            and record.get("status")
+                            in {"completed", "failed", "cancelled"}
+                            and str(record.get("output") or "").strip()
+                        ),
+                        None,
+                    )
+                    if recovered is None and child:
+                        entry = runner_app.get_subagent_work(child)
+                        if (
+                            entry is not None
+                            and (
+                                not work_id
+                                or str(getattr(entry, "work_id", "") or "")
+                                == work_id
+                            )
+                            and str(getattr(entry, "status", "") or "")
+                            in {"completed", "failed", "cancelled"}
+                            and str(getattr(entry, "output", "") or "").strip()
+                        ):
+                            recovered = {
+                                "parent_session_id": parent_session_id,
+                                "child_session_id": child,
+                                "work_id": getattr(entry, "work_id", work_id),
+                                "agent": getattr(entry, "agent", None)
+                                or latest.get("agent"),
+                                "title": getattr(entry, "title", None)
+                                or latest.get("title"),
+                                "status": getattr(entry, "status", ""),
+                                "output": getattr(entry, "output", ""),
+                            }
+                            append_collection(recovered)
+                            attest_codex_stamp(recovered)
+                    if recovered is not None:
+                        payload = {
+                            "type": "sub_agent",
+                            "handle_id": (
+                                recovered.get("child_session_id")
+                                or recovered.get("work_id")
+                                or "unknown"
+                            ),
+                            "conversation_id": recovered.get("child_session_id"),
+                            "work_id": recovered.get("work_id"),
+                            "tool_name": recovered.get("agent"),
+                            "agent": recovered.get("agent"),
+                            "title": recovered.get("title"),
+                            "status": recovered.get("status"),
+                            "output": recovered.get("output"),
+                        }
+                        return dispatch._format_async_task_item(payload)
                 return "Inbox is empty — no completed tasks."
 
             leased: list[dict[str, object]] = []
