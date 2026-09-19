@@ -196,6 +196,49 @@ def _route_packet(
     }
 
 
+def _voice_invalid_stamp_records(answer: str) -> tuple[dict[str, str], ...]:
+    raw_stamp = json.dumps(
+        {
+            "verdict": "STAMP",
+            "needs_web": False,
+            "needs_internal": False,
+            "why": "supported",
+            "gap_materiality": "none",
+            "limitations": [],
+            "citations_that_hold": ["evidence"],
+            "voice_profile_check": {
+                "source_path": "",
+                "sha256": "",
+                "constraints_applied": "voice rendering disabled",
+            },
+            "shippable_answer": answer,
+            "evidence_appendix": [],
+        }
+    )
+    return (
+        _route_packet(
+            "cursor_workhorse",
+            "cursor-cycle-1",
+            "cursor evidence",
+        ),
+        _route_packet(
+            "opus_auditor",
+            "audit-cycle-1",
+            _audit("PASS"),
+        ),
+        _route_packet(
+            "codex_judge",
+            "judge-cycle-1",
+            raw_stamp,
+        ),
+        _route_packet(
+            "codex_judge",
+            "judge-format-repair-1",
+            _judgment("REWORK"),
+        ),
+    )
+
+
 # Voice rendering is optional, so tests that exercise the enabled mode declare
 # the profile explicitly. The example profile is checked in so the suite never
 # depends on a personal absolute path.
@@ -11184,6 +11227,210 @@ print("exact temp boundary: PASS")
         self.assertIn("judge_format_repair_best_effort_relay", actions)
         self.assertNotIn("continuation_exhausted_abstained", actions)
 
+    def test_voice_invalid_stamp_rework_forces_cursor_cycle_two(
+        self,
+    ) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TurnComplete
+
+        parent = "voice-invalid-stamp-rework-parent"
+        answer = "The supported answer remains available."
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+        forced_dispatches: list[tuple[str, dict[str, object]]] = []
+
+        async def refuses_cycle_two(*_args: object, **_kwargs: object):
+            nonlocal model_turns
+            model_turns += 1
+            yield TurnComplete(response="")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+            async def _tool_executor(
+                self,
+                name: str,
+                args: dict[str, object],
+            ) -> dict[str, object]:
+                forced_dispatches.append((name, args))
+                runtime_state.append_dispatch(
+                    {
+                        "agent": args["agent"],
+                        "title": args["title"],
+                        "child_session_id": "forced-cycle-two-child",
+                        "work_id": "forced-cycle-two-work",
+                        "parent_session_id": parent,
+                    }
+                )
+                return {
+                    "status": "launching",
+                    "conversation_id": "forced-cycle-two-child",
+                }
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Answer the customer question.",
+                "session_id": parent,
+            }
+        ]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    messages,
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "/voice/profile.md",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "expected-digest",
+            },
+            clear=False,
+        ):
+            for record in _voice_invalid_stamp_records(answer):
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": parent}
+                )
+            route = plugin._next_route(
+                runtime_state.read_attempt_collections(parent),
+                parent_session_id=parent,
+            )
+            self.assertEqual(route.title, "cursor-cycle-2")
+
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = refuses_cycle_two
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+
+        self.assertEqual(model_turns, 3)
+        self.assertEqual(len(forced_dispatches), 1)
+        self.assertEqual(forced_dispatches[0][0], "sys_session_send")
+        dispatch_args = forced_dispatches[0][1]
+        self.assertEqual(dispatch_args["agent"], "cursor_workhorse")
+        self.assertEqual(dispatch_args["title"], "cursor-cycle-2")
+        self.assertIn(
+            "Answer the customer question.",
+            dispatch_args["args"]["input"],
+        )
+        self.assertIn(answer, dispatch_args["args"]["input"])
+        self.assertIn("deterministic_rework_dispatch", actions)
+        self.assertNotIn("continuation_exhausted_abstained", actions)
+
+    def test_voice_invalid_stamp_rework_never_leaves_ui_empty(
+        self,
+    ) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        parent = "voice-invalid-stamp-fallback-parent"
+        answer = "The collected customer answer is still visible."
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+
+        async def refuses_cycle_two(*_args: object, **_kwargs: object):
+            nonlocal model_turns
+            model_turns += 1
+            yield TurnComplete(response="")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Answer the customer question.",
+                "session_id": parent,
+            }
+        ]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    messages,
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "/voice/profile.md",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "expected-digest",
+            },
+            clear=False,
+        ):
+            for record in _voice_invalid_stamp_records(answer):
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": parent}
+                )
+            route = plugin._next_route(
+                runtime_state.read_attempt_collections(parent),
+                parent_session_id=parent,
+            )
+            self.assertEqual(route.title, "cursor-cycle-2")
+
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = refuses_cycle_two
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+            persisted = runtime_state.read_best_effort_answer(parent)
+            attestation = json.loads(
+                runtime_state._read_artifact_path(
+                    Path(value),
+                    "best-effort-attestation.json",
+                    parent,
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(model_turns, 3)
+        self.assertEqual(persisted, answer)
+        self.assertEqual(
+            "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            ),
+            answer,
+        )
+        self.assertEqual(
+            [
+                packet["title"]
+                for packet in attestation["source_packets"]
+                if packet["agent"] == "codex_judge"
+            ],
+            ["judge-cycle-1"],
+        )
+        self.assertIn("judge_format_repair_best_effort_relay", actions)
+        self.assertNotIn("continuation_exhausted_abstained", actions)
+
     def test_voice_profile_reaches_codex_native_judge_environment(self) -> None:
         from omnigent import codex_native_app_server
 
@@ -11237,6 +11484,37 @@ print("exact temp boundary: PASS")
                     terminal_env["TRIPLE_STAMP_VOICE_PROFILE_SHA256"],
                     "voice-digest",
                 )
+                raw = '{"verdict":"STAMP","shippable_answer":"answer"}'
+                enriched = cursor_lifecycle._codex_runtime_handoff(
+                    {
+                        "agent": "codex_judge",
+                        "title": "judge-format-repair-1",
+                        "args": {
+                            "input": (
+                                "No voice profile is configured; write plain prose."
+                            )
+                        },
+                    },
+                    title="judge-format-repair-1",
+                    parent_session_id="parent",
+                    read_attempt_collections=lambda **_kwargs: [
+                        {
+                            "agent": "codex_judge",
+                            "title": "judge-cycle-1",
+                            "status": "completed",
+                            "output": raw,
+                        }
+                    ],
+                )
+                self.assertIn(
+                    "TRIPLE_STAMP_VOICE_PROFILE is configured",
+                    enriched["args"]["input"],
+                )
+                self.assertIn(
+                    "must not report voice rendering disabled",
+                    enriched["args"]["input"],
+                )
+                self.assertIn(raw, enriched["args"]["input"])
         finally:
             codex_native_app_server.build_codex_native_server = prior_builder
             codex_native_app_server.codex_terminal_env = prior_terminal_env

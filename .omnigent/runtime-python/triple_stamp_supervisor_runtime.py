@@ -395,36 +395,39 @@ def _attested_stamp_answer(
 
 
 def _raw_stamp_fallback_answer(
-    route: object,
     records: list[dict[str, Any]],
-) -> str:
-    """Recover a safe answer when a raw STAMP's format repair cannot launch.
+) -> tuple[str, int, dict[str, Any] | None]:
+    """Recover a safe answer when routing after a raw STAMP cannot continue.
 
     This is deliberately a BEST_EFFORT candidate, not a STAMP: fields such as
     the configured voice-profile receipt may still be invalid. The completed
     Cursor-to-Opus chain and raw Codex verdict must nevertheless agree that the
-    answer is shippable, so bounded supervisor refusal cannot leave the UI empty.
+    answer is shippable, so a later format-repair REWORK plus bounded supervisor
+    refusal cannot leave the UI empty.
     """
 
     from triple_stamp_isaac_launcher import (
         _has_required_stage_chain,
         _mapping_candidates,
         _safe_customer_answer,
+        _valid_stamp,
     )
 
-    title = str(getattr(route, "title", "") or "")
-    match = re.fullmatch(r"judge-format-repair-([1-4])", title)
-    if match is None:
-        return ""
-    cycle = int(match.group(1))
-    if not _has_required_stage_chain(records, cycle):
-        return ""
+    profile = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE", "").strip()
+    digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "").strip()
+    if not profile or not digest:
+        return "", 0, None
     for record in reversed(records):
+        title = str(record.get("title") or "")
+        match = re.fullmatch(r"judge-cycle-([1-4])", title)
         if (
-            record.get("agent") != "codex_judge"
+            match is None
+            or record.get("agent") != "codex_judge"
             or record.get("status") != "completed"
-            or record.get("title") != f"judge-cycle-{cycle}"
         ):
+            continue
+        cycle = int(match.group(1))
+        if not _has_required_stage_chain(records, cycle):
             continue
         for payload in _mapping_candidates(str(record.get("output") or "")):
             if (
@@ -434,9 +437,67 @@ def _raw_stamp_fallback_answer(
             ):
                 continue
             answer = _safe_customer_answer(payload.get("shippable_answer"))
-            if answer and "\u2014" not in answer:
-                return answer
-    return ""
+            receipt_probe = {
+                **payload,
+                "voice_profile_check": {
+                    "source_path": profile,
+                    "sha256": digest,
+                    "constraints_applied": "receipt validation probe only",
+                },
+            }
+            if (
+                answer
+                and "\u2014" not in answer
+                and _valid_stamp(receipt_probe) == answer
+            ):
+                return answer, cycle, record
+    return "", 0, None
+
+
+def _deterministic_cursor_cycle_handoff(
+    route: object,
+    *,
+    original_request: str,
+    records: list[dict[str, Any]],
+) -> str:
+    """Build the rework handoff when the supervisor refuses the durable route."""
+
+    if (
+        str(getattr(route, "status", "") or "") != "dispatch"
+        or str(getattr(route, "agent", "") or "") != "cursor_workhorse"
+    ):
+        return ""
+    title = str(getattr(route, "title", "") or "")
+    match = re.fullmatch(r"cursor-cycle-([2-4])", title)
+    if match is None or not original_request:
+        return ""
+    previous_cycle = int(match.group(1)) - 1
+    prior_packets = [
+        str(record.get("output") or "")
+        for record in records
+        if record.get("agent") == "codex_judge"
+        and record.get("status") == "completed"
+        and record.get("title")
+        in {
+            f"judge-cycle-{previous_cycle}",
+            f"judge-format-repair-{previous_cycle}",
+        }
+        and str(record.get("output") or "").strip()
+    ]
+    context = "\n\n".join(
+        f"PRIOR CODEX PACKET {index + 1}:\n{packet}"
+        for index, packet in enumerate(prior_packets)
+    )
+    return (
+        f"TRIPLE STAMP CURSOR REWORK CYCLE {match.group(1)}\n\n"
+        "Work directly in the current Cursor session. Return a complete Stage 1 "
+        "evidence packet inline. Do not invoke a Skill, workflow, subagent, Task, "
+        "nested agent, Omnigent, triple-stamp, run-with-isaac, or --self-test. "
+        "Use at most one tool call per assistant turn. Address the original "
+        "request and every concrete gap in the prior Codex packets.\n\n"
+        f"ORIGINAL REQUEST (verbatim):\n{original_request}"
+        + (f"\n\n{context}" if context else "")
+    )
 
 
 def _thousands(value: object) -> str:
@@ -1332,12 +1393,87 @@ def install_supervisor_continuation_guard() -> None:
                 ]
                 continue
 
-            fallback = _raw_stamp_fallback_answer(route, records)
+            deterministic_handoff = _deterministic_cursor_cycle_handoff(
+                route,
+                original_request=original_request,
+                records=records,
+            )
+            if deterministic_handoff:
+                title = str(getattr(route, "title", "") or "")
+                tool_executor = getattr(self, "_tool_executor", None)
+                if callable(tool_executor):
+                    if title not in narrated:
+                        narrated.add(title)
+                        note = _progress_note(
+                            "cursor_workhorse",
+                            title,
+                            narrated,
+                            parent_session_id=session_id,
+                        )
+                        if note:
+                            yield TextChunk(text=note)
+                    forced_args = {
+                        "agent": "cursor_workhorse",
+                        "title": title,
+                        "args": {"input": deterministic_handoff},
+                    }
+                    try:
+                        await tool_executor("sys_session_send", forced_args)
+                    except Exception as exc:  # noqa: BLE001 - fallback below
+                        _LOGGER.warning(
+                            "deterministic rework dispatch failed: %s",
+                            type(exc).__name__,
+                        )
+                    dispatches = read_attempt_dispatches(
+                        parent_session_id=session_id
+                    )
+                    if _route_dispatch_pending(
+                        route,
+                        records,
+                        dispatches,
+                        parent_session_id=session_id,
+                    ):
+                        _record(
+                            "deterministic_rework_dispatch",
+                            route,
+                            attempt=continuation_attempt,
+                            reason=(
+                                "supervisor exhausted its continuation prompts; "
+                                "runtime executed the durable Cursor rework route"
+                            ),
+                            parent_session_id=session_id,
+                        )
+                        yield TurnComplete(
+                            response="",
+                            modified_by_policy=True,
+                            usage=completed.usage,
+                        )
+                        return
+                    _record(
+                        "deterministic_rework_dispatch_failed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "runtime dispatch produced no durable Cursor "
+                            "cycle record; preserving raw STAMP candidate"
+                        ),
+                        parent_session_id=session_id,
+                    )
+
+            fallback, fallback_cycle, fallback_source = (
+                _raw_stamp_fallback_answer(records)
+            )
             if fallback:
+                fallback_records = [
+                    record
+                    for record in records
+                    if record.get("agent") != "codex_judge"
+                    or record is fallback_source
+                ]
                 persisted = record_best_effort_answer(
                     fallback,
-                    records,
-                    cycle=int(getattr(route, "cycle", 0) or 0),
+                    fallback_records,
+                    cycle=fallback_cycle,
                     reason=(
                         "raw Codex STAMP contained a shippable answer, but "
                         "judge format repair could not be dispatched within "

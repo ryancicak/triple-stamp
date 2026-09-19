@@ -357,6 +357,90 @@ def _install_codex_voice_environment() -> None:
     codex_native_app_server.codex_terminal_env = voice_aware_terminal_env
 
 
+def _codex_runtime_handoff(
+    args: object,
+    *,
+    title: object,
+    parent_session_id: str,
+    read_attempt_collections: Any,
+) -> object:
+    """Append launch truth that a model-authored handoff cannot override.
+
+    The routing supervisor cannot inspect its own environment.  It can therefore
+    emit a stale sentence claiming that voice rendering is disabled even while
+    the runner has a validated profile configured.  Codex receives the actual
+    environment through :func:`_install_codex_voice_environment`; this suffix
+    makes the same fact explicit in the turn that tells the judge what to do.
+
+    Format-repair dispatches also receive the actual collected raw judgment.
+    Asking the supervisor to reproduce a near-10KB packet proved lossy in a live
+    run: it sent a prose placeholder instead, so Codex had nothing to normalize.
+    """
+
+    if not isinstance(args, dict):
+        return args
+    nested = args.get("args")
+    if isinstance(nested, dict):
+        child_args = dict(nested)
+        handoff = child_args.get("input")
+    else:
+        child_args = None
+        handoff = nested
+    text = handoff if isinstance(handoff, str) else ""
+    additions: list[str] = []
+
+    profile = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE", "").strip()
+    digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "").strip()
+    if profile:
+        additions.append(
+            "[System-authoritative Codex launch context]\n"
+            f"TRIPLE_STAMP_VOICE_PROFILE is configured as {profile!r} and is "
+            "present in the Codex app-server and terminal environment. "
+            f"TRIPLE_STAMP_VOICE_PROFILE_SHA256 is {digest!r}. Any earlier "
+            "handoff sentence claiming that no voice profile is configured is "
+            "stale and false. Read the exact live path from the environment. "
+            "A STAMP must not report voice rendering disabled; it must apply "
+            "the profile and return its path and computed SHA-256."
+        )
+
+    match = re.fullmatch(r"judge-format-repair-([1-4])", str(title or ""))
+    if match is not None and parent_session_id:
+        source_title = f"judge-cycle-{match.group(1)}"
+        source = next(
+            (
+                str(record.get("output") or "")
+                for record in reversed(
+                    read_attempt_collections(
+                        parent_session_id=parent_session_id
+                    )
+                )
+                if record.get("agent") == "codex_judge"
+                and record.get("title") == source_title
+                and record.get("status") == "completed"
+                and str(record.get("output") or "").strip()
+            ),
+            "",
+        )
+        if source and source not in text:
+            additions.append(
+                "[System-authoritative raw judgment for format repair]\n"
+                "The exact collected packet follows. It supersedes any "
+                "placeholder claiming the packet was unavailable.\n"
+                f"{source}"
+            )
+
+    if not additions:
+        return args
+    enriched = "\n\n".join((text, *additions)).strip()
+    result = dict(args)
+    if child_args is not None:
+        child_args["input"] = enriched
+        result["args"] = child_args
+    else:
+        result["args"] = {"input": enriched}
+    return result
+
+
 def _observe_dispatch_bookkeeping(
     result: object,
     *,
@@ -1676,6 +1760,13 @@ def install_parent_inbox_guard() -> None:
                     )
                 ):
                     return _DUPLICATE_OPUS_RETRY_DISPATCH
+            if agent == "codex_judge":
+                args = _codex_runtime_handoff(
+                    args,
+                    title=title,
+                    parent_session_id=parent_session_id,
+                    read_attempt_collections=read_attempt_collections,
+                )
             try:
                 result = await original_send(
                     args,
