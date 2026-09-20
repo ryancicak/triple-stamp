@@ -385,7 +385,11 @@ assert outcome is permissions._YoloAccept.SKIP
     if result.returncode:
         fail(
             "runtime guard regression probe failed: "
-            + (result.stderr.strip() or result.stdout.strip() or "no output")
+            + (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"no output (exit {result.returncode})"
+            )
         )
 
 
@@ -712,17 +716,31 @@ def validate_launchers(
     ):
         if marker not in supervisor_runtime_source:
             fail(f"supervisor continuation marker missing: {marker}")
-    if version("omnigent") != "0.12.0":
-        fail(f"runtime is Omnigent {version('omnigent')}, expected 0.12.0")
+    # Accept the pinned stable line (0.12.x) or the released native line
+    # (0.14.x). The compatibility module owns the version policy and the
+    # per-version schema (migration-head) expectation; this is a version gate,
+    # not routing. Loaded by path because validate_bundle runs under ``-I``.
+    import importlib.util as _ilu
+
+    _compat_spec = _ilu.spec_from_file_location(
+        "triple_stamp_omnigent_compat",
+        root / ".omnigent/runtime-python/triple_stamp_omnigent_compat.py",
+    )
+    _omnigent_compat = _ilu.module_from_spec(_compat_spec)
+    _compat_spec.loader.exec_module(_omnigent_compat)
+    omnigent_version = version("omnigent")
+    if not _omnigent_compat.is_supported_omnigent_version(omnigent_version):
+        fail(f"runtime is Omnigent {omnigent_version}, expected 0.12.x or 0.14.x")
     if version("claude-agent-sdk") != "0.2.152":
         fail(
             f"runtime is claude-agent-sdk {version('claude-agent-sdk')}, "
             "expected 0.2.152"
         )
+    expected_heads = _omnigent_compat.expected_migration_heads(omnigent_version)
     heads = ScriptDirectory.from_config(
         _build_alembic_config("sqlite:////tmp/triple-stamp-validator.db")
     ).get_heads()
-    if heads != ["ga1b2c3d4e5f"]:
+    if expected_heads is None or heads != expected_heads:
         fail(f"unexpected Omnigent migration heads: {heads}")
 
     isaac = os.environ.get("ISAAC_BIN", "")

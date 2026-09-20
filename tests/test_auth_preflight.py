@@ -60,14 +60,37 @@ class AuthPreflightTests(unittest.TestCase):
     def test_cursor_missing_exact_model_has_one_remediation(self) -> None:
         ok = preflight.subprocess.CompletedProcess([], 0, "logged in", "")
         missing = preflight.subprocess.CompletedProcess([], 0, "auto - Auto", "")
-        with mock.patch.object(preflight, "_run", side_effect=[ok, missing, ok, ok]):
+        with (
+            mock.patch.object(preflight, "_run", side_effect=[ok, missing, ok, ok]),
+            mock.patch.dict(
+                os.environ,
+                {"CURSOR_AGENT_BIN": "/opt/homebrew/bin/cursor-agent"},
+                clear=False,
+            ),
+        ):
             with self.assertRaises(preflight.PreflightError) as raised:
                 preflight._preflight_cursor(ROOT)
         self.assertEqual(raised.exception.stage, "Cursor")
         self.assertEqual(
             raised.exception.remediation,
-            f"{preflight._real_home() / '.local/bin/cursor-agent'} login",
+            (
+                "/opt/homebrew/bin/cursor-agent login; the logged-in Cursor "
+                f"account must include {preflight.EXPECTED_CURSOR}"
+            ),
         )
+
+    def test_cursor_startup_preflight_waits_for_interactive_retries(self) -> None:
+        ok = preflight.subprocess.CompletedProcess(
+            [], 0, f"logged in\n{preflight.EXPECTED_CURSOR}\n", ""
+        )
+        with mock.patch.object(preflight, "_run", return_value=ok) as run:
+            preflight._preflight_cursor(ROOT)
+        startup = run.call_args_list[3]
+        self.assertEqual(
+            startup.args[0][-1],
+            "--triple-stamp-startup-preflight",
+        )
+        self.assertEqual(startup.kwargs["timeout"], 240)
 
     def test_direct_preflight_uses_plain_binary_round_trips(self) -> None:
         claude = preflight.subprocess.CompletedProcess(
@@ -96,6 +119,16 @@ class AuthPreflightTests(unittest.TestCase):
         self.assertEqual(
             claude_argv[claude_argv.index("--effort") + 1],
             "max",
+        )
+        self.assertEqual(claude_argv[claude_argv.index("--tools") + 1], "")
+        self.assertEqual(
+            claude_argv[claude_argv.index("--setting-sources") + 1],
+            "",
+        )
+        self.assertIn("--strict-mcp-config", claude_argv)
+        self.assertEqual(
+            claude_argv[claude_argv.index("--mcp-config") + 1],
+            '{"mcpServers":{}}',
         )
         self.assertEqual(codex_argv[0], "/bundle/.omnigent/codex-launch")
         self.assertIn("--skip-git-repo-check", codex_argv)
