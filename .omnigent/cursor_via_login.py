@@ -42,7 +42,8 @@ CONFIG_PREFLIGHT_ARGS = {
 }
 STARTUP_PREFLIGHT_ARG = "--triple-stamp-startup-preflight"
 STARTUP_ACK_TIMEOUT_SECONDS = 45.0
-STARTUP_PREFLIGHT_TIMEOUT_SECONDS = 20.0
+STARTUP_PREFLIGHT_TIMEOUT_SECONDS = 45.0
+INTERACTIVE_STARTUP_ATTEMPTS = 3
 _STARTUP_STATUS_FILE = "triple-stamp-startup.json"
 _STARTUP_PREFLIGHT_FILE = "cursor-startup-preflight.json"
 _CHAT_ID_RE = re.compile(
@@ -526,6 +527,23 @@ def _file_sizes(root: Path, pattern: str) -> dict[Path, int]:
     return result
 
 
+def _isolated_worker_socket(data_root: Path, logged_socket: str) -> str:
+    """Prefer a logged socket, then any Unix socket under the isolated data dir."""
+
+    candidates: list[str] = []
+    if logged_socket:
+        candidates.append(logged_socket)
+    try:
+        for path in data_root.rglob("*.sock"):
+            candidates.append(str(path))
+    except OSError:
+        pass
+    for value in candidates:
+        if value and not value.startswith("/tmp/.cursor/"):
+            return value
+    return logged_socket
+
+
 def _file_deltas(root: Path, pattern: str, baseline: dict[Path, int]) -> str:
     parts: list[str] = []
     for path in root.glob(pattern):
@@ -575,6 +593,7 @@ def _run_interactive_startup_probe(
         startup_seen = False
         worker_seen = False
         worker_socket = ""
+        dismissed_mcp_prompt = False
         try:
             while time.monotonic() < deadline:
                 for _key, _mask in selector.select(timeout=0.1):
@@ -586,6 +605,17 @@ def _run_interactive_startup_probe(
                         terminal.extend(chunk)
                         if len(terminal) > 16_000:
                             del terminal[:-8_000]
+                screen = terminal.decode("utf-8", errors="replace")
+                if (
+                    not dismissed_mcp_prompt
+                    and "Continue without approval" in screen
+                ):
+                    try:
+                        os.write(master, b"c")
+                    except OSError:
+                        pass
+                    else:
+                        dismissed_mcp_prompt = True
                 debug_delta = _file_deltas(debug_root, "*.log", debug_baseline)
                 worker_delta = _file_deltas(
                     data_root / "projects", "**/worker.log", worker_baseline
@@ -615,6 +645,13 @@ def _run_interactive_startup_probe(
         worker_delta = _file_deltas(
             data_root / "projects", "**/worker.log", worker_baseline
         )
+        if not worker_socket:
+            socket_matches = re.findall(r"runServer socketPath=([^\s]+)", worker_delta)
+            if socket_matches:
+                worker_socket = socket_matches[-1]
+        worker_socket = _isolated_worker_socket(data_root, worker_socket)
+        worker_seen = worker_seen or bool(worker_socket)
+        startup_seen = startup_seen or "startup.metrics" in debug_delta
         socket_is_isolated = bool(worker_socket) and not worker_socket.startswith(
             "/tmp/.cursor/"
         )
@@ -768,9 +805,29 @@ def _run_startup_preflight(cursor: str) -> int:
             return_code=process.returncode,
         )
         return fail(reason, 77)
-    interactive_ok, interactive_diagnostic, interactive_pid, interactive_code, details = (
-        _run_interactive_startup_probe(cursor, chat_id)
-    )
+    interactive_ok = False
+    interactive_diagnostic = ""
+    interactive_pid = 0
+    interactive_code: int | None = None
+    details: dict[str, object] = {}
+    for attempt in range(INTERACTIVE_STARTUP_ATTEMPTS):
+        (
+            interactive_ok,
+            interactive_diagnostic,
+            interactive_pid,
+            interactive_code,
+            details,
+        ) = _run_interactive_startup_probe(cursor, chat_id)
+        if interactive_ok:
+            break
+        fatal_probe = bool(details.get("paid_request_seen")) or (
+            "operation not permitted" in interactive_diagnostic.lower()
+            and "worker.sock" in interactive_diagnostic
+        )
+        if fatal_probe:
+            break
+        if attempt + 1 < INTERACTIVE_STARTUP_ATTEMPTS:
+            time.sleep(1.0)
     if not interactive_ok:
         reason = "Cursor interactive startup preflight failed before prompt-loop readiness"
         _write_startup_preflight(

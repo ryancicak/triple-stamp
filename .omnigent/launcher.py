@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -372,13 +373,69 @@ def _first_executable(label: str, candidates: list[Path]) -> Path:
     _die(f"required {label} executable not found; checked: {', '.join(map(str, candidates))}", 127)
 
 
+def _path_candidates(name: str, canonical: list[Path]) -> list[Path]:
+    """Use supported canonical locations before falling back to caller PATH."""
+
+    candidates = list(canonical)
+    discovered = shutil.which(name, path=os.environ.get("PATH", ""))
+    if discovered:
+        path = Path(discovered).expanduser()
+        candidates.append(path if path.is_absolute() else Path.cwd() / path)
+    return list(dict.fromkeys(candidate.absolute() for candidate in candidates))
+
+
+def _cli_install_prefix(executable: Path) -> Path:
+    """Return the narrow read-only install root needed by a resolved CLI."""
+
+    path = executable.absolute()
+    candidates = tuple(dict.fromkeys((path, path.resolve(strict=False))))
+    for candidate in candidates:
+        parts = candidate.parts
+        for brew_root in (Path("/opt/homebrew"), Path("/usr/local")):
+            try:
+                relative = candidate.relative_to(brew_root)
+            except ValueError:
+                continue
+            relative_parts = relative.parts
+            if (
+                len(relative_parts) >= 4
+                and relative_parts[0] == "Cellar"
+            ):
+                return brew_root.joinpath(*relative_parts[:3])
+            return brew_root
+
+        for marker in (".volta", ".npm-global"):
+            if marker in parts:
+                return Path(*parts[: parts.index(marker) + 1])
+
+        if ".nvm" in parts:
+            marker = parts.index(".nvm")
+            tail = parts[marker + 1 :]
+            if (
+                len(tail) >= 3
+                and tail[0] == "versions"
+                and tail[1] == "node"
+            ):
+                return Path(*parts[: marker + 4])
+            return Path(*parts[: marker + 1])
+
+        if "node-versions" in parts:
+            marker = parts.index("node-versions")
+            if len(parts) > marker + 2 and parts[marker + 2] == "installation":
+                return Path(*parts[: marker + 3])
+
+    return path.parent
+
+
 def _resolve_toolchain(real_home: Path, provider: str | None = None) -> Toolchain:
-    """Resolve tools without accepting ambient executable overrides."""
+    """Resolve required CLIs from PATH and supported macOS locations."""
 
     selected = _provider(provider)
+    invoked_python = Path(sys.executable).absolute()
     omnigent_python = _first_executable(
         "Omnigent Python",
         [
+            invoked_python,
             real_home / ".local/share/uv/tools/omnigent/bin/python",
             real_home / ".local/share/uv/tools/omnigent/bin/python3",
         ],
@@ -410,22 +467,52 @@ def _resolve_toolchain(real_home: Path, provider: str | None = None) -> Toolchai
             "uv",
             [Path("/opt/homebrew/bin/uv"), Path("/usr/local/bin/uv"), real_home / ".local/bin/uv"],
         ),
-        omnigent=_require_executable(real_home / ".local/bin/omnigent", "Omnigent"),
+        omnigent=_first_executable(
+            "Omnigent",
+            [
+                invoked_python.parent / "omnigent",
+                *_path_candidates(
+                    "omnigent",
+                    [real_home / ".local/bin/omnigent"],
+                ),
+            ],
+        ),
         omnigent_python=omnigent_python,
-        cursor_agent=_require_executable(real_home / ".local/bin/cursor-agent", "Cursor Agent"),
+        cursor_agent=_first_executable(
+            "Cursor Agent",
+            _path_candidates(
+                "cursor-agent",
+                [
+                    real_home / ".local/bin/cursor-agent",
+                    real_home / ".cursor/bin/cursor-agent",
+                    Path("/opt/homebrew/bin/cursor-agent"),
+                    Path("/usr/local/bin/cursor-agent"),
+                ],
+            ),
+        ),
         sandbox_exec=_require_executable(Path("/usr/bin/sandbox-exec"), "sandbox-exec"),
         security=_require_executable(Path("/usr/bin/security"), "macOS security"),
         claude=_first_executable(
             "Claude",
-            [real_home / ".local/bin/claude", Path("/usr/local/bin/claude")],
+            _path_candidates(
+                "claude",
+                [
+                    real_home / ".local/bin/claude",
+                    Path("/opt/homebrew/bin/claude"),
+                    Path("/usr/local/bin/claude"),
+                ],
+            ),
         ),
         codex=_first_executable(
             "Codex",
-            [
-                Path("/opt/homebrew/bin/codex"),
-                Path("/usr/local/bin/codex"),
-                real_home / ".local/bin/codex",
-            ],
+            _path_candidates(
+                "codex",
+                [
+                    Path("/opt/homebrew/bin/codex"),
+                    Path("/usr/local/bin/codex"),
+                    real_home / ".local/bin/codex",
+                ],
+            ),
         ),
     )
 
@@ -585,19 +672,45 @@ def _validate_versions(
     host_env: dict[str, str],
     provider: str,
 ) -> None:
-    version_check = _run(
-        [
-            str(tools.omnigent_python),
-            "-I",
-            "-c",
-            "from importlib.metadata import version; print(version('omnigent'))",
-        ],
+    # Accept the pinned stable line (0.12.x) or the released native line
+    # (0.14.x) only when every launcher/runtime-required surface resolves.
+    # The compatibility module owns the version policy, the 0.14 module
+    # relocation map, and the capability probe; it fails closed otherwise.
+    compat_module = (
+        Path(__file__).resolve().parent
+        / "runtime-python"
+        / "triple_stamp_omnigent_compat.py"
+    )
+    version_probe = _run(
+        [str(tools.omnigent_python), "-I", str(compat_module), "--probe"],
         env=host_env,
     )
-    if version_check.returncode or version_check.stdout.strip() != "0.12.0":
+    try:
+        status = json.loads(version_probe.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError, json.JSONDecodeError):
+        status = {}
+    if (
+        version_probe.returncode
+        or not isinstance(status, dict)
+        or not status.get("omnigent_version")
+    ):
         _die(
-            "the stable runtime must be exactly Omnigent 0.12.0; "
-            f"got {version_check.stdout.strip() or version_check.stderr.strip() or 'unknown'}",
+            "could not determine the Omnigent runtime version; got "
+            f"{version_probe.stdout.strip() or version_probe.stderr.strip() or 'unknown'}",
+            127,
+        )
+    omnigent_version = str(status.get("omnigent_version"))
+    if not status.get("supported"):
+        _die(
+            "the stable runtime must be Omnigent 0.12.x or 0.14.x; "
+            f"got {omnigent_version}",
+            127,
+        )
+    if not status.get("surfaces_ok"):
+        missing = ", ".join(status.get("missing_surfaces") or []) or "unknown"
+        _die(
+            f"Omnigent {omnigent_version} is missing launcher-required "
+            f"surfaces: {missing}",
             127,
         )
     sdk_check = _run(
@@ -623,6 +736,79 @@ def _validate_versions(
         if isaac_version.returncode or "Version: 2." not in isaac_version_text:
             _die(
                 "Isaac 2.x is required; `isaac version` did not report a 2.x release",
+                127,
+            )
+
+
+def _omnigent_runtime_version(stable_python: str, env: dict[str, str]) -> str:
+    """Return the installed Omnigent version for the self-test summary line.
+
+    Reports the actual runtime version (0.12.x or 0.14.x) rather than a
+    hardcoded string. Falls back to ``"unknown"`` if the probe fails.
+    """
+
+    probe = _run(
+        [
+            str(stable_python),
+            "-I",
+            "-c",
+            "from importlib.metadata import version; print(version('omnigent'))",
+        ],
+        env=env,
+    )
+    version = probe.stdout.strip()
+    return version if not probe.returncode and version else "unknown"
+
+
+def _ensure_claude_agent_sdk_pin(
+    tools: Toolchain,
+    host_env: dict[str, str],
+) -> None:
+    """Repair uv's newer transitive SDK selection before strict validation."""
+
+    check_argv = [
+        str(tools.omnigent_python),
+        "-I",
+        "-c",
+        "from importlib.metadata import version; print(version('claude-agent-sdk'))",
+    ]
+    check = _run(check_argv, env=host_env)
+    if check.returncode == 0 and check.stdout.strip() == "0.2.152":
+        return
+    with _PluginInstallLock(tools.omnigent_python):
+        # Another launcher using this managed interpreter may have repaired it
+        # while this process waited for the shared installation lock.
+        check = _run(check_argv, env=host_env)
+        if check.returncode == 0 and check.stdout.strip() == "0.2.152":
+            return
+        _eprint(
+            "triple-stamp: pinning claude-agent-sdk 0.2.152 in the "
+            "Omnigent tool environment..."
+        )
+        install = _run(
+            [
+                str(tools.uv),
+                "pip",
+                "install",
+                "--python",
+                str(tools.omnigent_python),
+                "claude-agent-sdk==0.2.152",
+            ],
+            env=host_env,
+            timeout=180,
+        )
+        if install.returncode:
+            detail = _sanitize_plugin_output(
+                install.stderr.strip()
+                or install.stdout.strip()
+                or "no installer output"
+            )
+            _die(
+                "could not pin claude-agent-sdk 0.2.152 in the Omnigent tool "
+                f"environment (uv exited {install.returncode}): {detail}\nRun: "
+                f"{shlex.quote(str(tools.uv))} pip install --python "
+                f"{shlex.quote(str(tools.omnigent_python))} "
+                "claude-agent-sdk==0.2.152",
                 127,
             )
 
@@ -746,10 +932,22 @@ raise SystemExit(0 if ok else 1)
 
 
 class _PluginInstallLock:
-    """Serialize changes to the shared managed-Python plugin metadata."""
+    """Serialize package mutations by target managed-Python interpreter."""
 
-    def __init__(self, root: Path) -> None:
-        self.path = root / ".omnigent/isaac-launcher/.install.lock"
+    def __init__(self, interpreter: Path) -> None:
+        identity = hashlib.sha256(
+            str(interpreter.resolve(strict=False)).encode("utf-8")
+        ).hexdigest()[:24]
+        # Keep the lock inside the per-uid ``/tmp/claude-<uid>`` scratch root,
+        # which the outer Seatbelt grants for writes (see build_outer_seatbelt).
+        # It stays interpreter-keyed and shared across worktrees that use the
+        # same managed Python, but no longer lands on a sandbox-denied path.
+        self.path = (
+            Path("/tmp")
+            / f"claude-{os.getuid()}"
+            / "omnigent-triple-stamp-install-locks"
+            / f"{identity}.lock"
+        )
         self.handle: object | None = None
 
     def __enter__(self) -> Self:
@@ -829,6 +1027,7 @@ def _sanitize_plugin_output(text: str) -> str:
         r"\1 [REDACTED]",
         text,
     )
+    sanitized = re.sub(r"https?://[^\s]+", "[REDACTED_URL]", sanitized)
     return sanitized[-4000:]
 
 
@@ -876,7 +1075,7 @@ def _ensure_plugin(
     tools: Toolchain,
     host_env: dict[str, str],
 ) -> None:
-    with _PluginInstallLock(root):
+    with _PluginInstallLock(tools.omnigent_python):
         status, check = _plugin_probe(root, tools, host_env)
         if check.returncode == 0 and status.get("ok") is True:
             return
@@ -1077,7 +1276,12 @@ def _copy_tree(source: Path, destination: Path) -> None:
         shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
 
 
-def _seed_isolated_home(root: Path, real_home: Path, isolated_home: Path) -> None:
+def _seed_isolated_home(
+    root: Path,
+    real_home: Path,
+    isolated_home: Path,
+    stable_python: Path,
+) -> None:
     isolated_home.mkdir(mode=0o700, parents=True)
     for relative in (
         ".claude/settings.json",
@@ -1105,6 +1309,13 @@ def _seed_isolated_home(root: Path, real_home: Path, isolated_home: Path) -> Non
 
     for relative in (".claude/plugins", ".omnigent", ".cursor", ".local/bin"):
         (isolated_home / relative).mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Ephemeral HOME is always a first launch for Omnigent's TUI. Persist a
+    # theme so the startup picker does not block the documented prompt.
+    (isolated_home / ".omnigent/config.yaml").write_text(
+        "tui:\n  theme: dark\n",
+        encoding="utf-8",
+    )
+    (isolated_home / ".omnigent/config.yaml").chmod(0o600)
     (isolated_home / ".local/share").symlink_to(real_home / ".local/share", target_is_directory=True)
     (isolated_home / ".cache").mkdir(mode=0o700)
     (isolated_home / ".cache/isaac").symlink_to(
@@ -1118,7 +1329,6 @@ def _seed_isolated_home(root: Path, real_home: Path, isolated_home: Path) -> Non
     (isolated_home / "Library/Caches/dbexec").symlink_to(
         real_home / "Library/Caches/dbexec", target_is_directory=True
     )
-    stable_python = real_home / ".local/share/uv/tools/omnigent/bin/python"
     for name in ("python", "python3"):
         (isolated_home / ".local/bin" / name).symlink_to(stable_python)
     for executable in (real_home / ".local/bin").glob("*"):
@@ -1281,9 +1491,21 @@ def _runtime_env(
         "SHELL": os.environ.get("SHELL", "/bin/zsh"),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "PWD": str(root),
-        "PATH": (
-            f"{isolated_home}/.local/bin:/usr/local/bin:/opt/homebrew/bin:"
-            "/usr/bin:/bin:/usr/sbin:/sbin"
+        "PATH": ":".join(
+            dict.fromkeys(
+                (
+                    str(isolated_home / ".local/bin"),
+                    str(tools.cursor_agent.parent),
+                    str(tools.claude.parent),
+                    str(tools.codex.parent),
+                    "/usr/local/bin",
+                    "/opt/homebrew/bin",
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/sbin",
+                    "/sbin",
+                )
+            )
         ),
         "TMPDIR": str(temp_dir),
         "PEX_ROOT": str(run_dir / "pex"),
@@ -1377,6 +1599,13 @@ def _build_profile_and_bundle(
 ) -> tuple[Path, Path]:
     profile = run_dir / "outer-seatbelt.sb"
     bundle = run_dir / "bundle"
+    cli_read_dirs = sorted(
+        {
+            str(_cli_install_prefix(tools.cursor_agent)),
+            str(_cli_install_prefix(tools.claude)),
+            str(_cli_install_prefix(tools.codex)),
+        }
+    )
     build = _run(
         [
             str(tools.omnigent_python),
@@ -1388,6 +1617,7 @@ def _build_profile_and_bundle(
             str(bundle),
             str(real_home),
             str(VOICE_PROFILE) if VOICE_PROFILE else "",
+            json.dumps(cli_read_dirs, separators=(",", ":")),
         ],
         env=runtime_env,
         timeout=60,
@@ -1590,6 +1820,19 @@ def _sandboxed_auth_preflight(
     )
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        preflight_status = run_dir / "cursor-startup-preflight.json"
+        try:
+            payload = json.loads(preflight_status.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            extras = [
+                str(payload.get("reason") or ""),
+                str(payload.get("stderr") or "")[:1500],
+            ]
+            extra = "\n".join(part for part in extras if part and part not in detail)
+            if extra:
+                detail = f"{detail}\n{extra}"
         raise LaunchError(
             detail,
             EXIT_AUTH if result.returncode == EXIT_AUTH else EXIT_CONFIG,
@@ -1607,7 +1850,13 @@ def _managed_cursor_entry(value: object, run_root: Path | None = None) -> bool:
     command = value.get("command")
     arg_values = args if isinstance(args, list) else []
     text = " ".join([str(command or ""), *(str(arg) for arg in arg_values)])
-    if "omnigent.claude_native_bridge" not in text or "serve-mcp" not in text:
+    # Match either the 0.12 module path or the 0.14 relocated harness path so
+    # managed Cursor entries are still detected for teardown on both runtimes.
+    bridge_tokens = (
+        "omnigent.claude_native_bridge",
+        "omnigent.harnesses.claude_native.bridge",
+    )
+    if not any(token in text for token in bridge_tokens) or "serve-mcp" not in text:
         return False
     return run_root is None or str(run_root) in text or "/omnigent-triple-stamp-" in text
 
@@ -1642,8 +1891,12 @@ def _remove_managed_cursor_files(root: Path, run_root: Path | None = None) -> No
             text = hooks_path.read_text(encoding="utf-8")
         except OSError:
             text = ""
+        usage_tokens = (
+            "omnigent.cursor_native_usage",
+            "omnigent.harnesses.cursor_native.usage",
+        )
         if (
-            "omnigent.cursor_native_usage" in text
+            any(token in text for token in usage_tokens)
             and (run_root is None or str(run_root) in text or "/omnigent-triple-stamp-" in text)
         ):
             hooks_path.unlink(missing_ok=True)
@@ -1822,6 +2075,11 @@ def _prepare_runtime(
     selected_models = _explicit_model_overrides(
         models or _provider_models(root, selected_provider)
     )
+    # The Isaac plugin is an editable install into the shared Omnigent
+    # environment. Re-bind it to *this* clone before generating Seatbelt,
+    # otherwise a leftover install from another checkout is imported from
+    # outside the read root and the runtime-guard probe dies with EPERM.
+    _ensure_plugin(root, tools, _host_env(real_home))
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=base_dir))
     harness_tmp: Path | None = None
     try:
@@ -1854,7 +2112,12 @@ def _prepare_runtime(
         harness_tmp = Path("/tmp") / f"ots-{os.getuid()}-{secrets.token_hex(4)}"
         harness_tmp.symlink_to(run_dir / "h", target_is_directory=True)
         (run_dir / "harness-link").write_text(str(harness_tmp) + "\n", encoding="utf-8")
-        _seed_isolated_home(root, real_home, run_dir / "home")
+        _seed_isolated_home(
+            root,
+            real_home,
+            run_dir / "home",
+            tools.omnigent_python,
+        )
         _seed_cursor_home(run_dir, harness_tmp)
         _copy_file(real_home / ".kube/config", run_dir / "kube/config")
         if selected_provider == "databricks":
@@ -2153,17 +2416,25 @@ def _inner_validate(root: Path, args: list[str]) -> int:
             )
         regression_counts: dict[str, str] = {}
         for matrix_provider, _matrix_bundle, matrix_env in validation_cases:
+            # Install the 0.14 compatibility layer (relocated-module aliases +
+            # changed-signature shims) before test discovery, so tests that
+            # import legacy Omnigent paths or call adapted functions behave the
+            # same on 0.12 and 0.14. A no-op on 0.12.
+            regression_bootstrap = (
+                "import sys, unittest;"
+                f"sys.path.insert(0, {str(root / '.omnigent/runtime-python')!r});"
+                "import triple_stamp_omnigent_compat as _compat;"
+                "_compat.install_all();"
+                "unittest.main(module=None, argv=["
+                "'triple-stamp-regressions', 'discover',"
+                f" '-s', {str(root / 'tests')!r}, '-p', 'test_*.py'])"
+            )
             regressions = _run(
                 [
                     stable_python,
                     "-I",
-                    "-m",
-                    "unittest",
-                    "discover",
-                    "-s",
-                    str(root / "tests"),
-                    "-p",
-                    "test_*.py",
+                    "-c",
+                    regression_bootstrap,
                 ],
                 env=matrix_env,
                 timeout=180,
@@ -2183,9 +2454,14 @@ def _inner_validate(root: Path, args: list[str]) -> int:
                     "test-count summary"
                 )
             regression_counts[matrix_provider] = regression_summary.group(1)
+        omnigent_runtime_version = _omnigent_runtime_version(
+            stable_python, dict(os.environ)
+        )
         print("triple-stamp self-test: PASS")
         print("  outer Seatbelt: active (positive + negative probes passed)")
-        print("  runtime: Omnigent 0.12.0, per-run HOME/state/tmp")
+        print(
+            f"  runtime: Omnigent {omnigent_runtime_version}, per-run HOME/state/tmp"
+        )
         for matrix_provider, regression_count in regression_counts.items():
             print(
                 f"  regression tests ({matrix_provider}): "
@@ -2794,11 +3070,10 @@ def _retain_runtime_diagnostics(
     *,
     models_started: bool,
     keep_runtime: bool,
-    return_code: int,
+    return_code: int | None,
 ) -> bool:
-    """Retain every model-started failure and its terminal attestation."""
-
-    return models_started and (keep_runtime or return_code != 0)
+    del models_started
+    return keep_runtime or return_code != 0
 
 
 def _outer_main(root: Path, args: list[str]) -> int:
@@ -2815,6 +3090,7 @@ def _outer_main(root: Path, args: list[str]) -> int:
     voice_profile_sha256 = _validate_voice_profile(VOICE_PROFILE)
     tools = _resolve_toolchain(real_home, provider)
     host_env = _host_env(real_home)
+    _ensure_claude_agent_sdk_pin(tools, host_env)
     _validate_versions(tools, host_env, provider)
     managed_python = (
         _ensure_isaac_runtime(tools, host_env, real_home)
@@ -2860,17 +3136,21 @@ def _outer_main(root: Path, args: list[str]) -> int:
     run_return_code: int | None = None
     try:
         _sandbox_probe(tools, profile, runtime_env)
-        _sandboxed_auth_preflight(
-            root,
-            run_dir,
-            run_id,
-            tools,
-            profile,
-            runtime_env,
-        )
-        # The expensive/native harnesses have not started yet. Acquire the
-        # workspace lock only after the exact isolated environment is healthy.
+        # Workspace Cursor configuration is shared state. Hold the run lock
+        # before removing stale managed entries or probing Cursor so a rejected
+        # concurrent invocation cannot disrupt the active run.
         with _RunLock(lock_path):
+            # Stale managed MCP entries make Cursor's TUI wait on
+            # "Approve all servers" and prevent prompt-loop readiness.
+            _remove_managed_cursor_files(root)
+            _sandboxed_auth_preflight(
+                root,
+                run_dir,
+                run_id,
+                tools,
+                profile,
+                runtime_env,
+            )
             _cleanup_stale_runs(base_dir, keep=run_dir)
             _remove_managed_cursor_files(root)
             hooks_snapshot = _snapshot_cursor_file(root, "hooks.json")

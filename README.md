@@ -47,13 +47,53 @@
 
 ## Install
 
+Clone it and run it:
+
 ```bash
-uv tool install omnigent==0.12.0   # once
-cursor-agent login                 # once
-./triple-stamp                     # every time
+git clone https://github.com/ryancicak/triple-stamp
+cd triple-stamp
+./triple-stamp
 ```
 
-> **Reference implementation.** It expects Databricks-internal infrastructure: the package proxy, Opus's Glean, Jira, Slack, Confluence, and SAFE access, and a Cursor account entitled to Grok 4.6 Extra High. Outside that environment the install will not finish. The full design stays readable in `config.yaml` and `agents/*/config.yaml`.
+That is the whole setup. The first run:
+
+- installs `uv` into your user account if needed;
+- uses an existing compatible Omnigent `0.12.x` or `0.14.x`, or installs a
+  private Omnigent `0.14` runtime on Python 3.13;
+- repairs `claude-agent-sdk` to the required `0.2.152`;
+- installs Cursor Agent, Claude Code, and Codex from their official installers;
+- opens browser login only for a CLI that is not already authenticated;
+- verifies the exact models, sandbox, runtime surfaces, and bundle before any
+  research starts; and
+- opens the browser UI and interactive terminal.
+
+It never uses `sudo`, replaces another Omnigent installation, or silently
+substitutes a cheaper model. Setup is idempotent, so every later run quickly
+re-verifies the same invariants and starts.
+
+On a Databricks SA laptop, existing managed Claude/Codex routing and credentials
+are detected and preserved. On a vanilla Mac, the three public account logins
+are used. Either way, the command is still just `./triple-stamp`.
+
+The account must actually include Cursor Grok 4.6 Extra High, Claude Opus 5, and
+the configured Codex model. A script can install software and open login pages;
+it cannot grant model entitlements. Missing entitlement therefore fails closed
+with the exact account/model that needs attention.
+
+To bootstrap the required tools (if needed) and run live entitlement/model
+checks without starting a research run:
+
+```bash
+./triple-stamp --self-test
+```
+
+Automation escape hatches are intended for CI and troubleshooting:
+
+- `TRIPLE_STAMP_BOOTSTRAP=0` disables first-run installation.
+- `TRIPLE_STAMP_BOOTSTRAP_OFFLINE=1` permits only already-installed tools.
+- `TRIPLE_STAMP_BOOTSTRAP_OMNIGENT_VERSION=0.12.0` makes a newly created private
+  runtime use the other supported line. Existing compatible `0.12` or `0.14`
+  runtimes are always accepted after capability verification.
 
 ## Use
 
@@ -101,7 +141,7 @@ There is one catch, and it is on purpose. If a question needs internal evidence 
   <sub>
     answer relayed byte for byte
     &nbsp;·&nbsp; optional saved voice via <code>TRIPLE_STAMP_VOICE_PROFILE</code>
-    &nbsp;·&nbsp; <code>./triple-stamp --self-test</code> checks the install without starting a research run
+    &nbsp;·&nbsp; <code>./triple-stamp --self-test</code> may install missing tools, open first-time login, and perform live model checks without starting a research run
     &nbsp;·&nbsp; macOS only
   </sub>
 </p>

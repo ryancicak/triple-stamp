@@ -204,7 +204,8 @@ def _preflight_cursor(root: Path) -> None:
     status = _run([wrapper, "status"], timeout=30)
     models = _run([wrapper, "models"], timeout=30)
     config = _run([wrapper, "--triple-stamp-config-preflight"], timeout=30)
-    startup = _run([wrapper, "--triple-stamp-startup-preflight"], timeout=30)
+    # create-chat (45s) plus up to 3 interactive TUI probes (45s each, 1s gap)
+    startup = _run([wrapper, "--triple-stamp-startup-preflight"], timeout=240)
     if (
         status.returncode
         or models.returncode
@@ -223,7 +224,10 @@ def _preflight_cursor(root: Path) -> None:
         raise PreflightError(
             "Cursor",
             detail,
-            f"{_real_home() / '.local/bin/cursor-agent'} login",
+            (
+                f"{os.environ.get('CURSOR_AGENT_BIN', 'cursor-agent')} login; "
+                f"the logged-in Cursor account must include {EXPECTED_CURSOR}"
+            ),
         )
 
 
@@ -391,6 +395,14 @@ def _direct_round_trip(root: Path) -> None:
             EXPECTED_OPUS,
             "--effort",
             "max",
+            "--tools",
+            "",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--disable-slash-commands",
             "--print",
             "Reply with exactly: DIRECT_CLAUDE_OK",
         ],

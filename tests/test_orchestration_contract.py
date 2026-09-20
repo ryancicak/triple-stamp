@@ -4986,11 +4986,21 @@ print("exact temp boundary: PASS")
                 "ALLOW",
             )
 
-    def test_auth_preflight_precedes_lock_and_model_launch(self) -> None:
+    def test_lock_precedes_workspace_mutation_auth_and_model_launch(self) -> None:
         source = (ROOT / ".omnigent/launcher.py").read_text(encoding="utf-8")
         outer = source[source.index("def _outer_main") :]
-        self.assertLess(outer.index("_sandboxed_auth_preflight("), outer.index("with _RunLock"))
-        self.assertLess(outer.index("with _RunLock"), outer.index("_spawn_sandboxed("))
+        self.assertLess(
+            outer.index("with _RunLock"),
+            outer.index("_remove_managed_cursor_files(root)"),
+        )
+        self.assertLess(
+            outer.index("_remove_managed_cursor_files(root)"),
+            outer.index("_sandboxed_auth_preflight("),
+        )
+        self.assertLess(
+            outer.index("_sandboxed_auth_preflight("),
+            outer.index("_spawn_sandboxed("),
+        )
 
     def test_concurrent_launch_lock_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -5280,11 +5290,18 @@ print("exact temp boundary: PASS")
                 return_code=0,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             launcher._retain_runtime_diagnostics(
                 models_started=False,
                 keep_runtime=True,
-                return_code=launcher.EXIT_PIPELINE,
+                return_code=0,
+            )
+        )
+        self.assertTrue(
+            launcher._retain_runtime_diagnostics(
+                models_started=False,
+                keep_runtime=False,
+                return_code=None,
             )
         )
 
