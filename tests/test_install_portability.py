@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shlex
 import stat
 import sys
@@ -36,6 +37,27 @@ class InstallPortabilityTests(unittest.TestCase):
             claude=Path("/custom/npm/bin/claude"),
             codex=Path("/custom/npm/bin/codex"),
         )
+
+    def test_host_env_preserves_package_network_config_but_not_secrets(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UV_DEFAULT_INDEX": "https://packages.example/simple/",
+                "PIP_EXTRA_INDEX_URL": "https://extra.example/simple/",
+                "https_proxy": "https://proxy.example",
+                "OPENAI_API_KEY": "do-not-forward",
+            },
+            clear=True,
+        ):
+            env = launcher._host_env(Path("/tmp/real-home"))
+        self.assertEqual(
+            env["UV_DEFAULT_INDEX"], "https://packages.example/simple/"
+        )
+        self.assertEqual(
+            env["PIP_EXTRA_INDEX_URL"], "https://extra.example/simple/"
+        )
+        self.assertEqual(env["https_proxy"], "https://proxy.example")
+        self.assertNotIn("OPENAI_API_KEY", env)
 
     def test_newer_sdk_is_repaired_with_exact_pin(self) -> None:
         check = launcher.subprocess.CompletedProcess([], 0, "0.2.153\n", "")

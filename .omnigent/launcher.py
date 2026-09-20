@@ -563,6 +563,17 @@ def _host_env(real_home: Path) -> dict[str, str]:
         "HTTPS_PROXY",
         "HTTP_PROXY",
         "NO_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "no_proxy",
+        "UV_DEFAULT_INDEX",
+        "UV_INDEX",
+        "UV_INDEX_URL",
+        "UV_EXTRA_INDEX_URL",
+        "UV_KEYRING_PROVIDER",
+        "UV_NATIVE_TLS",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
     ):
         if value := os.environ.get(name):
             env[name] = value
