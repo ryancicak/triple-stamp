@@ -17,6 +17,7 @@ if (umask 077 && : >"$PROBE") 2>/dev/null; then
 fi
 
 exec /usr/bin/env \
+  -u PYTHONPATH \
   ISAAC_DEFAULT_UCODE=0 \
   ISAAC_LAUNCH_MODE=omni \
   ISAAC_DISABLE_MAC_MANAGED_SETTINGS_UPDATE=1 \

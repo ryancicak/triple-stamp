@@ -151,7 +151,6 @@ def validate_text_files(root: Path) -> None:
     paths = [
         root / "README.md",
         root / "AGENTS.md",
-        root / "run-with-isaac",
         root / "verify-provider-matrix",
         root / "config.yaml",
         root / ".omnigent/config.yaml",
