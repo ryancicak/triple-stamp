@@ -23,4 +23,4 @@ TRIPLE_STAMP_PROVIDER=databricks \
 
 echo "== exact Seatbelt: direct + databricks validators/tests =="
 TRIPLE_STAMP_PROVIDER=databricks TRIPLE_STAMP_PROFILE_MATRIX=1 \
-  "$ROOT/run-with-isaac" --self-test
+  "$ROOT/triple-stamp" --self-test

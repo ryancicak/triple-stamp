@@ -99,6 +99,12 @@ def main() -> None:
         str(runtime_dir),
         f"/tmp/claude-{os.getuid()}",
     }
+    provider = os.environ.get("TRIPLE_STAMP_PROVIDER", "direct")
+    if provider == "databricks":
+        # Isaac installs and repairs its private Codex distribution here. The
+        # isolated HOME exposes this exact directory through a symlink; keep
+        # the broader ~/.local/share tree read-only.
+        write_paths.add(str(real_home / ".local/share/isaac"))
     harness_tmp = os.environ.get("OMNIGENT_HARNESS_TMP_PARENT", "").strip()
     if harness_tmp:
         harness_path = Path(harness_tmp)
@@ -138,7 +144,6 @@ def main() -> None:
             "TRIPLE_STAMP_CURSOR_HOME",
         ],
     )
-    provider = os.environ.get("TRIPLE_STAMP_PROVIDER", "direct")
     if provider == "databricks":
         launch_executable = os.environ["ISAAC_BIN"]
     elif provider == "direct":

@@ -447,6 +447,10 @@ class InstallPortabilityTests(unittest.TestCase):
         self.assertIn("CLI_READ_DIRS_JSON", seatbelt_builder)
         self.assertIn("OMNIGENT_HARNESS_TMP_PARENT", seatbelt_builder)
         self.assertIn("sys.prefix", seatbelt_builder)
+        self.assertIn(
+            'write_paths.add(str(real_home / ".local/share/isaac"))',
+            seatbelt_builder,
+        )
         plugin_meta = (
             ROOT / ".omnigent/isaac-launcher/pyproject.toml"
         ).read_text(encoding="utf-8")

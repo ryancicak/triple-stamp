@@ -641,6 +641,10 @@ class OrchestrationContractTests(unittest.TestCase):
         )
 
     def test_provider_profiles_select_exact_child_launchers(self) -> None:
+        isaac_codex_wrapper = (
+            ROOT / ".omnigent/codex-via-isaac"
+        ).read_text(encoding="utf-8")
+        self.assertIn("-u PYTHONPATH", isaac_codex_wrapper)
         common = dict(
             root=ROOT,
             real_home=Path("/Users/unit"),
