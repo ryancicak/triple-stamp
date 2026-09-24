@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ _CURSOR_STAGE_INACTIVITY_S = 5 * 60
 _CURSOR_STAGE_ABSOLUTE_S = 15 * 60
 _CURSOR_POST_CLAIM_S = 30.0
 _INBOX_TIME_CONTRACT_S = 5.0
+_CURSOR_PARENT_WAKE_RETRY_BASE_S = 1.0
+_CURSOR_PARENT_WAKE_RETRY_MAX_S = 30.0
+_CURSOR_PARENT_WAKE_MAX_ATTEMPTS = 5
+_CURSOR_PARENT_WAKE_DEADLINE_S = 180.0
 _NO_OUTPUT = "[System: sub-agent completed with no output]"
 _PENDING_PREFIX = "[System: sub-agent task pending —"
 _MISSING_PARENT_INBOX = "Error: sys_session_send requires parent session inbox"
@@ -33,6 +38,22 @@ _MISSING_PARENT_INBOX_TERMINAL = (
 _OPUS_UNKNOWN_COMPLETION_PREFIX = (
     "PIPELINE_INFRASTRUCTURE_ERROR: Opus native dispatch timed out after "
     "child creation; completion is unknown and duplicate paid launch is forbidden"
+)
+_DUPLICATE_CURSOR_DISPATCH = (
+    "Error: duplicate Cursor dispatch denied; this attempt already dispatched "
+    "or completed that cycle, or advanced to a later stage"
+)
+_DUPLICATE_OPUS_RETRY_DISPATCH = (
+    "Error: duplicate paid Opus retry denied; this attempt/cycle already "
+    "dispatched its one reserved retry"
+)
+_TERMINAL_DISPATCH_NOOP = json.dumps(
+    {
+        "result": "NOOP",
+        "suppressed": True,
+        "reason": "parent attempt is already terminal",
+    },
+    separators=(",", ":"),
 )
 _DISPATCH_BOOKKEEPING_ERRORS = (
     AttributeError,
@@ -46,6 +67,386 @@ PARENT_INBOX_PROBE_VALUE = "v1"
 PARENT_INBOX_READY = "TRIPLE_STAMP_PARENT_INBOX_READY:v1"
 _parent_inbox_failures: dict[str, str] = {}
 _unknown_opus_dispatches: dict[str, str] = {}
+_CursorWakeKey = tuple[str, str, str]
+_cursor_parent_wake_tasks: dict[_CursorWakeKey, asyncio.Task[None]] = {}
+
+
+async def _cursor_parent_wake_retry_sleep(seconds: float) -> None:
+    """Pace stranded parent-wake retries without a hot loop."""
+
+    await asyncio.sleep(seconds)
+
+
+async def _retry_cursor_parent_wake(
+    *,
+    client: Any,
+    parent_session_id: str,
+    child_session_id: str,
+    work_id: str,
+    notice: str,
+    created_by: str | None,
+    started_at_monotonic: float | None = None,
+) -> None:
+    """Retry one queued Cursor completion, then terminalize if unreachable."""
+
+    from omnigent.runner import app as runner_app
+    from triple_stamp_runtime_state import (
+        mutate_cursor_lifecycle,
+        read_dispatches,
+        record_terminal_failure,
+    )
+
+    attempts = 0
+    started = (
+        started_at_monotonic
+        if started_at_monotonic is not None
+        else time.monotonic()
+    )
+    while (
+        attempts < _CURSOR_PARENT_WAKE_MAX_ATTEMPTS
+        and time.monotonic() - started < _CURSOR_PARENT_WAKE_DEADLINE_S
+    ):
+        remaining = _CURSOR_PARENT_WAKE_DEADLINE_S - (
+            time.monotonic() - started
+        )
+        if remaining <= 0:
+            break
+        attempts += 1
+        try:
+            delivered = await asyncio.wait_for(
+                runner_app._deliver_subagent_wake_post(
+                    client,
+                    parent_session_id,
+                    notice,
+                    created_by=created_by,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - stranded wake remains retryable
+            delivered = False
+
+        def observe(
+            generation: dict[str, Any],
+            _state: dict[str, Any],
+        ) -> None:
+            generation["parent_wake_attempts"] = attempts
+            generation["parent_wake_pending"] = not delivered
+            if delivered:
+                generation["parent_wake_delivered_at_ns"] = time.time_ns()
+
+        mutate_cursor_lifecycle(child_session_id, work_id, observe)
+        if delivered:
+            return
+        elapsed = time.monotonic() - started
+        if (
+            attempts >= _CURSOR_PARENT_WAKE_MAX_ATTEMPTS
+            or elapsed >= _CURSOR_PARENT_WAKE_DEADLINE_S
+        ):
+            break
+        delay = min(
+            _CURSOR_PARENT_WAKE_RETRY_BASE_S * (2 ** min(attempts - 1, 8)),
+            _CURSOR_PARENT_WAKE_RETRY_MAX_S,
+            max(0.0, _CURSOR_PARENT_WAKE_DEADLINE_S - elapsed),
+        )
+        await _cursor_parent_wake_retry_sleep(delay)
+
+    dispatch = next(
+        (
+            record
+            for record in reversed(read_dispatches())
+            if record.get("child_session_id") == child_session_id
+            and record.get("work_id") == work_id
+        ),
+        {},
+    )
+    reason = (
+        "Cursor parent wake exhausted its bounded recovery "
+        f"(attempts={attempts}, deadline_s={_CURSOR_PARENT_WAKE_DEADLINE_S:.0f}); "
+        "the terminal packet remains queued locally"
+    )
+    failure = record_terminal_failure(
+        "PIPELINE_INFRASTRUCTURE_ERROR",
+        reason,
+        stage=str(dispatch.get("title") or "cursor-parent-wake"),
+        cycle=int(dispatch.get("cycle") or 0),
+        parent_session_id=parent_session_id,
+    )
+    parent_events = runner_app._session_event_queues_ref.setdefault(
+        parent_session_id,
+        asyncio.Queue(),
+    )
+    parent_events.put_nowait(
+        {
+            "type": "session.status",
+            "status": "failed",
+            "error": {
+                "type": "CursorParentWakeExhausted",
+                "message": failure,
+            },
+        }
+    )
+    inbox = ensure_parent_inbox(parent_session_id)
+    queued = False
+    for packet in tuple(inbox._queue):  # type: ignore[attr-defined]
+        if (
+            isinstance(packet, dict)
+            and packet.get("work_id") == work_id
+            and packet.get("conversation_id") == child_session_id
+        ):
+            packet["status"] = "failed"
+            packet["output"] = failure
+            queued = True
+            break
+    entry = runner_app.get_subagent_work(child_session_id)
+    if entry is not None:
+        entry.status = "failed"
+        entry.output = failure
+        entry.completed_at = time.time()
+        entry.delivered = True
+    if not queued:
+        inbox.put_nowait(
+            {
+                "type": "sub_agent",
+                "work_id": work_id,
+                "task_id": child_session_id,
+                "handle_id": child_session_id,
+                "conversation_id": child_session_id,
+                "tool_name": (
+                    entry.agent if entry is not None else "cursor_workhorse"
+                ),
+                "agent": (
+                    entry.agent if entry is not None else "cursor_workhorse"
+                ),
+                "title": (
+                    entry.title
+                    if entry is not None
+                    else str(dispatch.get("title") or "")
+                ),
+                "status": "failed",
+                "output": failure,
+            }
+        )
+
+    def terminalize(
+        generation: dict[str, Any],
+        _state: dict[str, Any],
+    ) -> None:
+        generation["parent_wake_attempts"] = attempts
+        generation["parent_wake_pending"] = False
+        generation["parent_wake_exhausted"] = True
+        generation["parent_notification_queued"] = True
+        generation["delivery_committed"] = False
+        generation["terminal_status"] = "failed"
+        generation["terminal_output"] = failure
+        generation["terminal_phase"] = "wake_exhausted"
+
+    mutate_cursor_lifecycle(child_session_id, work_id, terminalize)
+
+
+def _schedule_cursor_parent_wake_retry(
+    *,
+    client: Any,
+    parent_session_id: str,
+    child_session_id: str,
+    work_id: str,
+    notice: str,
+    created_by: str | None,
+    started_at_monotonic: float | None = None,
+) -> None:
+    """Keep exactly one paced stranded-wake task per child generation."""
+
+    key = (parent_session_id, child_session_id, work_id)
+    existing = _cursor_parent_wake_tasks.get(key)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _retry_cursor_parent_wake(
+            client=client,
+            parent_session_id=parent_session_id,
+            child_session_id=child_session_id,
+            work_id=work_id,
+            notice=notice,
+            created_by=created_by,
+            started_at_monotonic=started_at_monotonic,
+        ),
+        name=f"triple-stamp-cursor-wake-{parent_session_id}",
+    )
+    _cursor_parent_wake_tasks[key] = task
+
+    def clear(completed: asyncio.Task[None]) -> None:
+        if _cursor_parent_wake_tasks.get(key) is completed:
+            _cursor_parent_wake_tasks.pop(key, None)
+
+    task.add_done_callback(clear)
+
+
+def _cursor_retry_note(title: str) -> str:
+    """Name the sole fresh retry for an original Cursor cycle failure."""
+
+    match = re.fullmatch(r"cursor-cycle-([1-4])", title)
+    if match is None:
+        return ""
+    cycle = match.group(1)
+    return (
+        "\n\n[System-required next dispatch: Cursor ended without a complete "
+        "packet in a retryable transport failure. Dispatch cursor_workhorse "
+        f"as one fresh child with title cursor-retry-{cycle}-1. Keep cycle "
+        f"{cycle}; do not resume the failed child. This retry is separate "
+        "from the Opus transient-retry budget.]"
+    )
+
+
+def _cursor_failure_requires_terminal_latch(
+    title: str,
+    status: str,
+    output: str,
+) -> bool:
+    """Return whether a delivered Cursor failure has no recovery route."""
+
+    if status != "failed":
+        return False
+    if re.fullmatch(r"cursor-retry-[1-4]-1", title):
+        return True
+    if re.fullmatch(r"cursor-cycle-[1-4]", title):
+        retryable = (
+            output.startswith("CURSOR_WORKER_TIMEOUT: kind=inactivity")
+            and "assistant_chars=0" in output
+        ) or output.startswith(
+            "CURSOR_WORKER_FAILED: Cursor turn ended with status "
+        )
+        return not retryable
+    return re.fullmatch(
+        r"cursor-web-(?:opus|codex)-[1-4]-[1-2]",
+        title,
+    ) is not None
+
+
+def _install_codex_voice_environment() -> None:
+    """Thread the validated voice profile into codex-native app-server env."""
+
+    from omnigent import codex_native_app_server
+
+    original = codex_native_app_server.build_codex_native_server
+    if getattr(original, "__triple_stamp_voice_environment__", False):
+        return
+
+    def voice_aware_server(*args: object, **kwargs: object) -> Any:
+        server = original(*args, **kwargs)
+        for name in (
+            "TRIPLE_STAMP_VOICE_PROFILE",
+            "TRIPLE_STAMP_VOICE_PROFILE_SHA256",
+        ):
+            value = os.environ.get(name, "")
+            if value:
+                server.env[name] = value
+        return server
+
+    voice_aware_server.__triple_stamp_voice_environment__ = True
+    voice_aware_server.__triple_stamp_original__ = original
+    codex_native_app_server.build_codex_native_server = voice_aware_server
+
+    original_terminal_env = codex_native_app_server.codex_terminal_env
+
+    def voice_aware_terminal_env(server: Any) -> dict[str, str]:
+        env = original_terminal_env(server)
+        for name in (
+            "TRIPLE_STAMP_VOICE_PROFILE",
+            "TRIPLE_STAMP_VOICE_PROFILE_SHA256",
+        ):
+            value = server.env.get(name)
+            if isinstance(value, str) and value:
+                env[name] = value
+        return env
+
+    voice_aware_terminal_env.__triple_stamp_voice_environment__ = True
+    voice_aware_terminal_env.__triple_stamp_original__ = original_terminal_env
+    codex_native_app_server.codex_terminal_env = voice_aware_terminal_env
+
+
+def _codex_runtime_handoff(
+    args: object,
+    *,
+    title: object,
+    parent_session_id: str,
+    read_attempt_collections: Any,
+) -> object:
+    """Append launch truth that a model-authored handoff cannot override.
+
+    The routing supervisor cannot inspect its own environment.  It can therefore
+    emit a stale sentence claiming that voice rendering is disabled even while
+    the runner has a validated profile configured.  Codex receives the actual
+    environment through :func:`_install_codex_voice_environment`; this suffix
+    makes the same fact explicit in the turn that tells the judge what to do.
+
+    Format-repair dispatches also receive the actual collected raw judgment.
+    Asking the supervisor to reproduce a near-10KB packet proved lossy in a live
+    run: it sent a prose placeholder instead, so Codex had nothing to normalize.
+    """
+
+    if not isinstance(args, dict):
+        return args
+    nested = args.get("args")
+    if isinstance(nested, dict):
+        child_args = dict(nested)
+        handoff = child_args.get("input")
+    else:
+        child_args = None
+        handoff = nested
+    text = handoff if isinstance(handoff, str) else ""
+    additions: list[str] = []
+
+    profile = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE", "").strip()
+    digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "").strip()
+    if profile:
+        additions.append(
+            "[System-authoritative Codex launch context]\n"
+            f"TRIPLE_STAMP_VOICE_PROFILE is configured as {profile!r} and is "
+            "present in the Codex app-server and terminal environment. "
+            f"TRIPLE_STAMP_VOICE_PROFILE_SHA256 is {digest!r}. Any earlier "
+            "handoff sentence claiming that no voice profile is configured is "
+            "stale and false. Read the exact live path from the environment. "
+            "A STAMP must not report voice rendering disabled; it must apply "
+            "the profile and return its path and computed SHA-256."
+        )
+
+    match = re.fullmatch(r"judge-format-repair-([1-4])", str(title or ""))
+    if match is not None and parent_session_id:
+        source_title = f"judge-cycle-{match.group(1)}"
+        source = next(
+            (
+                str(record.get("output") or "")
+                for record in reversed(
+                    read_attempt_collections(
+                        parent_session_id=parent_session_id
+                    )
+                )
+                if record.get("agent") == "codex_judge"
+                and record.get("title") == source_title
+                and record.get("status") == "completed"
+                and str(record.get("output") or "").strip()
+            ),
+            "",
+        )
+        if source and source not in text:
+            additions.append(
+                "[System-authoritative raw judgment for format repair]\n"
+                "The exact collected packet follows. It supersedes any "
+                "placeholder claiming the packet was unavailable.\n"
+                f"{source}"
+            )
+
+    if not additions:
+        return args
+    enriched = "\n\n".join((text, *additions)).strip()
+    result = dict(args)
+    if child_args is not None:
+        child_args["input"] = enriched
+        result["args"] = child_args
+    else:
+        result["args"] = {"input": enriched}
+    return result
 
 
 def _observe_dispatch_bookkeeping(
@@ -61,6 +462,10 @@ def _observe_dispatch_bookkeeping(
 ) -> object:
     """Observe a returned native send without changing its outcome."""
 
+    if isinstance(result, str) and result.startswith("Error:"):
+        # This is an explicit tool-level non-launch result, not a malformed
+        # successful handle and not a ledger-observer failure.
+        return result
     native_send_status = "returned"
     try:
         payload = json.loads(result)
@@ -202,6 +607,7 @@ def _install_runner_session_inbox_initialization() -> None:
 
     def guarded_create_runner_app(*args: object, **kwargs: object) -> Any:
         application = original_create_runner_app(*args, **kwargs)
+        server_client = kwargs.get("server_client")
 
         @application.middleware("http")
         async def parent_inbox_lifecycle(request: Any, call_next: Any) -> Any:
@@ -211,6 +617,17 @@ def _install_runner_session_inbox_initialization() -> None:
             )
             if operation is not None and operation[0] == "initialize":
                 ensure_parent_inbox(operation[1])
+            active_child_ids: list[str] = []
+            if operation is not None and operation[0] == "cleanup":
+                active_child_ids = [
+                    str(entry.child_session_id)
+                    for entry in runner_app.list_subagent_work(operation[1])
+                    if getattr(entry, "status", "") in {
+                        "launching",
+                        "running",
+                        "waiting",
+                    }
+                ]
             response = await call_next(request)
             if (
                 operation is not None
@@ -218,9 +635,30 @@ def _install_runner_session_inbox_initialization() -> None:
                 and response.status_code < 400
             ):
                 session_id = operation[1]
+                from triple_stamp_runtime_state import tombstone_parent_session
+
+                tombstone_parent_session(session_id)
+                if server_client is not None:
+                    for child_id in active_child_ids:
+                        try:
+                            await server_client.delete(
+                                f"/v1/sessions/{child_id}",
+                                timeout=30.0,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                            logging.getLogger(__name__).warning(
+                                "failed to cancel child %s for deleted parent %s: %s",
+                                child_id,
+                                session_id,
+                                type(exc).__name__,
+                            )
                 runner_app._session_inboxes_ref.pop(session_id, None)
                 _parent_inbox_failures.pop(session_id, None)
                 _unknown_opus_dispatches.pop(session_id, None)
+                for key, wake_task in tuple(_cursor_parent_wake_tasks.items()):
+                    if key[0] == session_id:
+                        _cursor_parent_wake_tasks.pop(key, None)
+                        wake_task.cancel()
             return response
 
         # ``add_middleware`` prepends. Move this layer behind the runner's
@@ -394,13 +832,27 @@ def _cursor_transcript_snapshot(
             ),
             -1,
         )
+        current_dispatch = (
+            dispatches[current_index] if current_index >= 0 else {}
+        )
+        parent_session_id = str(
+            current_dispatch.get("parent_session_id") or ""
+        )
         has_prior_cursor = current_index > 0 and any(
             record.get("agent") == "cursor_workhorse"
+            and str(record.get("parent_session_id") or "")
+            == parent_session_id
             for record in dispatches[:current_index]
+        )
+        has_foreign_cursor = any(
+            record.get("agent") == "cursor_workhorse"
+            and str(record.get("parent_session_id") or "")
+            != parent_session_id
+            for record in dispatches
         )
         candidates = (
             []
-            if has_prior_cursor
+            if has_prior_cursor or has_foreign_cursor
             else sorted(project_root.glob("*/agent-transcripts/*/*.jsonl"))
         )
         if len(candidates) == 1:
@@ -410,6 +862,8 @@ def _cursor_transcript_snapshot(
             candidates = []
             if has_prior_cursor:
                 metadata_source = "forwarder-required-after-prior-dispatch"
+            elif has_foreign_cursor:
+                metadata_source = "forwarder-required-after-parent-dispatch"
 
     snapshots: list[tuple[int, int, str, bytes]] = []
     for transcript in candidates:
@@ -421,8 +875,12 @@ def _cursor_transcript_snapshot(
         snapshots.append((stat.st_mtime_ns, stat.st_size, str(transcript), data))
 
     latest = ""
+    recovered_parts: list[str] = []
     prompt_line = -1
     success_line = -1
+    turn_ended_status = ""
+    turn_ended_error = ""
+    recoverable_complete = False
     active = False
     complete = False
     malformed = 0
@@ -449,6 +907,10 @@ def _cursor_transcript_snapshot(
                 prompt_line = index
                 success_line = -1
                 latest = ""
+                recovered_parts = []
+                turn_ended_status = ""
+                turn_ended_error = ""
+                recoverable_complete = False
                 active = False
                 complete = False
                 continue
@@ -470,6 +932,8 @@ def _cursor_transcript_snapshot(
                     and block.get("type") == "text"
                     and isinstance(block.get("text"), str)
                 ).strip()
+                if text and (not recovered_parts or recovered_parts[-1] != text):
+                    recovered_parts.append(text)
                 if has_tool:
                     latest = ""
                     active = True
@@ -489,13 +953,22 @@ def _cursor_transcript_snapshot(
                 active = True
 
             if payload.get("type") == "turn_ended":
+                turn_ended_status = str(payload.get("status") or "")
+                turn_ended_error = str(payload.get("error") or "")
+                recoverable_complete = (
+                    turn_ended_status != "success"
+                    and bool(latest)
+                    and not active
+                )
                 complete = (
-                    payload.get("status") == "success"
+                    turn_ended_status == "success"
                     and bool(latest)
                     and not active
                 )
                 success_line = index if complete else -1
 
+    recovered_output = "\n\n".join(recovered_parts).strip()
+    observed_output = latest or recovered_output
     turn_id = (
         hashlib.sha256(
             f"{cursor_session_id}|{selected_path}|{prompt_line}".encode()
@@ -506,7 +979,8 @@ def _cursor_transcript_snapshot(
     fingerprint = hashlib.sha256(
         (
             f"{selected_path}|{selected_mtime}|{selected_size}|{line_count}|"
-            f"{prompt_line}|{success_line}|{hashlib.sha256(latest.encode()).hexdigest()}|"
+            f"{prompt_line}|{success_line}|{turn_ended_status}|"
+            f"{hashlib.sha256(observed_output.encode()).hexdigest()}|"
             f"{process_state}|{process_reason}"
         ).encode()
     ).hexdigest()
@@ -514,19 +988,24 @@ def _cursor_transcript_snapshot(
         f"cursor bridge={bridge_id} cursor_session={cursor_session_id or 'unknown'} "
         f"metadata_source={metadata_source} forwarder_present={forwarder.is_file()} "
         f"transcripts={len(candidates)} prompt_line={prompt_line} "
+        f"turn_ended_status={turn_ended_status or 'none'} "
         f"turn_ended_success={complete} active={active} "
-        f"assistant_chars={len(latest)} lines={line_count} "
+        f"assistant_chars={len(observed_output)} lines={line_count} "
         f"malformed_lines={malformed} process_state={process_state or 'unknown'} "
         f"process_reason={json.dumps(process_reason)}"
     )
     return {
         "output": latest,
+        "recovered_output": recovered_output,
+        "recoverable_complete": recoverable_complete,
         "diagnostic": diagnostic,
         "seen": bool(snapshots),
         "active": active,
         "complete": complete,
         "turn_id": turn_id,
         "fingerprint": fingerprint,
+        "turn_ended_status": turn_ended_status,
+        "turn_ended_error": turn_ended_error,
         "process_state": process_state,
         "process_reason": process_reason,
     }
@@ -576,7 +1055,10 @@ def _observe_cursor_lifecycle(
             and other is not generation
         }
         complete = (
-            bool(snapshot.get("complete"))
+            (
+                bool(snapshot.get("complete"))
+                or bool(snapshot.get("recoverable_complete"))
+            )
             and bool(snapshot.get("output"))
             and bool(turn_id)
             and turn_id not in prior_turn_ids
@@ -601,6 +1083,22 @@ def _observe_cursor_lifecycle(
         generation["terminal_status"] = ""
         generation["terminal_output"] = ""
 
+        turn_ended_status = str(snapshot.get("turn_ended_status") or "")
+        if turn_ended_status and turn_ended_status != "success":
+            recovered = str(snapshot.get("recovered_output") or "")
+            retry_note = _cursor_retry_note(str(generation.get("title") or ""))
+            generation["terminal_status"] = "failed"
+            generation["terminal_output"] = (
+                "CURSOR_WORKER_FAILED: Cursor turn ended with status "
+                f"{turn_ended_status} before a complete packet; "
+                f"error={json.dumps(str(snapshot.get('turn_ended_error') or ''))}; "
+                f"recovered_assistant_output={json.dumps(recovered[:4000])}; "
+                f"{snapshot['diagnostic']}"
+                f"{retry_note}"
+            )
+            generation["terminal_phase"] = "ready"
+            return
+
         process_state = str(snapshot.get("process_state") or "")
         process_reason = str(snapshot.get("process_reason") or "")
         if process_state in {"failed", "exited"} and not process_reason.endswith(
@@ -624,6 +1122,7 @@ def _observe_cursor_lifecycle(
         elif inactive_s >= _CURSOR_STAGE_INACTIVITY_S:
             timeout_kind = "inactivity"
         if timeout_kind:
+            retry_note = _cursor_retry_note(str(generation.get("title") or ""))
             generation["terminal_status"] = "failed"
             generation["terminal_output"] = (
                 f"CURSOR_WORKER_TIMEOUT: kind={timeout_kind} "
@@ -631,6 +1130,7 @@ def _observe_cursor_lifecycle(
                 f"inactivity_limit_s={_CURSOR_STAGE_INACTIVITY_S:.3f} "
                 f"absolute_limit_s={_CURSOR_STAGE_ABSOLUTE_S:.3f}; "
                 f"{snapshot['diagnostic']}"
+                f"{retry_note}"
             )
             generation["terminal_phase"] = "ready"
 
@@ -759,6 +1259,7 @@ def install_parent_inbox_guard() -> None:
 
     from omnigent import cursor_native_forwarder as cursor_forwarder
     from omnigent import cursor_native_status as cursor_status
+    from omnigent import _native_post_delivery as native_delivery
     from omnigent.runner import app as runner_app
     from omnigent.runner import tool_dispatch as dispatch
     from triple_stamp_runtime_state import (
@@ -768,11 +1269,21 @@ def install_parent_inbox_guard() -> None:
         append_dispatch,
         attest_codex_stamp,
         mutate_cursor_lifecycle,
+        parse_dispatch_title,
+        read_attempt_collections,
+        read_attempt_dispatches,
+        read_attested_answer,
+        read_best_effort_answer,
+        read_collections,
         read_cursor_lifecycle,
         read_dispatches,
+        read_terminal_failure,
+        release_retry_reservation,
+        record_terminal_failure,
         record_tool_dispatch_exception,
     )
 
+    _install_codex_voice_environment()
     _install_runner_session_inbox_initialization()
 
     original_chats_root = cursor_forwarder._cursor_chats_root
@@ -903,6 +1414,167 @@ def install_parent_inbox_guard() -> None:
         guarded_status_post.__triple_stamp_original__ = original_status_post
         cursor_forwarder._post_external_session_status = guarded_status_post
 
+    original_native_status_post = native_delivery.post_external_session_status
+    if not getattr(
+        original_native_status_post,
+        "__triple_stamp_cursor_delivery__",
+        False,
+    ):
+        async def guarded_native_status_post(
+            client: Any,
+            *,
+            session_id: str,
+            status: str,
+            output: str | None = None,
+            **kwargs: Any,
+        ) -> None:
+            record = _latest_dispatch_for_child(
+                session_id,
+                read_dispatches(),
+            )
+            if not record or status not in {"idle", "failed"}:
+                await original_native_status_post(
+                    client,
+                    session_id=session_id,
+                    status=status,
+                    output=output,
+                    **kwargs,
+                )
+                return
+            try:
+                await cursor_forwarder._post_external_session_status(
+                    client,
+                    session_id=session_id,
+                    status=status,
+                )
+                return
+            except RuntimeError as exc:
+                if str(exc).startswith(
+                    "suppressed premature Cursor terminal status"
+                ):
+                    # A stop/usage hook can precede stable transcript evidence.
+                    # A later transcript-forwarder pass owns the real terminal
+                    # edge; acknowledging this hook prevents a hot retry loop.
+                    return
+                raise
+            except Exception as exc:  # noqa: BLE001 - inspect structured 503
+                response = getattr(exc, "response", None)
+                try:
+                    body = response.json() if response is not None else {}
+                except Exception:  # noqa: BLE001 - best-effort response parse
+                    body = {}
+                missing_work_entry = (
+                    getattr(response, "status_code", None) == 503
+                    and isinstance(body, dict)
+                    and body.get("error") == "subagent_delivery_not_confirmed"
+                    and body.get("reason") == "missing_work_entry"
+                )
+                if not missing_work_entry:
+                    raise
+
+            work_id = str(record.get("work_id") or "")
+            generation = read_cursor_lifecycle(session_id, work_id)
+            desired = str(generation.get("terminal_status") or "")
+            terminal_output = str(generation.get("terminal_output") or "")
+            parent_session_id = str(record.get("parent_session_id") or "")
+            ensure_parent_inbox(parent_session_id)
+            entry = runner_app.get_subagent_work(session_id)
+            if entry is None:
+                entry = runner_app.register_subagent_work(
+                    parent_session_id=parent_session_id,
+                    child_session_id=session_id,
+                    agent=str(record.get("agent") or "cursor_workhorse"),
+                    title=str(record.get("title") or ""),
+                )
+            entry.parent_session_id = parent_session_id
+            entry.work_id = work_id
+            entry.agent = str(record.get("agent") or "cursor_workhorse")
+            entry.title = str(record.get("title") or "")
+            try:
+                # Retry once through the server after reconstructing the exact
+                # work entry. This preserves its normal parent-wake scheduling,
+                # unlike pushing directly into the runner-local queue.
+                await cursor_forwarder._post_external_session_status(
+                    client,
+                    session_id=session_id,
+                    status=(
+                        "idle" if desired == "completed" else "failed"
+                    ),
+                )
+                return
+            except Exception:  # noqa: BLE001 - one bounded recovery attempt
+                acknowledgement = runner_app.mark_subagent_work_terminal(
+                    session_id,
+                    status=desired,
+                    output=terminal_output,
+                )
+                if acknowledgement.delivered:
+                    if (
+                        acknowledgement.delivered_now
+                        and acknowledgement.entry is not None
+                    ):
+                        parent_inbox = ensure_parent_inbox(parent_session_id)
+                        notice = runner_app._format_subagent_wake_notice(
+                            agent=entry.agent,
+                            title=entry.title,
+                            status=entry.status,
+                            pending=parent_inbox.qsize(),
+                        )
+                        wake_started = time.monotonic()
+                        try:
+                            wake_delivered = await asyncio.wait_for(
+                                runner_app._deliver_subagent_wake_post(
+                                    client,
+                                    parent_session_id,
+                                    notice,
+                                    created_by=entry.created_by,
+                                ),
+                                timeout=_CURSOR_PARENT_WAKE_DEADLINE_S,
+                            )
+                        except TimeoutError:
+                            wake_delivered = False
+                        if not wake_delivered:
+                            def mark_wake_pending(
+                                current: dict[str, Any],
+                                _state: dict[str, Any],
+                            ) -> None:
+                                current["parent_wake_pending"] = True
+                                current["parent_wake_attempts"] = 0
+
+                            mutate_cursor_lifecycle(
+                                session_id,
+                                work_id,
+                                mark_wake_pending,
+                            )
+                            _schedule_cursor_parent_wake_retry(
+                                client=client,
+                                parent_session_id=parent_session_id,
+                                child_session_id=session_id,
+                                work_id=work_id,
+                                notice=notice,
+                                created_by=entry.created_by,
+                                started_at_monotonic=wake_started,
+                            )
+                    return
+            reason = (
+                "Cursor terminal delivery recovery exhausted after one "
+                "reconstructed missing_work_entry retry; duplicate delivery "
+                "loop stopped"
+            )
+            record_terminal_failure(
+                "PIPELINE_INFRASTRUCTURE_ERROR",
+                reason,
+                stage=str(record.get("title") or ""),
+                cycle=int(record.get("cycle") or 0),
+                parent_session_id=parent_session_id,
+            )
+
+        guarded_native_status_post.__triple_stamp_cursor_delivery__ = True
+        guarded_native_status_post.__triple_stamp_original__ = (
+            original_native_status_post
+        )
+        native_delivery.post_external_session_status = guarded_native_status_post
+
     original_mark_terminal = runner_app.mark_subagent_work_terminal
     if not getattr(
         original_mark_terminal,
@@ -959,6 +1631,22 @@ def install_parent_inbox_guard() -> None:
                     current["terminal_phase"] = "delivered"
 
                 mutate_cursor_lifecycle(child_session_id, work_id, commit)
+                title = str(record.get("title") or "")
+                if _cursor_failure_requires_terminal_latch(
+                    title,
+                    status,
+                    output,
+                ):
+                    parsed = parse_dispatch_title(title) or {}
+                    record_terminal_failure(
+                        "PIPELINE_INFRASTRUCTURE_ERROR",
+                        output,
+                        stage=title or "cursor",
+                        cycle=int(parsed.get("cycle") or 0),
+                        parent_session_id=str(
+                            record.get("parent_session_id") or ""
+                        ),
+                    )
             return acknowledgement
 
         guarded_mark_terminal.__triple_stamp_lifecycle_gate__ = True
@@ -1021,6 +1709,18 @@ def install_parent_inbox_guard() -> None:
         ) -> str:
             if conversation_id in _parent_inbox_failures:
                 return _parent_inbox_failures[conversation_id]
+            parent_session_id = str(conversation_id or "")
+            if parent_session_id and (
+                read_attested_answer(parent_session_id)
+                or read_best_effort_answer(parent_session_id)
+                or read_terminal_failure(parent_session_id)
+            ):
+                # This is the final no-spend boundary. The response guard normally
+                # consumes stale completion wakes before they reach a tool call,
+                # but a terminal artifact can be written while a model turn is
+                # already streaming. Treat that raced dispatch as an internal
+                # no-op rather than launching a child or returning a policy error.
+                return _TERMINAL_DISPATCH_NOOP
             agent = args.get("agent") if isinstance(args, dict) else None
             title = args.get("title") if isinstance(args, dict) else None
             if (
@@ -1028,6 +1728,67 @@ def install_parent_inbox_guard() -> None:
                 and conversation_id in _unknown_opus_dispatches
             ):
                 return _unknown_opus_dispatches[conversation_id]
+            parsed = parse_dispatch_title(title)
+            if parent_session_id and parsed is not None:
+                dispatches = read_attempt_dispatches(
+                    parent_session_id=parent_session_id
+                )
+                collections = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                active = (*dispatches, *collections)
+                if (
+                    agent == "cursor_workhorse"
+                    and parsed["stage_id"] in {"cursor_grunt", "cursor_retry"}
+                    and (
+                        any(record.get("title") == title for record in active)
+                        or any(
+                            (
+                                later := parse_dispatch_title(
+                                    record.get("title")
+                                )
+                            )
+                            is not None
+                            and later["cycle"] == parsed["cycle"]
+                            and (
+                                (
+                                    parsed["stage_id"] == "cursor_grunt"
+                                    and later["stage_id"] != "cursor_grunt"
+                                )
+                                or (
+                                    parsed["stage_id"] == "cursor_retry"
+                                    and later["stage_id"]
+                                    not in {"cursor_grunt", "cursor_retry"}
+                                )
+                            )
+                            for record in active
+                        )
+                    )
+                ):
+                    return _DUPLICATE_CURSOR_DISPATCH
+                if (
+                    agent == "opus_auditor"
+                    and parsed["stage_id"] == "audit_retry"
+                    and any(
+                        (
+                            prior := parse_dispatch_title(
+                                record.get("title")
+                            )
+                        )
+                        is not None
+                        and prior["stage_id"] == "audit_retry"
+                        and prior["cycle"] == parsed["cycle"]
+                        for record in active
+                    )
+                ):
+                    return _DUPLICATE_OPUS_RETRY_DISPATCH
+            if agent == "codex_judge":
+                args = _codex_runtime_handoff(
+                    args,
+                    title=title,
+                    parent_session_id=parent_session_id,
+                    read_attempt_collections=read_attempt_collections,
+                )
             try:
                 result = await original_send(
                     args,
@@ -1069,6 +1830,27 @@ def install_parent_inbox_guard() -> None:
                     child_state=child_state,
                     append_collection=append_collection,
                 )
+            if (
+                isinstance(result, str)
+                and result.startswith("Error:")
+                and parent_session_id
+                and parsed is not None
+                and parsed["stage_id"] in {"cursor_retry", "audit_retry"}
+            ):
+                # Omnigent returns Error: text only on paths that did not post
+                # the child turn (including paths that created then tore down a
+                # child). No paid worker launched, so the policy reservation
+                # may be retried. Exceptions and unknown outcomes stay latched.
+                release_retry_reservation(
+                    parent_session_id,
+                    int(parsed["cycle"]),
+                    stage=(
+                        "cursor"
+                        if parsed["stage_id"] == "cursor_retry"
+                        else "opus"
+                    ),
+                    native_send_status="not_launched",
+                )
             if result == _MISSING_PARENT_INBOX and conversation_id:
                 terminal = _parent_inbox_failures.setdefault(
                     conversation_id,
@@ -1107,6 +1889,116 @@ def install_parent_inbox_guard() -> None:
             if inbox is None:
                 return "Error: sys_read_inbox requires parent session inbox"
             if inbox.empty():
+                parent_session_id = str(conversation_id or "")
+                dispatches = read_attempt_dispatches(
+                    parent_session_id=parent_session_id
+                )
+                if dispatches:
+                    collections = read_attempt_collections(
+                        parent_session_id=parent_session_id
+                    )
+
+                    def matches(
+                        dispatch_record: dict[str, Any],
+                        collection_record: dict[str, Any],
+                    ) -> bool:
+                        dispatch_work = str(
+                            dispatch_record.get("work_id") or ""
+                        )
+                        collection_work = str(
+                            collection_record.get("work_id") or ""
+                        )
+                        if dispatch_work and collection_work:
+                            return dispatch_work == collection_work
+                        dispatch_child = str(
+                            dispatch_record.get("child_session_id") or ""
+                        )
+                        collection_child = str(
+                            collection_record.get("child_session_id") or ""
+                        )
+                        if dispatch_child and collection_child:
+                            return (
+                                dispatch_child == collection_child
+                                and dispatch_record.get("title")
+                                == collection_record.get("title")
+                            )
+                        return (
+                            dispatch_record.get("agent")
+                            == collection_record.get("agent")
+                            and dispatch_record.get("title")
+                            == collection_record.get("title")
+                        )
+
+                    uncollected = [
+                        dispatch_record
+                        for dispatch_record in reversed(dispatches)
+                        if not any(
+                            matches(dispatch_record, collection_record)
+                            for collection_record in collections
+                        )
+                    ]
+                    recovered = None
+                    for pending in uncollected:
+                        child = str(pending.get("child_session_id") or "")
+                        work_id = str(pending.get("work_id") or "")
+                        if not child:
+                            continue
+                        entry = runner_app.get_subagent_work(child)
+                        if (
+                            entry is not None
+                            and (
+                                not work_id
+                                or str(getattr(entry, "work_id", "") or "")
+                                == work_id
+                            )
+                            and str(getattr(entry, "status", "") or "")
+                            in {"completed", "failed", "cancelled"}
+                            and str(getattr(entry, "output", "") or "").strip()
+                        ):
+                            recovered = {
+                                "parent_session_id": parent_session_id,
+                                "child_session_id": child,
+                                "work_id": getattr(entry, "work_id", work_id),
+                                "agent": getattr(entry, "agent", None)
+                                or pending.get("agent"),
+                                "title": getattr(entry, "title", None)
+                                or pending.get("title"),
+                                "status": getattr(entry, "status", ""),
+                                "output": getattr(entry, "output", ""),
+                            }
+                            append_collection(recovered)
+                            attest_codex_stamp(recovered)
+                            break
+                    if recovered is None and not uncollected:
+                        latest = dispatches[-1]
+                        recovered = next(
+                            (
+                                record
+                                for record in reversed(collections)
+                                if matches(latest, record)
+                                and record.get("status")
+                                in {"completed", "failed", "cancelled"}
+                                and str(record.get("output") or "").strip()
+                            ),
+                            None,
+                        )
+                    if recovered is not None:
+                        payload = {
+                            "type": "sub_agent",
+                            "handle_id": (
+                                recovered.get("child_session_id")
+                                or recovered.get("work_id")
+                                or "unknown"
+                            ),
+                            "conversation_id": recovered.get("child_session_id"),
+                            "work_id": recovered.get("work_id"),
+                            "tool_name": recovered.get("agent"),
+                            "agent": recovered.get("agent"),
+                            "title": recovered.get("title"),
+                            "status": recovered.get("status"),
+                            "output": recovered.get("output"),
+                        }
+                        return dispatch._format_async_task_item(payload)
                 return "Inbox is empty — no completed tasks."
 
             leased: list[dict[str, object]] = []
@@ -1115,8 +2007,35 @@ def install_parent_inbox_guard() -> None:
                     leased.append(inbox.get_nowait())
                 except asyncio.QueueEmpty:
                     break
-            dispatches = read_dispatches()
-            enriched = [_enrich_packet(payload, dispatches) for payload in leased]
+            all_dispatches = read_dispatches()
+            dispatches = read_dispatches(
+                parent_session_id=str(conversation_id or "")
+            )
+            local_payloads: list[dict[str, object]] = []
+            for payload in leased:
+                child, work_id = _packet_identity(payload)
+                owner = next(
+                    (
+                        row
+                        for row in reversed(all_dispatches)
+                        if (work_id and row.get("work_id") == work_id)
+                        or (child and row.get("child_session_id") == child)
+                    ),
+                    {},
+                )
+                owner_parent = str(owner.get("parent_session_id") or "")
+                if (
+                    owner_parent
+                    and conversation_id
+                    and owner_parent != conversation_id
+                ):
+                    ensure_parent_inbox(owner_parent).put_nowait(payload)
+                    continue
+                local_payloads.append(payload)
+            enriched = [
+                _enrich_packet(payload, dispatches)
+                for payload in local_payloads
+            ]
             complete_cursor_ids = {
                 _packet_identity(payload)
                 for payload in enriched

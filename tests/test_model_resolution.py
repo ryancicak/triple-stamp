@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +24,47 @@ SPEC.loader.exec_module(launcher)
 
 
 class ModelResolutionTests(unittest.TestCase):
+    def test_managed_claude_bearer_is_minted_before_home_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = Path(value)
+            helper = home / ".local/bin/ug"
+            helper.parent.mkdir(parents=True)
+            helper.write_text("", encoding="utf-8")
+            settings = home / "managed-settings.json"
+            settings.write_text(
+                json.dumps(
+                    {
+                        "apiKeyHelper": (
+                            f"{helper} auth-token --host https://example.test "
+                            "--profile managed-oauth"
+                        )
+                    }
+                ),
+                encoding="utf-8",
+            )
+            minted = subprocess.CompletedProcess(
+                [], 0, "gateway-bearer-value-long-enough\n", ""
+            )
+            with mock.patch.object(launcher, "_run", return_value=minted) as run:
+                token = launcher._managed_claude_bearer(
+                    home,
+                    {"HOME": str(home)},
+                    (settings,),
+                )
+        self.assertEqual(token, "gateway-bearer-value-long-enough")
+        run.assert_called_once_with(
+            [
+                str(helper),
+                "auth-token",
+                "--host",
+                "https://example.test",
+                "--profile",
+                "managed-oauth",
+            ],
+            env={"HOME": str(home)},
+            timeout=30,
+        )
+
     def test_explicit_environment_wins_for_all_three_models(self) -> None:
         environment = {
             "TRIPLE_STAMP_SUPERVISOR_MODEL": "explicit-supervisor",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import importlib.util
 import logging
 import os
 import sys
@@ -50,9 +51,11 @@ def _is_runner_process(argv: object) -> bool:
 
 _is_runner = _is_runner_process(getattr(sys, "orig_argv", ()))
 _is_probe = os.environ.get(_PROBE_ENV_NAME) == "1"
+_has_omnigent_runtime = importlib.util.find_spec("omnigent") is not None
 
-install_browser_runtime_guard()
-_supervisor_runtime.install_headless_pipeline_wait()
+if _has_omnigent_runtime:
+    install_browser_runtime_guard()
+    _supervisor_runtime.install_headless_pipeline_wait()
 
 
 def _install_fail_closed_claude_launcher() -> None:
@@ -278,9 +281,54 @@ def _install_policy_identity_context() -> None:
     policy_function.FunctionPolicy.evaluate = evaluate_with_identity
 
 
-if os.environ.get(_ENV_NAME) == _MODE:
+def _install_native_request_provenance() -> None:
+    """Stamp native hook requests so they cannot impersonate browser submits."""
+
+    from omnigent import native_policy_hook
+
+    original = native_policy_hook.hook_payload_to_evaluation_request
+    if getattr(original, "__triple_stamp_request_provenance__", False):
+        return
+
+    def with_request_provenance(
+        hook_event: str,
+        payload: dict[str, object],
+    ) -> object:
+        request = original(hook_event, payload)
+        if hook_event != "UserPromptSubmit" or not isinstance(request, dict):
+            return request
+        event = request.get("event")
+        if not isinstance(event, dict):
+            return request
+        context = event.get("context")
+        if not isinstance(context, dict):
+            context = {}
+            event["context"] = context
+        context.setdefault("harness", "triple-stamp-native-hook")
+        return request
+
+    with_request_provenance.__triple_stamp_request_provenance__ = True
+    with_request_provenance.__triple_stamp_original__ = original
+    native_policy_hook.hook_payload_to_evaluation_request = with_request_provenance
+
+    for module_name in (
+        "omnigent.claude_native_hook",
+        "omnigent.codex_native_hook",
+        "omnigent.kimi_native_hook",
+    ):
+        module = sys.modules.get(module_name)
+        if (
+            module is not None
+            and getattr(module, "hook_payload_to_evaluation_request", None)
+            is original
+        ):
+            module.hook_payload_to_evaluation_request = with_request_provenance
+
+
+if os.environ.get(_ENV_NAME) == _MODE and _has_omnigent_runtime:
     try:
         _install_policy_identity_context()
+        _install_native_request_provenance()
     except Exception as exc:  # noqa: BLE001 - missing identity would weaken the route cap
         print(
             f"triple-stamp: policy identity guard failed: {type(exc).__name__}: {exc}",
@@ -290,7 +338,11 @@ if os.environ.get(_ENV_NAME) == _MODE:
         os._exit(78)
 
 
-if os.environ.get(_ENV_NAME) == _MODE and (_is_runner or _is_probe):
+if (
+    os.environ.get(_ENV_NAME) == _MODE
+    and _has_omnigent_runtime
+    and (_is_runner or _is_probe)
+):
     try:
         from omnigent import cursor_native_permissions as _permissions
 

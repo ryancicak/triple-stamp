@@ -158,6 +158,12 @@ prompt: |
   or certainty remains, refuse STAMP and return REWORK with a concrete
   punch-list item identifying the language and evidence needed.
 
+  If you do not STAMP, still render a complete customer-facing response in
+  `best_supported_answer`. State only conclusions supported by the completed
+  packets, preserve uncertainty, and do not imply quality approval. The runtime
+  may ship this answer with your concrete limitations when bounded research is
+  exhausted. This field is not a STAMP and must never be described as one.
+
   You cannot search the public web. If a stamp-critical claim
   needs a live public source or a test you cannot run, return
   NEEDS_WEB or REWORK with a hunt spec. Not "look this up."
@@ -202,6 +208,9 @@ prompt: |
   - `why`: string
   - `gap_materiality`: `none` or `nonmaterial` on STAMP; `material` otherwise
   - `limitations`: JSON array of concise strings, empty only when there are none
+  On REWORK, NEEDS_WEB, and NEEDS_INTERNAL also include:
+  - `best_supported_answer`: complete human-visible response containing only
+    conclusions supported by the completed packets
   On STAMP also include:
   - `citations_that_hold`: non-empty JSON array
   - `voice_profile_check`: object containing the exact source path, SHA-256

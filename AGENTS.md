@@ -20,5 +20,5 @@ displayed as GPT-5.6 Sol Extra High.
   another recursive triple-stamp run. The outer pipeline already owns the
   workspace lock.
 - For this Stage 1 `cursor_workhorse` runtime only, the required model is
-  `cursor-grok-4.6-xhigh`, displayed as Cursor Grok 4.6 Extra High. If that
+  `cursor-grok-4.6-xhigh`, displayed as Grok 4.6 Extra High. If that
   runtime session's displayed model differs, stop and report the mismatch.

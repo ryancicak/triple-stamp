@@ -217,7 +217,9 @@ import sys
 from pathlib import Path
 from omnigent import claude_launcher
 from omnigent import chat
+from omnigent import codex_native_app_server
 from omnigent import cursor_native_permissions as permissions
+from omnigent import native_policy_hook
 from omnigent.inner import claude_sdk_executor
 from omnigent.policies import function as policy_function
 from omnigent.runner import tool_dispatch
@@ -288,8 +290,23 @@ assert getattr(
     False,
 )
 assert getattr(
+    native_policy_hook.hook_payload_to_evaluation_request,
+    "__triple_stamp_request_provenance__",
+    False,
+)
+assert getattr(
     claude_sdk_executor.ClaudeSDKExecutor.run_turn,
     "__triple_stamp_continuation_guard__",
+    False,
+)
+assert getattr(
+    codex_native_app_server.build_codex_native_server,
+    "__triple_stamp_voice_environment__",
+    False,
+)
+assert getattr(
+    codex_native_app_server.codex_terminal_env,
+    "__triple_stamp_voice_environment__",
     False,
 )
 assert chat._LOOP_TIMEOUT_S is None
@@ -509,10 +526,12 @@ def validate_spec(
             "runtime exposes only those two MCP tools",
             "routing authorization never parses or compares handoff prose",
             "cursor-cycle-N",
+            "cursor-retry-N-1",
             "cursor-web-opus-N-H",
             "cursor-web-codex-N-H",
             "audit-cycle-N",
             "audit-cycle-N-web-H",
+            "audit-retry-N-1",
             "FRESH `opus_auditor` child",
             "judge-cycle-N",
             "judge-format-repair-N",
@@ -697,7 +716,9 @@ def validate_launchers(
         "def append_supervisor_continuation(",
         "def parse_dispatch_title(",
         "def record_tool_dispatch_exception(",
+        'r"cursor-retry-([1-4])-(1)"',
         'r"audit-internal-([1-4])-([1-2])"',
+        'r"audit-retry-([1-4])-(1)"',
     ):
         if marker not in runtime_state_source:
             fail(f"runtime attestation marker missing: {marker}")
@@ -709,7 +730,7 @@ def validate_launchers(
         "__triple_stamp_headless_wait__",
         "def install_supervisor_continuation_guard(",
         "ordinary_response_suppressed",
-        "continuation_exhausted",
+        "continuation_exhausted_abstained",
         "dispatch_observer_failure_abstained",
         "ledger observer failure=",
     ):
@@ -771,10 +792,16 @@ def validate_launchers(
         "forwarder-required-after-prior-dispatch",
         "turn_ended_success",
         "_CURSOR_STAGE_ABSOLUTE_S = 15 * 60",
+        "_CURSOR_PARENT_WAKE_MAX_ATTEMPTS = 5",
+        "_CURSOR_PARENT_WAKE_DEADLINE_S = 180.0",
+        "await asyncio.wait_for(",
+        "def _cursor_retry_note(",
         "def _observe_dispatch_bookkeeping(",
         "def ensure_parent_inbox(",
         "def _install_runner_session_inbox_initialization(",
         "__triple_stamp_parent_inbox_probe__",
+        "missing_work_entry",
+        "recovered_assistant_output",
         "retry denied",
     ):
         if marker not in runtime_guard_source:
@@ -1025,6 +1052,52 @@ def validate_launchers(
     ) != ("opus_auditor", "audit-cycle-1-web-1", ""):
         fail("Opus web re-audit did not resolve to a fresh native child")
 
+    transient_retry = _next_route(
+        [
+            {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "completed",
+                "output": "cursor packet",
+            },
+            {
+                "agent": "opus_auditor",
+                "title": "audit-cycle-1",
+                "status": "failed",
+                "output": (
+                    "API Error: Server error mid-response. The response above "
+                    "may be incomplete."
+                ),
+                "child_session_id": "dead-opus-child",
+            },
+        ]
+    )
+    if (transient_retry.status, transient_retry.agent, transient_retry.title) != (
+        "dispatch",
+        "opus_auditor",
+        "audit-retry-1-1",
+    ):
+        fail("transient Opus stream death did not resolve to a fresh retry child")
+    cursor_retry = _next_route(
+        [
+            {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "failed",
+                "output": (
+                    "CURSOR_WORKER_TIMEOUT: kind=inactivity "
+                    "inactivity_s=301 inactivity_limit_s=300; assistant_chars=0"
+                ),
+            }
+        ]
+    )
+    if (cursor_retry.status, cursor_retry.agent, cursor_retry.title) != (
+        "dispatch",
+        "cursor_workhorse",
+        "cursor-retry-1-1",
+    ):
+        fail("zero-output Cursor inactivity did not resolve to one fresh retry")
+
     runner_env = _build_runner_env(
         os.environ,
         server_url="http://127.0.0.1:1",
@@ -1129,6 +1202,19 @@ def validate_launchers(
     )
     if any(contract(event).get("result") != "ALLOW" for event in arbitrary_calls):
         fail("final response contract still gates a routing/tool payload")
+    forbidden_retry = {
+        "type": "tool_call",
+        "data": {
+            "name": "sys_session_send",
+            "arguments": {
+                "agent": "opus_auditor",
+                "title": "audit-retry-1-2",
+                "args": {"input": "must not launch"},
+            },
+        },
+    }
+    if contract(forbidden_retry).get("result") != "DENY":
+        fail("second paid Opus retry was not denied before dispatch")
 
     if _SUPERVISOR_ROUTE_LIMIT != _route_call_cap():
         fail("supervisor route-call formula drifted")

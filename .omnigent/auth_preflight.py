@@ -13,7 +13,7 @@ from pathlib import Path
 
 import tomllib
 
-EXPECTED_CURSOR = "cursor-grok-4.6-xhigh - Cursor Grok 4.6 Extra High"
+EXPECTED_CURSOR = "cursor-grok-4.6-xhigh - Grok 4.6 Extra High"
 EXPECTED_SUPERVISOR = os.environ.get(
     "TRIPLE_STAMP_SUPERVISOR_MODEL", "claude-sonnet-4-6"
 )
@@ -219,7 +219,7 @@ def _preflight_cursor(root: Path) -> None:
                 for result in (status, models, config, startup)
                 if result.returncode
             ),
-            "Cursor Grok 4.6 Extra High is not in the Cursor account model catalog",
+            f"{EXPECTED_CURSOR!r} is not in the Cursor account model catalog",
         )
         raise PreflightError(
             "Cursor",

@@ -12,7 +12,7 @@ from unittest import mock
 
 import triple_stamp_isaac_launcher as contract
 import triple_stamp_runtime_state as runtime_state
-from omnigent import cursor_native_forwarder, cursor_native_status
+from omnigent import _native_post_delivery, cursor_native_forwarder, cursor_native_status
 from omnigent.runner import app as runner_app
 from omnigent.runner import tool_dispatch
 
@@ -44,6 +44,52 @@ class _Response:
     @staticmethod
     def json() -> dict[str, str]:
         return {"result": "POLICY_ACTION_ALLOW"}
+
+
+class _MissingWorkError(Exception):
+    def __init__(self, response: "_MissingWorkResponse") -> None:
+        super().__init__("missing work entry")
+        self.response = response
+
+
+class _MissingWorkResponse:
+    status_code = 503
+    text = "missing_work_entry"
+
+    def raise_for_status(self) -> None:
+        raise _MissingWorkError(self)
+
+    @staticmethod
+    def json() -> dict[str, str]:
+        return {
+            "error": "subagent_delivery_not_confirmed",
+            "reason": "missing_work_entry",
+        }
+
+
+class _MissingWorkClient:
+    def __init__(self, child: str, *, missing_attempts: int = 1) -> None:
+        self.child = child
+        self.missing_attempts = missing_attempts
+        self.posts = 0
+
+    async def post(
+        self,
+        _url: str,
+        *,
+        json: dict[str, object],
+    ) -> _MissingWorkResponse | _Response:
+        self.posts += 1
+        if self.posts <= self.missing_attempts:
+            return _MissingWorkResponse()
+        data = json["data"]
+        assert isinstance(data, dict)
+        runner_app.mark_subagent_work_terminal(
+            self.child,
+            status="completed" if data["status"] == "idle" else "failed",
+            output=str(data["output"]),
+        )
+        return _Response()
 
 
 class _AllowPolicyClient:
@@ -115,6 +161,73 @@ class CursorLifecycleTests(unittest.TestCase):
     def _line(role: str, blocks: list[dict[str, object]]) -> str:
         return json.dumps({"role": role, "message": {"content": blocks}})
 
+    def test_single_transcript_fallback_never_crosses_parent_sessions(
+        self,
+    ) -> None:
+        parent_a = "cursor-parent-a"
+        parent_b = "cursor-parent-b"
+        child_a = "cursor-child-a"
+        child_b = "cursor-child-b"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            run = Path(value)
+            transcript = (
+                run
+                / "home/.cursor/projects/project/agent-transcripts"
+                / "cursor-session-a"
+                / "cursor-session-a.jsonl"
+            )
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                self._line(
+                    "assistant",
+                    [{"type": "text", "text": "math answer"}],
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bridge_b = (
+                run
+                / "tmp"
+                / f"omnigent-{os.getuid()}"
+                / "cursor-native"
+                / __import__("hashlib").sha256(
+                    child_b.encode()
+                ).hexdigest()[:32]
+            )
+            bridge_b.mkdir(parents=True)
+            (bridge_b / "triple-stamp-startup.json").write_text(
+                json.dumps({"state": "ready"}),
+                encoding="utf-8",
+            )
+            self._dispatch(
+                parent=parent_a,
+                child=child_a,
+                work_id="work-a",
+                title="cursor-cycle-1",
+            )
+            self._dispatch(
+                parent=parent_b,
+                child=child_b,
+                work_id="work-b",
+                title="cursor-cycle-1",
+            )
+
+            snapshot = lifecycle._cursor_transcript_snapshot(
+                child_b,
+                bridge_b,
+            )
+
+        self.assertFalse(snapshot["seen"])
+        self.assertEqual(snapshot["output"], "")
+        self.assertIn(
+            "metadata_source=forwarder-required-after-parent-dispatch",
+            snapshot["diagnostic"],
+        )
+
     def _dispatch(
         self,
         *,
@@ -132,6 +245,59 @@ class CursorLifecycleTests(unittest.TestCase):
                 "title": title,
             }
         )
+
+    def _seed_stranded_completion(
+        self,
+        *,
+        parent: str,
+        child: str,
+        work_id: str,
+    ) -> None:
+        output = "CURSOR_WORKER_FAILED: stranded terminal packet"
+        self._dispatch(
+            parent=parent,
+            child=child,
+            work_id=work_id,
+            title="cursor-cycle-1",
+        )
+        inbox = lifecycle.ensure_parent_inbox(parent)
+        entry = runner_app.register_subagent_work(
+            parent_session_id=parent,
+            child_session_id=child,
+            agent="cursor_workhorse",
+            title="cursor-cycle-1",
+        )
+        entry.work_id = work_id
+        entry.status = "failed"
+        entry.output = output
+        entry.completed_at = time.time()
+        entry.delivered = True
+        inbox.put_nowait(
+            {
+                "type": "sub_agent",
+                "work_id": work_id,
+                "task_id": child,
+                "handle_id": child,
+                "conversation_id": child,
+                "tool_name": "cursor_workhorse",
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "failed",
+                "output": output,
+            }
+        )
+
+        def stranded(
+            generation: dict[str, object],
+            _state: dict[str, object],
+        ) -> None:
+            generation["terminal_status"] = "failed"
+            generation["terminal_output"] = output
+            generation["terminal_phase"] = "delivered"
+            generation["delivery_committed"] = True
+            generation["parent_wake_pending"] = True
+
+        runtime_state.mutate_cursor_lifecycle(child, work_id, stranded)
 
     def test_retained_transport_waits_for_real_turn_then_wakes_once(self) -> None:
         parent = FIXTURE["parent_session_id"]
@@ -706,6 +872,505 @@ class CursorLifecycleTests(unittest.TestCase):
             snapshots[1]["turn_id"],
             fixture["retained_completed_turn_id"],
         )
+
+    def test_missing_work_entry_recovers_transcript_and_delivers_once(
+        self,
+    ) -> None:
+        parent = "missing-work-parent"
+        child = "missing-work-child"
+        work_id = "missing-work-id"
+        cursor_id = "missing-work-cursor-session"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "CURSOR_DATA_DIR": f"{value}/home/.cursor",
+            },
+            clear=False,
+        ):
+            run = Path(value)
+            bridge, transcript = self._paths(
+                run,
+                child=child,
+                cursor_session_id=cursor_id,
+            )
+            self._dispatch(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+                title="cursor-cycle-1",
+            )
+            transcript.write_text(
+                "\n".join(
+                    (
+                        self._line(
+                            "user",
+                            [{"type": "text", "text": "2+2=?"}],
+                        ),
+                        self._line(
+                            "assistant",
+                            [
+                                {
+                                    "type": "text",
+                                    "text": "I will compute it.",
+                                },
+                                {"type": "tool_use", "name": "Shell"},
+                            ],
+                        ),
+                        self._line(
+                            "assistant",
+                            [
+                                {
+                                    "type": "text",
+                                    "text": "Python printed `4`.",
+                                },
+                                {"type": "tool_use", "name": "WebSearch"},
+                            ],
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn_ended",
+                                "status": "error",
+                                "error": "[resource_exhausted] Error",
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            snapshot = lifecycle._cursor_transcript_snapshot(child, bridge)
+            self.assertEqual(snapshot["turn_ended_status"], "error")
+            self.assertEqual(snapshot["output"], "")
+            self.assertFalse(snapshot["recoverable_complete"])
+            self.assertIn("Python printed `4`.", snapshot["recovered_output"])
+            self.assertNotIn("assistant_chars=0", snapshot["diagnostic"])
+            state = lifecycle._observe_cursor_lifecycle(
+                runtime_state.read_dispatches(parent)[-1],
+                snapshot,
+            )
+            self.assertEqual(state["terminal_status"], "failed")
+            self.assertEqual(state["terminal_phase"], "ready")
+            self.assertIn("Python printed `4`.", state["terminal_output"])
+
+            runner_app.unregister_subagent_work(child)
+            runner_app._session_inboxes_ref.pop(parent, None)
+            client = _MissingWorkClient(child)
+            try:
+                asyncio.run(
+                    _native_post_delivery.post_external_session_status(
+                        client,
+                        session_id=child,
+                        status="idle",
+                    )
+                )
+                inbox = runner_app._session_inboxes_ref[parent]
+                self.assertEqual(inbox.qsize(), 1)
+                packet = inbox.get_nowait()
+                self.assertEqual(packet["work_id"], work_id)
+                self.assertIn("Python printed `4`.", packet["output"])
+                self.assertEqual(client.posts, 2)
+                committed = runtime_state.read_cursor_lifecycle(
+                    child,
+                    work_id,
+                )
+                self.assertTrue(committed["delivery_committed"])
+                self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+
+    def test_failed_cursor_without_collection_terminalizes_parent_attempt(
+        self,
+    ) -> None:
+        parent = "failed-no-collection-parent"
+        child = "failed-no-collection-child"
+        work_id = "failed-no-collection-work"
+        output = (
+            "CURSOR_WORKER_FAILED: Cursor process ended before a successful "
+            "turn_ended result; assistant_chars=0 process_state=failed "
+            'process_reason="injected prompt was not acknowledged"'
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(
+                parent,
+                runtime_state.attempt_request_identity("2 + 2 = ?"),
+            )
+            self._dispatch(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+                title="cursor-cycle-1",
+            )
+            lifecycle.ensure_parent_inbox(parent)
+            entry = runner_app.register_subagent_work(
+                parent_session_id=parent,
+                child_session_id=child,
+                agent="cursor_workhorse",
+                title="cursor-cycle-1",
+            )
+            entry.work_id = work_id
+
+            def ready(
+                generation: dict[str, object],
+                _state: dict[str, object],
+            ) -> None:
+                generation["terminal_status"] = "failed"
+                generation["terminal_output"] = output
+                generation["terminal_phase"] = "ready"
+
+            runtime_state.mutate_cursor_lifecycle(child, work_id, ready)
+            try:
+                acknowledgement = runner_app.mark_subagent_work_terminal(
+                    child,
+                    status="failed",
+                    output=output,
+                )
+                self.assertTrue(acknowledgement.delivered)
+                self.assertEqual(runtime_state.read_attempt_collections(parent), [])
+                self.assertTrue(runtime_state.read_terminal_failure(parent))
+                self.assertEqual(
+                    runtime_state.activate_parent_attempt(
+                        parent,
+                        runtime_state.attempt_request_identity(
+                            "question after terminal Cursor failure"
+                        ),
+                        new_request=True,
+                    ),
+                    2,
+                )
+                self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+
+    def test_exhausted_parent_wake_retries_until_queued_packet_wakes(
+        self,
+    ) -> None:
+        parent = "repeated-missing-work-parent"
+        child = "repeated-missing-work-child"
+        work_id = "repeated-missing-work-id"
+        terminal_output = (
+            "CURSOR_WORKER_FAILED: Cursor turn ended with status error; "
+            'recovered_assistant_output="Python printed `4`."'
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            self._dispatch(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+                title="cursor-cycle-1",
+            )
+
+            def ready(
+                generation: dict[str, object],
+                _state: dict[str, object],
+            ) -> None:
+                generation["terminal_status"] = "failed"
+                generation["terminal_output"] = terminal_output
+                generation["terminal_phase"] = "ready"
+
+            runtime_state.mutate_cursor_lifecycle(child, work_id, ready)
+            runner_app.unregister_subagent_work(child)
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            client = _MissingWorkClient(child, missing_attempts=2)
+            wake = mock.AsyncMock(side_effect=[False, False, True])
+
+            async def deliver_and_wait_for_wake() -> None:
+                await _native_post_delivery.post_external_session_status(
+                    client,
+                    session_id=child,
+                    status="idle",
+                )
+                retry = lifecycle._cursor_parent_wake_tasks[
+                    (parent, child, work_id)
+                ]
+                await asyncio.wait_for(retry, timeout=1.0)
+                await asyncio.sleep(0)
+
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    wake,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_cursor_parent_wake_retry_sleep",
+                    mock.AsyncMock(return_value=None),
+                ):
+                    asyncio.run(deliver_and_wait_for_wake())
+
+                entry = runner_app.get_subagent_work(child)
+                self.assertIsNotNone(entry)
+                assert entry is not None
+                self.assertEqual(entry.status, "failed")
+                self.assertTrue(entry.delivered)
+                self.assertEqual(entry.work_id, work_id)
+                inbox = runner_app._session_inboxes_ref[parent]
+                self.assertEqual(inbox.qsize(), 1)
+                packet = inbox.get_nowait()
+                self.assertEqual(packet["status"], "failed")
+                self.assertEqual(packet["work_id"], work_id)
+                self.assertEqual(packet["output"], terminal_output)
+                committed = runtime_state.read_cursor_lifecycle(
+                    child,
+                    work_id,
+                )
+                self.assertTrue(committed["delivery_committed"])
+                self.assertFalse(committed["parent_wake_pending"])
+                self.assertEqual(committed["parent_wake_attempts"], 2)
+                self.assertIn("parent_wake_delivered_at_ns", committed)
+                self.assertEqual(client.posts, 2)
+                self.assertEqual(wake.await_count, 3)
+                self.assertNotIn(
+                    (parent, child, work_id),
+                    lifecycle._cursor_parent_wake_tasks,
+                )
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+
+    def test_permanent_parent_wake_failure_terminalizes_without_loop(
+        self,
+    ) -> None:
+        parent = "permanent-wake-failure-parent"
+        child = "permanent-wake-failure-child"
+        work_id = "permanent-wake-failure-work"
+        initial_output = (
+            "CURSOR_WORKER_FAILED: Cursor turn ended with status error; "
+            'recovered_assistant_output="Python printed `4`."'
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            self._dispatch(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+                title="cursor-cycle-1",
+            )
+
+            def ready(
+                generation: dict[str, object],
+                _state: dict[str, object],
+            ) -> None:
+                generation["terminal_status"] = "failed"
+                generation["terminal_output"] = initial_output
+                generation["terminal_phase"] = "ready"
+
+            runtime_state.mutate_cursor_lifecycle(child, work_id, ready)
+            runner_app.unregister_subagent_work(child)
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            client = _MissingWorkClient(child, missing_attempts=2)
+            wake = mock.AsyncMock(return_value=False)
+
+            async def deliver_and_wait_for_terminal() -> None:
+                await _native_post_delivery.post_external_session_status(
+                    client,
+                    session_id=child,
+                    status="idle",
+                )
+                retry = lifecycle._cursor_parent_wake_tasks[
+                    (parent, child, work_id)
+                ]
+                await asyncio.wait_for(retry, timeout=1.0)
+                await asyncio.sleep(0)
+
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    wake,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_cursor_parent_wake_retry_sleep",
+                    mock.AsyncMock(return_value=None),
+                ), mock.patch.object(
+                    lifecycle,
+                    "_CURSOR_PARENT_WAKE_MAX_ATTEMPTS",
+                    2,
+                ):
+                    asyncio.run(deliver_and_wait_for_terminal())
+
+                entry = runner_app.get_subagent_work(child)
+                self.assertIsNotNone(entry)
+                assert entry is not None
+                self.assertEqual(entry.status, "failed")
+                self.assertTrue(entry.delivered)
+                inbox = runner_app._session_inboxes_ref[parent]
+                self.assertEqual(inbox.qsize(), 1)
+                packet = inbox.get_nowait()
+                self.assertEqual(packet["status"], "failed")
+                self.assertTrue(
+                    str(packet["output"]).startswith(
+                        "PIPELINE_INFRASTRUCTURE_ERROR:"
+                    )
+                )
+                state = runtime_state.read_cursor_lifecycle(child, work_id)
+                self.assertFalse(state["delivery_committed"])
+                self.assertFalse(state["parent_wake_pending"])
+                self.assertTrue(state["parent_wake_exhausted"])
+                self.assertTrue(state["parent_notification_queued"])
+                self.assertEqual(state["parent_wake_attempts"], 2)
+                self.assertTrue(runtime_state.read_terminal_failure(parent))
+                parent_events = runner_app._session_event_queues_ref[parent]
+                self.assertEqual(parent_events.qsize(), 1)
+                parent_notice = parent_events.get_nowait()
+                self.assertEqual(parent_notice["type"], "session.status")
+                self.assertEqual(parent_notice["status"], "failed")
+                self.assertTrue(
+                    str(parent_notice["error"]["message"]).startswith(  # type: ignore[index]
+                        "PIPELINE_INFRASTRUCTURE_ERROR:"
+                    )
+                )
+                self.assertEqual(wake.await_count, 3)
+                self.assertNotIn(
+                    (parent, child, work_id),
+                    lifecycle._cursor_parent_wake_tasks,
+                )
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+                runner_app._session_event_queues_ref.pop(parent, None)
+
+    def test_inflight_wake_is_cancelled_at_remaining_deadline(self) -> None:
+        parent = "inflight-deadline-parent"
+        child = "inflight-deadline-child"
+        work_id = "inflight-deadline-work"
+
+        async def never_returns(*_args: object, **_kwargs: object) -> bool:
+            await asyncio.Event().wait()
+            return False
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            self._seed_stranded_completion(
+                parent=parent,
+                child=child,
+                work_id=work_id,
+            )
+            started = time.monotonic()
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    never_returns,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_CURSOR_PARENT_WAKE_DEADLINE_S",
+                    0.02,
+                ):
+                    asyncio.run(
+                        lifecycle._retry_cursor_parent_wake(
+                            client=object(),
+                            parent_session_id=parent,
+                            child_session_id=child,
+                            work_id=work_id,
+                            notice="wake",
+                            created_by=None,
+                        )
+                    )
+
+                self.assertLess(time.monotonic() - started, 0.5)
+                state = runtime_state.read_cursor_lifecycle(child, work_id)
+                self.assertTrue(state["parent_wake_exhausted"])
+                self.assertFalse(state["parent_wake_pending"])
+                self.assertFalse(state["delivery_committed"])
+                self.assertTrue(runtime_state.read_terminal_failure(parent))
+                event = runner_app._session_event_queues_ref[
+                    parent
+                ].get_nowait()
+                self.assertEqual(event["status"], "failed")
+            finally:
+                runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+                runner_app._session_event_queues_ref.pop(parent, None)
+
+    def test_two_stranded_children_each_own_bounded_terminal_recovery(
+        self,
+    ) -> None:
+        parent = "two-stranded-children-parent"
+        children = (
+            ("two-stranded-child-a", "two-stranded-work-a"),
+            ("two-stranded-child-b", "two-stranded-work-b"),
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runner_app._session_inboxes_ref.pop(parent, None)
+            runner_app._session_event_queues_ref.pop(parent, None)
+            for child, work_id in children:
+                self._seed_stranded_completion(
+                    parent=parent,
+                    child=child,
+                    work_id=work_id,
+                )
+            wake = mock.AsyncMock(return_value=False)
+
+            async def schedule_and_wait() -> None:
+                for child, work_id in children:
+                    lifecycle._schedule_cursor_parent_wake_retry(
+                        client=object(),
+                        parent_session_id=parent,
+                        child_session_id=child,
+                        work_id=work_id,
+                        notice=f"wake-{child}",
+                        created_by=None,
+                    )
+                tasks = tuple(lifecycle._cursor_parent_wake_tasks.values())
+                self.assertEqual(len(tasks), 2)
+                await asyncio.gather(*tasks)
+                await asyncio.sleep(0)
+
+            try:
+                with mock.patch.object(
+                    runner_app,
+                    "_deliver_subagent_wake_post",
+                    wake,
+                ), mock.patch.object(
+                    lifecycle,
+                    "_CURSOR_PARENT_WAKE_MAX_ATTEMPTS",
+                    1,
+                ):
+                    asyncio.run(schedule_and_wait())
+
+                self.assertEqual(wake.await_count, 2)
+                self.assertEqual(lifecycle._cursor_parent_wake_tasks, {})
+                inbox = runner_app._session_inboxes_ref[parent]
+                self.assertEqual(inbox.qsize(), 2)
+                for child, work_id in children:
+                    entry = runner_app.get_subagent_work(child)
+                    self.assertIsNotNone(entry)
+                    assert entry is not None
+                    self.assertEqual(entry.status, "failed")
+                    state = runtime_state.read_cursor_lifecycle(child, work_id)
+                    self.assertTrue(state["parent_wake_exhausted"])
+                    self.assertFalse(state["parent_wake_pending"])
+                    self.assertFalse(state["delivery_committed"])
+            finally:
+                for child, _work_id in children:
+                    runner_app.unregister_subagent_work(child)
+                runner_app._session_inboxes_ref.pop(parent, None)
+                runner_app._session_event_queues_ref.pop(parent, None)
 
     def test_inbox_time_contract_is_far_below_transport_timeout(self) -> None:
         self.assertEqual(lifecycle._CURSOR_STAGE_INACTIVITY_S, 5 * 60)

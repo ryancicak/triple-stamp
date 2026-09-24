@@ -91,6 +91,8 @@ PLUGIN_VERSION = "0.4.0"
 PLUGIN_ENTRY_NAME = "isaac"
 PLUGIN_ENTRY_VALUE = "triple_stamp_isaac_launcher:IsaacClaudeLauncher"
 _PIPELINE_OUTPUTS = (
+    "best-effort-answer.bin",
+    "best-effort-attestation.json",
     "budget-state.json",
     "codex-punch-lists.jsonl",
     "failure-attestation.json",
@@ -232,6 +234,52 @@ def _managed_claude_environment(
             if isinstance(value, str):
                 merged[name] = value
     return merged
+
+
+def _managed_claude_bearer(
+    real_home: Path,
+    host_env: dict[str, str],
+    paths: tuple[Path, ...] = CLAUDE_MANAGED_SETTINGS,
+) -> str:
+    """Mint gateway auth before the isolated HOME loses secure-store access."""
+
+    helper = ""
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            candidate = payload.get("apiKeyHelper", "")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(candidate, str) and candidate.strip():
+            helper = candidate.strip()
+    try:
+        argv = shlex.split(helper)
+        expected = (real_home / ".local/bin/ug").resolve()
+        executable = Path(argv[0]).expanduser().resolve()
+    except (IndexError, OSError, ValueError):
+        argv = []
+        executable = Path("/")
+    if (
+        len(argv) != 6
+        or executable != expected
+        or argv[1] != "auth-token"
+        or argv[2] != "--host"
+        or not argv[3].startswith("https://")
+        or argv[4] != "--profile"
+        or not argv[5]
+    ):
+        _die(
+            "managed Claude apiKeyHelper is unavailable or has an unexpected shape",
+            EXIT_AUTH,
+        )
+    result = _run(argv, env=host_env, timeout=30)
+    token = result.stdout.strip()
+    if result.returncode or len(token) < 20:
+        _die(
+            "managed Claude gateway token could not be minted before isolation",
+            EXIT_AUTH,
+        )
+    return token
 
 
 def _detect_claude_namespace(
@@ -1086,6 +1134,9 @@ def _ensure_plugin(
     tools: Toolchain,
     host_env: dict[str, str],
 ) -> None:
+    # Editable registration mutates the target interpreter globally. The lock
+    # is keyed by that interpreter, not by checkout, so two worktrees cannot
+    # concurrently retarget or repair the same managed-Python metadata.
     with _PluginInstallLock(tools.omnigent_python):
         status, check = _plugin_probe(root, tools, host_env)
         if check.returncode == 0 and status.get("ok") is True:
@@ -1672,14 +1723,10 @@ def _apply_provider_to_bundle(
     if not isinstance(supervisor_prompt, str):
         _die("runtime supervisor prompt is not text")
     supervisor_prompt = supervisor_prompt.replace(
-        (
-            "This run permits exactly 2 complete cycles. Cycle 3 is denied.\n"
-            "After 2 failed cycles,"
-        ),
+        "This run permits exactly 2 complete cycles. Cycle 3 is denied.",
         (
             f"This run permits exactly {cycles} complete cycles. "
-            f"Cycle {cycles + 1} is denied.\n"
-            f"After {cycles} failed cycles,"
+            f"Cycle {cycles + 1} is denied."
         ),
     )
     documents["supervisor"]["prompt"] = supervisor_prompt
@@ -2394,7 +2441,7 @@ def _inner_validate(root: Path, args: list[str]) -> int:
         )
         if cursor_pin.returncode:
             _die(
-                "Cursor Grok 4.6 Extra High wrapper self-test failed: "
+                "Grok 4.6 Extra High wrapper self-test failed: "
                 f"{cursor_pin.stderr.strip() or cursor_pin.stdout.strip() or 'no output'}"
             )
         codex_probe_env = {
@@ -2485,7 +2532,7 @@ def _inner_validate(root: Path, args: list[str]) -> int:
         )
         print(f"  provider: {provider}")
         print(f"  supervisor: {os.environ['TRIPLE_STAMP_SUPERVISOR_MODEL']}")
-        print("  Cursor: cursor-grok-4.6-xhigh (Cursor Grok 4.6 Extra High)")
+        print("  Cursor: cursor-grok-4.6-xhigh (Grok 4.6 Extra High)")
         print(f"  Opus: {os.environ['TRIPLE_STAMP_OPUS_MODEL']}, max")
         print(f"  Codex: {os.environ['TRIPLE_STAMP_CODEX_MODEL']}, ultra")
         print(
@@ -2572,7 +2619,32 @@ def _spawn_sandboxed(
         stdout_handle = (Path(runtime_env["TRIPLE_STAMP_RUN_DIR"]) / "child-stdout.bin").open(
             "wb"
         )
+    child: subprocess.Popen[bytes] | None = None
+    received_signal: int | None = None
+    stop_deadline: float | None = None
+    force_shutdown = False
+
+    def forward(signum: int, _frame: object) -> None:
+        nonlocal received_signal, stop_deadline, force_shutdown
+        force = received_signal is not None
+        force_shutdown = force_shutdown or force
+        if received_signal is None:
+            received_signal = signum
+        stop_deadline = (
+            time.monotonic()
+            if force
+            else time.monotonic() + STOP_GRACE_SECONDS
+        )
+        if child is not None:
+            _signal_sandbox_child(child, signum, force=force)
+
+    old_handlers: dict[int, object] = {}
     try:
+        # Install handlers before Popen creates a detached process group. A
+        # signal delivered between Popen's return and STORE_FAST is retained
+        # above and forwarded immediately after the child reference is stored.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            old_handlers[signum] = signal.signal(signum, forward)
         child = subprocess.Popen(
             command,
             env=runtime_env,
@@ -2580,24 +2652,12 @@ def _spawn_sandboxed(
             start_new_session=True,
             stdout=stdout_handle,
         )
-    finally:
-        if stdout_handle is not None:
-            stdout_handle.close()
-    received_signal: int | None = None
-    stop_deadline: float | None = None
-
-    def forward(signum: int, _frame: object) -> None:
-        nonlocal received_signal, stop_deadline
-        received_signal = signum
-        stop_deadline = time.monotonic() + STOP_GRACE_SECONDS
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(child.pid, signum)
-
-    old_handlers = {
-        signum: signal.signal(signum, forward)
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    }
-    try:
+        if received_signal is not None:
+            _signal_sandbox_child(
+                child,
+                received_signal,
+                force=force_shutdown,
+            )
         while True:
             try:
                 return_code = child.wait(timeout=0.25)
@@ -2611,7 +2671,15 @@ def _spawn_sandboxed(
                     child.kill()
                 return_code = child.wait()
                 break
+    except BaseException:
+        # Once Popen succeeds, every exceptional path owns and terminates the
+        # detached child; otherwise it could survive as an orphaned paid run.
+        if child is not None:
+            _terminate_sandbox_child(child)
+        raise
     finally:
+        if stdout_handle is not None:
+            stdout_handle.close()
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
     if received_signal is not None:
@@ -2621,6 +2689,50 @@ def _spawn_sandboxed(
         )
         return 128 + received_signal
     return return_code
+
+
+def _signal_sandbox_child(
+    child: subprocess.Popen[bytes],
+    signum: int,
+    *,
+    force: bool,
+) -> None:
+    """Forward shutdown signals, escalating a repeated interrupt immediately."""
+
+    forwarded = (
+        signal.SIGKILL
+        if force
+        else signal.SIGTERM
+        if signum == signal.SIGINT
+        else signum
+    )
+    try:
+        os.killpg(child.pid, forwarded)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        if force:
+            child.kill()
+        else:
+            child.terminate()
+
+
+def _terminate_sandbox_child(child: subprocess.Popen[bytes]) -> None:
+    """Best-effort bounded teardown for a successfully spawned sandbox child."""
+
+    if child.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        _signal_sandbox_child(child, signal.SIGTERM, force=False)
+    try:
+        child.wait(timeout=STOP_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        _signal_sandbox_child(child, signal.SIGTERM, force=True)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        child.wait(timeout=5)
 
 
 def _record_external_signal(run_dir: Path, signum: int) -> None:
@@ -2657,17 +2769,320 @@ def _reset_pipeline_outputs(run_dir: Path) -> None:
         shutil.rmtree(run_dir / directory, ignore_errors=True)
 
 
-def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) -> int:
-    """Return zero only for self-test or an immutable collected STAMP."""
+def _parent_artifact_path(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str = "",
+) -> Path:
+    if not parent_session_id:
+        return run_dir / filename
+    digest = hashlib.sha256(parent_session_id.encode("utf-8")).hexdigest()[:16]
+    path = Path(filename)
+    return run_dir / f"{path.stem}-{digest}{path.suffix}"
+
+
+def _validated_best_effort_exit(
+    run_dir: Path,
+    parent_session_id: str = "",
+) -> bool:
+    """Verify a complete non-STAMP answer and its available source packets."""
+
+    attestation_path = _parent_artifact_path(
+        run_dir,
+        "best-effort-attestation.json",
+        parent_session_id,
+    )
+    if not parent_session_id and not attestation_path.exists():
+        candidates = sorted(run_dir.glob("best-effort-attestation-*.json"))
+        if len(candidates) == 1:
+            attestation_path = candidates[0]
+    try:
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        if not isinstance(attestation, dict):
+            return False
+        attested_parent = str(
+            attestation.get("parent_session_id") or parent_session_id
+        )
+        answer = _parent_artifact_path(
+            run_dir,
+            "best-effort-answer.bin",
+            attested_parent,
+        ).read_bytes()
+        collections = [
+            json.loads(line)
+            for line in (run_dir / "routing-collections.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        dispatch_path = run_dir / "routing-dispatches.jsonl"
+        dispatches = (
+            [
+                json.loads(line)
+                for line in dispatch_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if dispatch_path.exists()
+            else []
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if attested_parent:
+        collections = [
+            record
+            for record in collections
+            if record.get("parent_session_id") == attested_parent
+        ]
+        dispatches = [
+            record
+            for record in dispatches
+            if record.get("parent_session_id") == attested_parent
+        ]
+    try:
+        attempt_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+        collections = [
+            record
+            for record in collections
+            if int(record.get("attempt_generation") or 1)
+            == attempt_generation
+        ]
+        dispatches = [
+            record
+            for record in dispatches
+            if int(record.get("attempt_generation") or 1)
+            == attempt_generation
+        ]
+    except (TypeError, ValueError):
+        return False
+    sources = attestation.get("source_packets")
+    if (
+        attestation.get("verdict") != "BEST_EFFORT"
+        or attestation.get("quality_approved") is not False
+        or attestation.get("provenance_version") != 1
+        or not answer
+        or answer.startswith(
+            (b"PIPELINE_VALIDATION_FAILED:", b"PIPELINE_INFRASTRUCTURE_ERROR:")
+        )
+        or attestation.get("answer_length") != len(answer)
+        or not isinstance(attestation.get("answer_sha256"), str)
+        or not secrets.compare_digest(
+            hashlib.sha256(answer).hexdigest(),
+            attestation["answer_sha256"],
+        )
+        or (
+            attested_parent
+            and attestation.get("parent_session_id") != attested_parent
+        )
+        or not isinstance(sources, list)
+        or len(sources) not in {2, 3}
+        or {
+            source.get("agent")
+            for source in sources
+            if isinstance(source, dict)
+        }
+        not in (
+            {"cursor_workhorse", "opus_auditor"},
+            {"cursor_workhorse", "opus_auditor", "codex_judge"},
+        )
+    ):
+        return False
+    cycle = attestation.get("cycle")
+    if not isinstance(cycle, int) or cycle not in {1, 2, 3, 4}:
+        return False
+    expected_titles = {
+        "cursor_workhorse": rf"cursor-cycle-{cycle}",
+        "opus_auditor": (
+            rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
+            rf"retry-{cycle}-1|internal-{cycle}-[1-2]|"
+            rf"format-repair-{cycle}(?:-web-[1-2])?)"
+        ),
+        "codex_judge": (
+            rf"judge-(?:cycle|convergence|format-repair)-{cycle}"
+        ),
+    }
+    collection_sequences: list[int] = []
+    dispatch_sequences: list[int] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            return False
+        agent = str(source.get("agent") or "")
+        if (
+            re.fullmatch(
+                expected_titles.get(agent, r"(?!x)x"),
+                str(source.get("title") or ""),
+            )
+            is None
+        ):
+            return False
+        matching_pair = next(
+            (
+                (index, record)
+                for index, record in enumerate(collections)
+                if record.get("agent") == source.get("agent")
+                and record.get("title") == source.get("title")
+                and str(record.get("child_session_id") or "")
+                == str(source.get("child_session_id") or "")
+                and str(record.get("work_id") or "")
+                == str(source.get("work_id") or "")
+                and record.get("status") == "completed"
+                and isinstance(record.get("output"), str)
+            ),
+            None,
+        )
+        if matching_pair is None:
+            return False
+        collection_index, matching = matching_pair
+        output = str(matching["output"]).encode("utf-8")
+        matching_dispatch_pair = next(
+            (
+                (index, record)
+                for index, record in enumerate(dispatches)
+                if (
+                    (
+                        str(source.get("work_id") or "")
+                        and str(record.get("work_id") or "")
+                        == str(source.get("work_id") or "")
+                    )
+                    or (
+                        not str(source.get("work_id") or "")
+                        and str(source.get("child_session_id") or "")
+                        and str(record.get("child_session_id") or "")
+                        == str(source.get("child_session_id") or "")
+                        and record.get("title") == source.get("title")
+                    )
+                )
+            ),
+            None,
+        )
+        dispatch_sequence = (
+            matching_dispatch_pair[0] + 1
+            if matching_dispatch_pair is not None
+            else 0
+        )
+        dispatched_at_ns = (
+            int(matching_dispatch_pair[1].get("dispatched_at_ns") or 0)
+            if matching_dispatch_pair is not None
+            else 0
+        )
+        if (
+            source.get("output_length") != len(output)
+            or not isinstance(source.get("output_sha256"), str)
+            or not secrets.compare_digest(
+                hashlib.sha256(output).hexdigest(),
+                source["output_sha256"],
+            )
+            or source.get("collection_sequence") != collection_index + 1
+            or source.get("collected_at_ns")
+            != int(matching.get("collected_at_ns") or 0)
+            or source.get("dispatch_sequence") != dispatch_sequence
+            or source.get("dispatched_at_ns") != dispatched_at_ns
+        ):
+            return False
+        collection_sequences.append(collection_index + 1)
+        dispatch_sequences.append(dispatch_sequence)
+    if collection_sequences != sorted(collection_sequences):
+        return False
+    nonzero_dispatches = [
+        sequence for sequence in dispatch_sequences if sequence
+    ]
+    if nonzero_dispatches != sorted(nonzero_dispatches):
+        return False
+    terminal_source_sequence = collection_sequences[-1]
+    for index, record in enumerate(collections):
+        if (
+            index + 1 > terminal_source_sequence
+            and record.get("agent") == "opus_auditor"
+            and re.fullmatch(
+                rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
+                rf"retry-{cycle}-1|internal-{cycle}-[1-2]|"
+                rf"format-repair-{cycle}(?:-web-[1-2])?)",
+                str(record.get("title") or ""),
+            )
+        ):
+            return False
+    for dispatch in dispatches:
+        if (
+            dispatch.get("agent") != "opus_auditor"
+            or re.fullmatch(
+                rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
+                rf"retry-{cycle}-1|internal-{cycle}-[1-2]|"
+                rf"format-repair-{cycle}(?:-web-[1-2])?)",
+                str(dispatch.get("title") or ""),
+            )
+            is None
+        ):
+            continue
+        work_id = str(dispatch.get("work_id") or "")
+        child_session_id = str(dispatch.get("child_session_id") or "")
+        if not any(
+            (
+                work_id
+                and str(record.get("work_id") or "") == work_id
+            )
+            or (
+                not work_id
+                and child_session_id
+                and str(record.get("child_session_id") or "")
+                == child_session_id
+                and record.get("title") == dispatch.get("title")
+            )
+            for record in collections
+        ):
+            return False
+    return True
+
+
+def _validated_pipeline_exit(
+    run_dir: Path,
+    child_code: int,
+    args: list[str],
+    parent_session_id: str = "",
+) -> int:
+    """Return zero only for self-test or an integrity-checked final answer."""
 
     if any(arg in SELF_TEST_FLAGS for arg in args):
         return child_code
 
+    stamp_path = _parent_artifact_path(
+        run_dir,
+        "stamp-attestation.json",
+        parent_session_id,
+    )
+    stamp_candidates = (
+        sorted(run_dir.glob("stamp-attestation-*.json"))
+        if not parent_session_id and not stamp_path.exists()
+        else []
+    )
+    if (
+        not stamp_path.exists()
+        and not stamp_candidates
+        and _validated_best_effort_exit(run_dir, parent_session_id)
+    ):
+        return 0
+
     try:
-        attestation = json.loads(
-            (run_dir / "stamp-attestation.json").read_text(encoding="utf-8")
+        attestation_path = _parent_artifact_path(
+            run_dir,
+            "stamp-attestation.json",
+            parent_session_id,
         )
-        answer = (run_dir / "stamped-answer.bin").read_bytes()
+        if not parent_session_id and not attestation_path.exists():
+            candidates = sorted(run_dir.glob("stamp-attestation-*.json"))
+            if len(candidates) == 1:
+                attestation_path = candidates[0]
+        attestation = json.loads(
+            attestation_path.read_text(encoding="utf-8")
+        )
+        attested_parent = str(
+            attestation.get("parent_session_id") or parent_session_id
+        )
+        answer = _parent_artifact_path(
+            run_dir,
+            "stamped-answer.bin",
+            attested_parent,
+        ).read_bytes()
     except (OSError, ValueError, json.JSONDecodeError):
         _ensure_terminal_failure(run_dir, child_code)
         return child_code if child_code != 0 else EXIT_PIPELINE
@@ -2691,6 +3106,21 @@ def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) ->
             .read_text(encoding="utf-8")
             .splitlines()
             if line.strip()
+        ]
+        if attested_parent:
+            collections = [
+                record
+                for record in collections
+                if record.get("parent_session_id") == attested_parent
+            ]
+        attempt_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+        collections = [
+            record
+            for record in collections
+            if int(record.get("attempt_generation") or 1)
+            == attempt_generation
         ]
     except OSError:
         _ensure_terminal_failure(
@@ -2732,7 +3162,7 @@ def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) ->
             if (
                 record.get("agent") == "opus_auditor"
                 and re.search(
-                    rf"(?:cycle-|repair-|internal-){attested_cycle}(?:-|$)",
+                    rf"(?:cycle-|repair-|retry-|internal-){attested_cycle}(?:-|$)",
                     title,
                 )
                 and isinstance(observation, dict)
@@ -2748,7 +3178,8 @@ def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) ->
             } or (
                 cursor_seen
                 and re.fullmatch(
-                    rf"audit-(?:cycle|format-repair)-{attested_cycle}-web-[1-2]",
+                    rf"audit-(?:(?:cycle|format-repair)-"
+                    rf"{attested_cycle}-web-[1-2]|retry-{attested_cycle}-1)",
                     title,
                 )
                 is not None
@@ -2760,6 +3191,10 @@ def _validated_pipeline_exit(run_dir: Path, child_code: int, args: list[str]) ->
         and required_chain
         and not observed_nonmax_opus_effort
         and attestation.get("answer_length") == len(answer)
+        and (
+            not attested_parent
+            or attestation.get("parent_session_id") == attested_parent
+        )
         and isinstance(attestation.get("answer_sha256"), str)
         and secrets.compare_digest(answer_digest, attestation["answer_sha256"])
         and isinstance(attestation.get("voice_profile_sha256"), str)
@@ -3062,7 +3497,19 @@ def _emit_attested_answer(run_dir: Path, args: list[str]) -> None:
 
     if not _prompt_mode(args):
         return
-    answer = (run_dir / "stamped-answer.bin").read_bytes()
+    answer_path = run_dir / "stamped-answer.bin"
+    if not answer_path.exists():
+        attestations = sorted(run_dir.glob("stamp-attestation-*.json"))
+        if len(attestations) == 1:
+            attestation = json.loads(
+                attestations[0].read_text(encoding="utf-8")
+            )
+            answer_path = _parent_artifact_path(
+                run_dir,
+                "stamped-answer.bin",
+                str(attestation.get("parent_session_id") or ""),
+            )
+    answer = answer_path.read_bytes()
     sys.stdout.buffer.write(answer)
     sys.stdout.buffer.flush()
 
@@ -3072,7 +3519,19 @@ def _emit_terminal_failure(run_dir: Path, args: list[str]) -> None:
 
     if not _prompt_mode(args):
         return
-    data = (run_dir / "terminal-failure.txt").read_bytes()
+    failure_path = run_dir / "terminal-failure.txt"
+    if not failure_path.exists():
+        attestations = sorted(run_dir.glob("failure-attestation-*.json"))
+        if len(attestations) == 1:
+            attestation = json.loads(
+                attestations[0].read_text(encoding="utf-8")
+            )
+            failure_path = _parent_artifact_path(
+                run_dir,
+                "terminal-failure.txt",
+                str(attestation.get("parent_session_id") or ""),
+            )
+    data = failure_path.read_bytes()
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
 
@@ -3110,6 +3569,11 @@ def _outer_main(root: Path, args: list[str]) -> int:
     )
     _ensure_plugin(root, tools, host_env)
     cursor_token = _cursor_token(tools, host_env)
+    claude_bearer = (
+        _managed_claude_bearer(real_home, host_env)
+        if provider == "direct" and model_namespace == "databricks_gateway"
+        else ""
+    )
     if provider == "databricks":
         omnigent_token, omnigent_expiry = _omnigent_remote_auth(tools, host_env)
         supervisor_provider = _supervisor_provider(real_home)
@@ -3135,6 +3599,9 @@ def _outer_main(root: Path, args: list[str]) -> int:
         provider,
         models,
     )
+    if claude_bearer:
+        runtime_env["DATABRICKS_BEARER"] = claude_bearer
+        runtime_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] += ",DATABRICKS_BEARER"
     runtime_args, browser_mode, translated_no_session = _browser_launch_args(args)
     if browser_mode:
         _configure_browser_runtime(runtime_env, root)

@@ -1,5 +1,5 @@
 # Deterministic three-stage pipeline:
-# Cursor Grok 4.6 Extra High -> Claude Opus 5 Max
+# Grok 4.6 Extra High -> Claude Opus 5 Max
 # -> Codex GPT-5.6 Sol Ultra.
 spec_version: 1
 name: triple-stamp
@@ -92,6 +92,12 @@ prompt: |
      If exact-child mechanical validation rejects an Opus `tools_called` name,
      launch the same fresh `audit-internal-N-H` path before Codex. Never ask
      Cursor to repair internal receipts or internal-system evidence.
+     If the collected Opus packet is a transient mid-stream death, launch a fresh
+     Opus child and native process titled `audit-retry-N-1`, skipping Cursor.
+     Its self-contained handoff is the same audit request: original request and
+     current-cycle Cursor evidence. Never continue or resume the dead terminal;
+     the child returns a complete fresh audit object. The truncated packet is not
+     evidence and carries no verdict.
   3. After Opus completes with PASS, PASS_WITH_GAPS, or FAIL, dispatch
      `codex_judge` with title `judge-cycle-N`, including the original request,
      current-cycle Cursor evidence, and the final audit. The runtime retains
@@ -161,9 +167,11 @@ prompt: |
   PASS, PASS_WITH_GAPS, FAIL, or NEEDS_WEB.
 
   CODEX HANDOFF
-  Give Codex the original request, complete Cursor evidence, and Opus audit. Require
-  Codex to render the complete answer in `shippable_answer` and re-check every
-  material statement afterwards. Voice rendering is optional and Codex resolves
+  Give Codex the original request, complete Cursor evidence, and Opus audit. On
+  STAMP, require Codex to render the complete answer in `shippable_answer` and
+  re-check every material statement afterwards. On a non-STAMP verdict, require
+  a complete supported-only `best_supported_answer` for bounded finalization.
+  Voice rendering is optional and Codex resolves
   it from `TRIPLE_STAMP_VOICE_PROFILE`: with a profile it reads that exact live
   file and reports the path and SHA-256; with none it writes plain prose and
   never asks for a profile. If the original request explicitly requires
@@ -199,9 +207,10 @@ prompt: |
   previous audit and hunt spec, cumulative web evidence, and the newest packet.
   It is the same logical audit stage but a new process and session. Downstream
   Opus/Codex must semantically reject incomplete evidence.
-  At most two web hops for each requester in each cycle. A third NEEDS_WEB is
-  terminal
-  `PIPELINE_VALIDATION_FAILED` with the unresolved gaps.
+  At most two web hops for each requester in each cycle. A third NEEDS_WEB
+  enters bounded customer finalization: return the best supported completed
+  answer with the unresolved evidence gaps stated explicitly. Do not expose
+  pipeline failure vocabulary to the user.
 
   If Codex returns NEEDS_INTERNAL, require a concrete lookup spec containing
   claim, exact_query_or_tool_call, which_system, where_to_look,
@@ -211,16 +220,17 @@ prompt: |
   contain the original request, current-cycle Cursor packet, previous audit
   and `internal_coverage`, and lookup spec. The returning Opus child must
   produce a full refreshed audit before Codex judges again. At most two
-  NEEDS_INTERNAL hops are allowed per cycle; a third is terminal
-  `PIPELINE_VALIDATION_FAILED` with the unresolved internal gaps.
+  NEEDS_INTERNAL hops are allowed per cycle; a third enters the same bounded
+  customer finalization with explicit unresolved internal gaps.
 
   If Codex returns REWORK, dispatch the original request and punch list to
   Cursor only when every structured item requires public web, a live test, or
   Stage 1 evidence that Cursor can perform. Restart Cursor -> Opus -> Codex as
   cycle N+1. This run permits exactly 2 complete cycles. Cycle 3 is denied.
-  After 2 failed cycles, return only:
-  `PIPELINE_VALIDATION_FAILED: <remaining evidence gaps>`.
-  This is a terminal failure, not a customer answer.
+  After the configured final cycle, preserve any prior valid STAMP. Otherwise
+  return a finished answer from the latest complete packets, followed by the
+  material limitations and evidence gaps. This is explicitly not a STAMP, but
+  it is a customer answer and must not contain `PIPELINE_*` vocabulary.
 
   CONVERGENCE
   The runtime persists normalized Codex punch lists using exact canonical IDs
@@ -234,9 +244,19 @@ prompt: |
   ROUTING FAILURES
   Make one `sys_session_send` attempt for a transition. If Omnigent returns a
   genuine native launch or infrastructure error, do not retry alternate payload
-  wording. One failed fresh Opus launch is terminal; never retry it under the
-  same or another title. Return one `PIPELINE_INFRASTRUCTURE_ERROR` with that
-  failure.
+  wording. A genuine failed fresh Opus launch is terminal; never retry that same
+  failed launch under the same or another title with reworded payload. Return one
+  `PIPELINE_INFRASTRUCTURE_ERROR` with that failure.
+  A transient Opus stream death is not a genuine launch failure. When a collected
+  Opus audit packet reports a mid-stream provider error (for example "server
+  error mid-response" or "the response above may be incomplete"), its output is
+  truncated and must never be read as an audit verdict. The runtime recovers it
+  deterministically: the `[System-required next dispatch: ...]` line, or the
+  continuation prompt, names a fresh `audit-retry-N-1` child. Dispatch exactly
+  that title. This is a new native Claude process and session, never a resume of
+  the dead terminal, and it does not advance the cycle counter. At most one such
+  retry per cycle is allowed; a second mid-stream death is terminal
+  `PIPELINE_INFRASTRUCTURE_ERROR`.
 
   CURSOR DELIVERY
   Treat only a completed Cursor packet as stage output. The generated runtime
@@ -244,6 +264,11 @@ prompt: |
   a stable successful `turn_ended` event and a non-empty final assistant result.
   A legacy incomplete packet returns a non-terminal pending notice and arranges
   a later completion wake; do not advance, retry, or poll in response to it.
+  A definitive zero-output inactivity timeout or explicit provider-error turn
+  may route to one fresh child titled `cursor-retry-N-1`. Dispatch that exact
+  title when the runtime names it. It stays in cycle N, is separate from the
+  Opus retry budget, and is never a resume of the failed Cursor session. A
+  second Cursor transport failure is terminal.
 
   FINAL OUTPUT
   A confidence score is never a stamp. Only `verdict: STAMP` with a non-empty
@@ -251,7 +276,12 @@ prompt: |
   whether a profile is configured is a stamp. On STAMP, your entire response must be the exact byte-for-byte value
   of Codex's `shippable_answer`, with nothing before or after it. Do not rewrite,
   normalize whitespace, add metadata, or append evidence outside that field.
-  A server-side response policy rejects any unstamped or non-exact final text.
+  If bounded routing ends on a valid non-STAMP Codex judgment, the runtime
+  deterministically relays `best_supported_answer` (or Cursor's explicit
+  completed customer-answer draft for a legacy packet) plus concrete remaining
+  gaps. It records a separate `BEST_EFFORT` integrity artifact with
+  `quality_approved: false`; it never fabricates a STAMP. A server-side response
+  policy rejects all other unstamped final text.
 
 tools:
   agents:

@@ -17,8 +17,10 @@ from urllib.parse import quote
 _LOGGER = logging.getLogger(__name__)
 _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-cycle-([1-4])", "cursor_grunt", ""),
+    (r"cursor-retry-([1-4])-(1)", "cursor_retry", ""),
     (r"audit-cycle-([1-4])", "audit", "opus"),
     (r"audit-cycle-([1-4])-web-([1-2])", "audit_web", "opus"),
+    (r"audit-retry-([1-4])-(1)", "audit_retry", "opus"),
     (r"audit-internal-([1-4])-([1-2])", "audit_internal", "codex"),
     (r"judge-cycle-([1-4])", "judge", "codex"),
     (r"judge-convergence-([1-4])", "judge_convergence", "codex"),
@@ -33,7 +35,14 @@ _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-web-codex-([1-4])-([1-2])", "cursor_web", "codex"),
 )
 _HOP_STAGE_IDS = frozenset(
-    {"audit_web", "audit_internal", "audit_repair_web", "cursor_web"}
+    {
+        "audit_web",
+        "audit_retry",
+        "audit_internal",
+        "audit_repair_web",
+        "cursor_retry",
+        "cursor_web",
+    }
 )
 _TOOL_DISPATCH_EXCEPTIONS = (
     AttributeError,
@@ -42,6 +51,10 @@ _TOOL_DISPATCH_EXCEPTIONS = (
     TypeError,
     ValueError,
 )
+
+
+class AttemptInFlightError(RuntimeError):
+    """A distinct top-level request arrived before its predecessor terminated."""
 
 
 def _validate_dispatch_title_patterns() -> None:
@@ -84,10 +97,734 @@ def _run_dir() -> Path | None:
     return Path(raw) if raw else None
 
 
+_ATTEMPTS_DIRECTORY = ".triple-stamp-attempts"
+_ATTEMPT_ARTIFACTS = (
+    "best-effort-answer.bin",
+    "best-effort-attestation.json",
+    "budget-state.json",
+    "failure-attestation.json",
+    "pipeline-terminal",
+    "stamp-attestation.json",
+    "stamped-answer.bin",
+    "stamped-answer.sha256",
+    "terminal-failure.txt",
+)
+_TERMINAL_ARTIFACTS = frozenset(
+    {
+        "best-effort-answer.bin",
+        "best-effort-attestation.json",
+        "failure-attestation.json",
+        "stamp-attestation.json",
+        "stamped-answer.bin",
+        "terminal-failure.txt",
+    }
+)
+
+
+def _parent_scope_digest(parent_session_id: str) -> str:
+    value = parent_session_id or "__legacy_single_parent__"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _attempt_root(run_dir: Path, parent_session_id: str) -> Path:
+    return (
+        run_dir
+        / _ATTEMPTS_DIRECTORY
+        / _parent_scope_digest(parent_session_id)
+    )
+
+
+def _attempt_state_path(run_dir: Path, parent_session_id: str) -> Path:
+    return _attempt_root(run_dir, parent_session_id) / "state.json"
+
+
+def _read_attempt_state_unlocked(
+    run_dir: Path,
+    parent_session_id: str,
+) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            _attempt_state_path(run_dir, parent_session_id).read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_attempt_state_unlocked(
+    run_dir: Path,
+    parent_session_id: str,
+    state: dict[str, Any],
+) -> None:
+    root = _attempt_root(run_dir, parent_session_id)
+    temporary = root / f".state-{os.getpid()}-{time.time_ns()}.tmp"
+    data = (
+        json.dumps(state, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, root / "state.json")
+
+
+def _attempt_generation_dir(
+    run_dir: Path,
+    parent_session_id: str,
+    generation: int,
+) -> Path:
+    return _attempt_root(run_dir, parent_session_id) / (
+        f"generation-{max(1, int(generation)):08d}"
+    )
+
+
+def _artifact_target_from_generation(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str,
+    generation: int,
+) -> Path:
+    generation_dir = _attempt_generation_dir(
+        run_dir,
+        parent_session_id,
+        generation,
+    )
+    if filename in _TERMINAL_ARTIFACTS:
+        return generation_dir / "terminal" / filename
+    return generation_dir / filename
+
+
+def _legacy_parent_artifact_path(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str = "",
+) -> Path:
+    if not parent_session_id:
+        return run_dir / filename
+    digest = hashlib.sha256(parent_session_id.encode("utf-8")).hexdigest()[:16]
+    path = Path(filename)
+    return run_dir / f"{path.stem}-{digest}{path.suffix}"
+
+
+def _ensure_artifact_aliases(
+    run_dir: Path,
+    parent_session_id: str,
+) -> None:
+    """Install stable launcher-compatible names through one atomic current link."""
+
+    root = _attempt_root(run_dir, parent_session_id)
+    if not (root / "state.json").is_file():
+        return
+    for filename in _ATTEMPT_ARTIFACTS:
+        alias = _legacy_parent_artifact_path(
+            run_dir,
+            filename,
+            parent_session_id,
+        )
+        if alias.is_symlink() or alias.exists():
+            continue
+        suffix = (
+            Path("terminal") / filename
+            if filename in _TERMINAL_ARTIFACTS
+            else Path(filename)
+        )
+        target = root / "current" / suffix
+        relative = os.path.relpath(target, start=alias.parent)
+        try:
+            os.symlink(relative, alias)
+        except FileExistsError:
+            pass
+
+
+def current_attempt_generation(parent_session_id: str = "") -> int:
+    """Return the active immutable-attempt generation for one parent."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return 1
+    root = _attempt_root(run_dir, parent_session_id)
+    if not root.exists():
+        return 1
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    try:
+        return max(1, int(state.get("current_generation") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _reserve_stage_retry(
+    parent_session_id: str,
+    cycle: int,
+    *,
+    stage: str,
+) -> bool:
+    """Atomically reserve one retry for this attempt, stage, and cycle.
+
+    The reservation is created before native dispatch. It remains spent after
+    any launch or unknown completion, and may be released only when the native
+    send returns explicit proof that it did not launch a child. Generation-local
+    exclusive files make duplicate policy evaluations and concurrent sends
+    converge on one winner without trusting a post-launch dispatch observer.
+    """
+
+    run_dir = _run_dir()
+    if (
+        run_dir is None
+        or not parent_session_id
+        or isinstance(cycle, bool)
+        or not isinstance(cycle, int)
+        or cycle < 1
+        or cycle > 4
+        or stage not in {"cursor", "opus"}
+    ):
+        return False
+    activate_parent_attempt(parent_session_id, "")
+    root = _attempt_root(run_dir, parent_session_id)
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+        try:
+            generation = max(1, int(state.get("current_generation") or 1))
+        except (TypeError, ValueError):
+            return False
+        reservation_dir = (
+            _attempt_generation_dir(
+                run_dir,
+                parent_session_id,
+                generation,
+            )
+            / "retry-reservations"
+        )
+        reservation_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        reservation = reservation_dir / f"{stage}-cycle-{cycle}.json"
+        try:
+            fd = os.open(
+                reservation,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+            )
+        except FileExistsError:
+            return False
+        data = (
+            json.dumps(
+                {
+                    "version": 1,
+                    "parent_session_id": parent_session_id,
+                    "attempt_generation": generation,
+                    "stage": stage,
+                    "cycle": cycle,
+                    "reserved_at_ns": time.time_ns(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        reservation_dir_fd = os.open(reservation_dir, os.O_RDONLY)
+        try:
+            os.fsync(reservation_dir_fd)
+        finally:
+            os.close(reservation_dir_fd)
+        return True
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def release_retry_reservation(
+    parent_session_id: str,
+    cycle: int,
+    *,
+    stage: str,
+    native_send_status: str,
+) -> bool:
+    """Release a reservation only after an explicit non-launch result."""
+
+    run_dir = _run_dir()
+    if (
+        run_dir is None
+        or not parent_session_id
+        or isinstance(cycle, bool)
+        or not isinstance(cycle, int)
+        or cycle < 1
+        or cycle > 4
+        or stage not in {"cursor", "opus"}
+        or native_send_status != "not_launched"
+    ):
+        return False
+    root = _attempt_root(run_dir, parent_session_id)
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+        try:
+            generation = max(1, int(state.get("current_generation") or 1))
+        except (TypeError, ValueError):
+            return False
+        reservation_dir = (
+            _attempt_generation_dir(
+                run_dir,
+                parent_session_id,
+                generation,
+            )
+            / "retry-reservations"
+        )
+        reservation = reservation_dir / f"{stage}-cycle-{cycle}.json"
+        try:
+            reservation.unlink()
+        except FileNotFoundError:
+            return False
+        reservation_dir_fd = os.open(reservation_dir, os.O_RDONLY)
+        try:
+            os.fsync(reservation_dir_fd)
+        finally:
+            os.close(reservation_dir_fd)
+        return True
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def reserve_opus_retry(
+    parent_session_id: str,
+    cycle: int,
+) -> bool:
+    """Reserve the one paid transient Opus retry independently of Cursor."""
+
+    return _reserve_stage_retry(
+        parent_session_id,
+        cycle,
+        stage="opus",
+    )
+
+
+def reserve_cursor_retry(
+    parent_session_id: str,
+    cycle: int,
+) -> bool:
+    """Reserve the one fresh Cursor recovery child independently of Opus."""
+
+    return _reserve_stage_retry(
+        parent_session_id,
+        cycle,
+        stage="cursor",
+    )
+
+
+def _observed_budget_totals(payload: dict[str, Any]) -> dict[str, float] | None:
+    try:
+        reported = float(
+            payload.get("observed_reported_usd", payload["reported_usd"])
+        )
+        estimated = float(
+            payload.get(
+                "observed_estimated_unpriced_usd",
+                payload["estimated_unpriced_usd"],
+            )
+        )
+        total = float(
+            payload.get("observed_cost_usd", reported + estimated)
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {
+        "reported_usd": max(0.0, reported),
+        "estimated_unpriced_usd": max(0.0, estimated),
+        "cost_usd": max(0.0, total),
+    }
+
+
+def attempt_request_identity(
+    content: object,
+    *,
+    message_id: str = "",
+) -> str:
+    """Return one stable identity shared by request policy and executor history."""
+
+    attachments: object = []
+    normalized_content = content
+    if isinstance(content, dict) and "user_content" in content:
+        normalized_content = content.get("user_content")
+        attachments = content.get("attachments") or []
+    elif isinstance(content, list):
+        text_parts = [
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        if text_parts:
+            normalized_content = "\n".join(text_parts)
+    encoded = json.dumps(
+        {
+            "message_id": str(message_id),
+            "content": normalized_content,
+            "attachments": attachments,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "request:" + hashlib.sha256(encoded).hexdigest()
+
+
+def activate_parent_attempt(
+    parent_session_id: str,
+    request_identity: str,
+    *,
+    new_request: bool = False,
+) -> int:
+    """Activate exactly one generation per top-level user-message history.
+
+    Child-completion wakes and harness-generated continuation prompts stay in
+    the same nonterminal generation even when their request-phase wrappers have
+    different text. A later user message advances the atomic ``current``
+    symlink only after the prior attempt published a terminal bundle, making
+    every terminal artifact, budget, route ledger, and retry counter from the
+    prior question unreachable without deleting or rewriting its bytes.
+    """
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return 1
+    root = _attempt_root(run_dir, parent_session_id)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+        try:
+            generation = max(
+                1,
+                int(state.get("current_generation") or 1),
+            )
+        except (TypeError, ValueError):
+            generation = 1
+        prior_identity = str(state.get("request_identity") or "")
+        terminal_exists = _attempt_generation_dir(
+            run_dir,
+            parent_session_id,
+            generation,
+        ).joinpath("terminal").is_dir()
+        if (
+            new_request
+            and request_identity
+            and prior_identity
+            and request_identity != prior_identity
+            and not terminal_exists
+        ):
+            raise AttemptInFlightError(
+                "prior attempt still in flight; refusing to merge request identities"
+            )
+        changed = bool(
+            request_identity
+            and terminal_exists
+            and (
+                new_request
+                or (
+                    prior_identity
+                    and request_identity != prior_identity
+                )
+            )
+        )
+        if changed:
+            prior_budget: dict[str, Any] = {}
+            try:
+                prior_budget = json.loads(
+                    _artifact_target_from_generation(
+                        run_dir,
+                        "budget-state.json",
+                        parent_session_id,
+                        generation,
+                    ).read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                prior_budget = {}
+            baseline = (
+                _observed_budget_totals(prior_budget)
+                if isinstance(prior_budget, dict)
+                else None
+            )
+            generation += 1
+        else:
+            baseline = (
+                state.get("cost_baseline")
+                if "cost_baseline" in state
+                else {
+                    "reported_usd": 0.0,
+                    "estimated_unpriced_usd": 0.0,
+                    "cost_usd": 0.0,
+                }
+            )
+        generation_dir = _attempt_generation_dir(
+            run_dir,
+            parent_session_id,
+            generation,
+        )
+        generation_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        next_state = {
+            "version": 1,
+            "parent_session_id": parent_session_id,
+            "current_generation": generation,
+            "request_identity": request_identity or prior_identity,
+            "cost_baseline": baseline,
+            "activated_at_ns": time.time_ns(),
+        }
+        _write_attempt_state_unlocked(
+            run_dir,
+            parent_session_id,
+            next_state,
+        )
+        temporary_link = root / (
+            f".current-{os.getpid()}-{time.time_ns()}.tmp"
+        )
+        os.symlink(generation_dir.name, temporary_link)
+        os.replace(temporary_link, root / "current")
+        root_fd = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    _ensure_artifact_aliases(run_dir, parent_session_id)
+    return generation
+
+
+def read_attempt_cost_baseline(
+    parent_session_id: str = "",
+) -> dict[str, float] | None:
+    """Return the active attempt's cumulative-usage baseline, if initialized."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return {
+            "reported_usd": 0.0,
+            "estimated_unpriced_usd": 0.0,
+            "cost_usd": 0.0,
+        }
+    state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+    value = state.get("cost_baseline")
+    if not isinstance(value, dict):
+        return None
+    return _observed_budget_totals(
+        {
+            "reported_usd": value.get("reported_usd"),
+            "estimated_unpriced_usd": value.get(
+                "estimated_unpriced_usd"
+            ),
+            "observed_cost_usd": value.get("cost_usd"),
+        }
+    )
+
+
+def initialize_attempt_cost_baseline(
+    parent_session_id: str,
+    *,
+    reported_usd: float,
+    estimated_unpriced_usd: float,
+    cost_usd: float,
+) -> dict[str, float]:
+    """Initialize a later attempt's baseline from its first authoritative read."""
+
+    run_dir = _run_dir()
+    proposed = {
+        "reported_usd": max(0.0, float(reported_usd)),
+        "estimated_unpriced_usd": max(
+            0.0,
+            float(estimated_unpriced_usd),
+        ),
+        "cost_usd": max(0.0, float(cost_usd)),
+    }
+    if run_dir is None:
+        return proposed
+    activate_parent_attempt(parent_session_id, "")
+    root = _attempt_root(run_dir, parent_session_id)
+    lock_fd = os.open(root / "attempt.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        state = _read_attempt_state_unlocked(run_dir, parent_session_id)
+        existing = state.get("cost_baseline")
+        if isinstance(existing, dict):
+            observed = _observed_budget_totals(
+                {
+                    "reported_usd": existing.get("reported_usd"),
+                    "estimated_unpriced_usd": existing.get(
+                        "estimated_unpriced_usd"
+                    ),
+                    "observed_cost_usd": existing.get("cost_usd"),
+                }
+            )
+            if observed is not None:
+                return observed
+        state["cost_baseline"] = proposed
+        _write_attempt_state_unlocked(
+            run_dir,
+            parent_session_id,
+            state,
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    return proposed
+
+
+def _parent_artifact_path(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str = "",
+) -> Path:
+    """Return a parent-owned artifact path, preserving legacy single-run names."""
+
+    if _attempt_state_path(run_dir, parent_session_id).is_file():
+        _ensure_artifact_aliases(run_dir, parent_session_id)
+    return _legacy_parent_artifact_path(
+        run_dir,
+        filename,
+        parent_session_id,
+    )
+
+
+def _read_artifact_path(
+    run_dir: Path,
+    filename: str,
+    parent_session_id: str,
+) -> Path:
+    """Prefer the active generation, with legacy direct-file compatibility."""
+
+    if _attempt_state_path(run_dir, parent_session_id).is_file():
+        target = _artifact_target_from_generation(
+            run_dir,
+            filename,
+            parent_session_id,
+            current_attempt_generation(parent_session_id),
+        )
+        if target.exists():
+            return target
+    return _parent_artifact_path(run_dir, filename, parent_session_id)
+
+
+def _scope_parent_records(
+    records: list[dict[str, Any]],
+    parent_session_id: str,
+) -> list[dict[str, Any]]:
+    """Return only one parent's live ledger generation."""
+
+    if not parent_session_id:
+        return records
+    active_generation = current_attempt_generation(parent_session_id)
+    scoped: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("parent_session_id") != parent_session_id:
+            continue
+        try:
+            generation = int(record.get("attempt_generation") or 1)
+        except (TypeError, ValueError):
+            continue
+        if generation == active_generation:
+            scoped.append(record)
+    last_tombstone = max(
+        (
+            index
+            for index, record in enumerate(scoped)
+            if record.get("record_type") == "parent_tombstone"
+        ),
+        default=-1,
+    )
+    return scoped[last_tombstone + 1 :]
+
+
+def _scope_logical_attempt_records(
+    records: list[dict[str, Any]],
+    parent_session_id: str,
+) -> list[dict[str, Any]]:
+    """Recover one attempt across nonterminal generation fragmentation.
+
+    A legitimate new attempt can start only after the preceding generation
+    atomically publishes ``terminal/``. Therefore contiguous later generations
+    without such a boundary belong to the same logical attempt even if an old
+    runtime accidentally advanced ``current_generation`` on synthetic wakes.
+    """
+
+    if not parent_session_id:
+        return records
+    run_dir = _run_dir()
+    active_generation = current_attempt_generation(parent_session_id)
+    start_generation = 1
+    if run_dir is not None:
+        root = _attempt_root(run_dir, parent_session_id)
+        try:
+            generation_dirs = tuple(root.iterdir())
+        except OSError:
+            generation_dirs = ()
+        terminal_generations: list[int] = []
+        for generation_dir in generation_dirs:
+            match = re.fullmatch(r"generation-([0-9]{8})", generation_dir.name)
+            if match is None or not generation_dir.joinpath("terminal").is_dir():
+                continue
+            generation = int(match.group(1))
+            if generation < active_generation:
+                terminal_generations.append(generation)
+        if terminal_generations:
+            start_generation = max(terminal_generations) + 1
+    scoped: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("parent_session_id") != parent_session_id:
+            continue
+        try:
+            generation = int(record.get("attempt_generation") or 1)
+        except (TypeError, ValueError):
+            continue
+        if start_generation <= generation <= active_generation:
+            scoped.append(record)
+    last_tombstone = max(
+        (
+            index
+            for index, record in enumerate(scoped)
+            if record.get("record_type") == "parent_tombstone"
+        ),
+        default=-1,
+    )
+    return scoped[last_tombstone + 1 :]
+
+
 def _append(filename: str, payload: dict[str, Any]) -> None:
     run_dir = _run_dir()
     if run_dir is None:
         return
+    payload = dict(payload)
+    parent_session_id = str(
+        payload.get("parent_session_id")
+        or payload.get("turn_id")
+        or ""
+    )
+    if parent_session_id:
+        payload.setdefault(
+            "attempt_generation",
+            current_attempt_generation(parent_session_id),
+        )
     data = (
         json.dumps(
             payload,
@@ -175,6 +912,7 @@ def record_tool_dispatch_exception(
         "native_send_status": str(native_send_status),
         "reason": _observation_reason(exc),
         "observed_at_ns": time.time_ns(),
+        "attempt_generation": current_attempt_generation(parent_session_id),
     }
     for writer in (
         lambda: _append("tool-dispatch-exceptions.jsonl", record),
@@ -206,12 +944,20 @@ def read_last_tool_dispatch_exception(
     )
     records.sort(key=lambda record: int(record.get("observed_at_ns") or 0))
     allowed_titles = {str(title) for title in titles}
+    active_generation = current_attempt_generation(parent_session_id)
     for record in reversed(records):
         if (
             parent_session_id
             and record.get("turn_id") != parent_session_id
         ):
             continue
+        if parent_session_id:
+            try:
+                generation = int(record.get("attempt_generation") or 1)
+            except (TypeError, ValueError):
+                continue
+            if generation != active_generation:
+                continue
         if allowed_titles and str(record.get("title") or "") not in allowed_titles:
             continue
         if int(record.get("observed_at_ns") or 0) < max(0, observed_after_ns):
@@ -224,6 +970,12 @@ def append_dispatch(payload: dict[str, Any]) -> None:
     """Record one worker generation after sys_session_send succeeds."""
 
     record = dict(payload)
+    parent_session_id = str(record.get("parent_session_id") or "")
+    if parent_session_id:
+        record.setdefault(
+            "attempt_generation",
+            current_attempt_generation(parent_session_id),
+        )
     record.setdefault("dispatched_at_ns", time.time_ns())
     title = str(record.get("title") or "")
     parsed = parse_dispatch_title(title)
@@ -232,7 +984,9 @@ def append_dispatch(payload: dict[str, Any]) -> None:
     prior = next(
         (
             item
-            for item in read_dispatches()
+            for item in read_dispatches(
+                parent_session_id=parent_session_id
+            )
             if item.get("agent") == record.get("agent")
             and item.get("title") == record.get("title")
         ),
@@ -247,8 +1001,20 @@ def append_dispatch(payload: dict[str, Any]) -> None:
         begin_cursor_lifecycle(record)
 
 
-def read_dispatches() -> list[dict[str, Any]]:
-    return _read("routing-dispatches.jsonl")
+def read_dispatches(parent_session_id: str = "") -> list[dict[str, Any]]:
+    return _scope_parent_records(
+        _read("routing-dispatches.jsonl"),
+        parent_session_id,
+    )
+
+
+def read_attempt_dispatches(parent_session_id: str = "") -> list[dict[str, Any]]:
+    """Return this logical attempt's dispatches across accidental fragments."""
+
+    return _scope_logical_attempt_records(
+        _read("routing-dispatches.jsonl"),
+        parent_session_id,
+    )
 
 
 def _cursor_state_path(child_session_id: str) -> Path | None:
@@ -391,12 +1157,13 @@ _INTERNAL_SYSTEMS = ("glean", "jira", "slack", "confluence", "safe")
 _OPUS_STAGE_TITLE = re.compile(
     r"(?:"
     r"audit-cycle-[1-4](?:-web-[1-2])?"
+    r"|audit-retry-[1-4]-1"
     r"|audit-internal-[1-4]-[1-2]"
     r"|audit-format-repair-[1-4](?:-web-[1-2])?"
     r")"
 )
 _AUDIT_CYCLE_HOP = re.compile(
-    r"^audit-(?:cycle|internal)-(?P<cycle>[1-4])(?:-web-(?P<hop>[1-2]))?"
+    r"^audit-(?:cycle|internal|retry)-(?P<cycle>[1-4])(?:-web-(?P<hop>[1-2]))?"
 )
 
 
@@ -462,7 +1229,11 @@ def _audit_next_dispatch_note(
     try:
         from triple_stamp_isaac_launcher import _next_route
 
-        route = _next_route([*read_collections(), record])
+        parent_session_id = str(record.get("parent_session_id") or "")
+        route = _next_route(
+            [*read_collections(parent_session_id=parent_session_id), record],
+            parent_session_id=parent_session_id,
+        )
     except (ImportError, TypeError, ValueError):
         return ""
     agent = str(getattr(route, "agent", "") or "")
@@ -738,7 +1509,7 @@ async def observe_opus_internal_mcp_calls(
     """Observe persisted Opus tool uses through the authenticated server API."""
 
     cycle_match = re.search(
-        r"(?:cycle-|repair-|internal-)([1-4])(?:-|$)", title
+        r"(?:cycle-|repair-|internal-|retry-)([1-4])(?:-|$)", title
     )
     cycle = int(cycle_match.group(1)) if cycle_match else 0
     base = {
@@ -1051,6 +1822,35 @@ def append_collection(payload: dict[str, Any]) -> None:
     """Record one packet plus an immutable digest-addressed artifact."""
 
     record = _add_codex_punch_metadata(dict(payload))
+    parent_session_id = str(record.get("parent_session_id") or "")
+    if parent_session_id and "attempt_generation" not in record:
+        child_session_id = str(record.get("child_session_id") or "")
+        work_id = str(record.get("work_id") or "")
+        prior_dispatch = next(
+            (
+                dispatch
+                for dispatch in reversed(_read("routing-dispatches.jsonl"))
+                if dispatch.get("parent_session_id") == parent_session_id
+                and (
+                    not child_session_id
+                    or dispatch.get("child_session_id") == child_session_id
+                )
+                and (
+                    not work_id
+                    or dispatch.get("work_id") == work_id
+                )
+            ),
+            None,
+        )
+        if prior_dispatch is not None:
+            record["attempt_generation"] = int(
+                prior_dispatch.get("attempt_generation") or 1
+            )
+        else:
+            record["attempt_generation"] = current_attempt_generation(
+                parent_session_id
+            )
+    record.setdefault("collected_at_ns", time.time_ns())
     output = record.get("output")
     run_dir = _run_dir()
     if run_dir is not None and isinstance(output, str):
@@ -1083,24 +1883,138 @@ def append_collection(payload: dict[str, Any]) -> None:
     _append("routing-collections.jsonl", record)
 
 
-def read_collections() -> list[dict[str, Any]]:
-    return _read("routing-collections.jsonl")
+def read_collections(parent_session_id: str = "") -> list[dict[str, Any]]:
+    return _scope_parent_records(
+        _read("routing-collections.jsonl"),
+        parent_session_id,
+    )
+
+
+def read_attempt_collections(parent_session_id: str = "") -> list[dict[str, Any]]:
+    """Return this logical attempt's packets across accidental fragments."""
+
+    return _scope_logical_attempt_records(
+        _read("routing-collections.jsonl"),
+        parent_session_id,
+    )
+
+
+def tombstone_parent_session(parent_session_id: str) -> None:
+    """End one parent's ledger generation without affecting sibling sessions."""
+
+    if not parent_session_id:
+        return
+    marker = {
+        "record_type": "parent_tombstone",
+        "parent_session_id": parent_session_id,
+        "recorded_at_ns": time.time_ns(),
+    }
+    _append("routing-dispatches.jsonl", marker)
+    _append("routing-collections.jsonl", marker)
+
+
+def _publish_terminal_bundle(
+    parent_session_id: str,
+    artifacts: dict[str, bytes],
+) -> bool:
+    """Publish one complete terminal generation with one directory rename."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return False
+    generation = activate_parent_attempt(parent_session_id, "")
+    generation_dir = _attempt_generation_dir(
+        run_dir,
+        parent_session_id,
+        generation,
+    )
+    destination = generation_dir / "terminal"
+    staging = generation_dir / (
+        f".terminal-{os.getpid()}-{time.time_ns()}.tmp"
+    )
+    staging.mkdir(mode=0o700)
+    try:
+        for filename, data in artifacts.items():
+            fd = os.open(
+                staging / filename,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+            )
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        staging_fd = os.open(staging, os.O_RDONLY)
+        try:
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
+        try:
+            os.rename(staging, destination)
+        except OSError:
+            if not destination.is_dir():
+                raise
+            for path in staging.iterdir():
+                path.unlink(missing_ok=True)
+            staging.rmdir()
+            return False
+        generation_fd = os.open(generation_dir, os.O_RDONLY)
+        try:
+            os.fsync(generation_fd)
+        finally:
+            os.close(generation_fd)
+        return True
+    except BaseException:
+        # A process death can leave only this hidden, unreferenced staging
+        # directory. The stable aliases remain dangling until a later retry
+        # atomically renames a complete directory into place.
+        raise
 
 
 def attest_codex_stamp(payload: dict[str, Any]) -> bool:
-    """Persist an immutable attestation for one mechanically valid Codex STAMP."""
+    """Persist one valid STAMP across a contiguous logical attempt."""
 
     run_dir = _run_dir()
+    parent_session_id = str(payload.get("parent_session_id") or "")
+    if run_dir is None or payload.get("agent") != "codex_judge":
+        return False
+    attempt_records = read_attempt_collections(
+        parent_session_id=parent_session_id
+    )
+    if parent_session_id:
+        child_session_id = str(payload.get("child_session_id") or "")
+        work_id = str(payload.get("work_id") or "")
+        recorded = next(
+            (
+                record
+                for record in reversed(attempt_records)
+                if record.get("agent") == "codex_judge"
+                and record.get("title") == payload.get("title")
+                and (
+                    not child_session_id
+                    or record.get("child_session_id") == child_session_id
+                )
+                and (
+                    not work_id
+                    or record.get("work_id") == work_id
+                )
+                and record.get("output") == payload.get("output")
+            ),
+            None,
+        )
+        if recorded is None:
+            return False
+        payload = recorded
     output = payload.get("output")
-    if run_dir is None or payload.get("agent") != "codex_judge" or not isinstance(
-        output, str
-    ):
+    if not isinstance(output, str):
         return False
     try:
         from triple_stamp_isaac_launcher import (
             _has_required_stage_chain,
             _mapping_candidates,
             _valid_stamp,
+            _valid_voice_profile_check,
         )
 
         stamp = next(
@@ -1115,10 +2029,14 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         return False
     if stamp is None:
         return False
+    if (
+        not parent_session_id
+        and any(record.get("parent_session_id") for record in read_collections())
+    ):
+        return False
     check = stamp.get("voice_profile_check") if isinstance(stamp, dict) else None
     answer = stamp.get("shippable_answer") if isinstance(stamp, dict) else None
     expected_profile = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
-    expected_path = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE", "").strip()
     if (
         not isinstance(answer, str)
         or not answer
@@ -1127,18 +2045,17 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     ):
         return False
     # Voice rendering is optional; only demand the receipt when one is expected.
-    if (expected_path or expected_profile) and (
-        not isinstance(check, dict)
-        or check.get("source_path") != expected_path
-        or check.get("sha256") != expected_profile
-    ):
+    if not _valid_voice_profile_check(check):
         return False
     answer_bytes = answer.encode("utf-8")
     evidence_bytes = output.encode("utf-8")
     title = str(payload.get("title") or "")
     match = re.fullmatch(r"judge-(?:cycle|convergence)-([1-4])", title)
+    generation = current_attempt_generation(parent_session_id)
     if match is None or not _has_required_stage_chain(
-        read_collections(), int(match.group(1))
+        attempt_records,
+        int(match.group(1)),
+        parent_session_id=parent_session_id,
     ):
         return False
     attestation = {
@@ -1149,6 +2066,8 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         "title": title,
         "child_session_id": payload.get("child_session_id"),
         "work_id": payload.get("work_id"),
+        "parent_session_id": parent_session_id,
+        "attempt_generation": generation,
         "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
         "answer_length": len(answer_bytes),
         "voice_profile_sha256": expected_profile,
@@ -1156,33 +2075,421 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
         "evidence_packet_length": len(evidence_bytes),
     }
 
-    def create_once(path: Path, data: bytes) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
     try:
-        create_once(run_dir / "stamped-answer.bin", answer_bytes)
-        create_once(
-            run_dir / "stamp-attestation.json",
-            (
+        return _publish_terminal_bundle(
+            parent_session_id,
+            {
+                "stamped-answer.bin": answer_bytes,
+                "stamp-attestation.json": (
                 json.dumps(attestation, sort_keys=True, separators=(",", ":"))
                 + "\n"
-            ).encode("utf-8"),
+                ).encode("utf-8"),
+            },
         )
-    except FileExistsError:
+    except OSError:
         return False
-    return True
 
 
-def append_supervisor_tool_call(name: str) -> int:
+def attest_latest_codex_stamp(parent_session_id: str) -> bool:
+    """Recover an already-collected STAMP before any further routing."""
+
+    if read_attested_answer(parent_session_id):
+        return True
+    for record in reversed(read_attempt_collections(parent_session_id)):
+        if (
+            record.get("agent") == "codex_judge"
+            and record.get("status") == "completed"
+            and attest_codex_stamp(record)
+        ):
+            return True
+    return False
+
+
+def read_attested_answer(parent_session_id: str = "") -> str:
+    """Return one parent's immutable attested answer after digest verification."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return ""
+    generation = current_attempt_generation(parent_session_id)
+    try:
+        attestation = json.loads(
+            _read_artifact_path(
+                run_dir,
+                "stamp-attestation.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+        answer = _read_artifact_path(
+            run_dir,
+            "stamped-answer.bin",
+            parent_session_id,
+        ).read_bytes()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    try:
+        attested_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("verdict") != "STAMP"
+        or (
+            parent_session_id
+            and attestation.get("parent_session_id") != parent_session_id
+        )
+        or attested_generation != generation
+        or attestation.get("answer_length") != len(answer)
+        or not isinstance(attestation.get("answer_sha256"), str)
+        or not hashlib.sha256(answer).hexdigest()
+        == attestation["answer_sha256"]
+    ):
+        return ""
+    try:
+        return answer.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def record_best_effort_answer(
+    answer: str,
+    records: list[dict[str, Any]],
+    *,
+    cycle: int,
+    reason: str,
+    parent_session_id: str = "",
+    candidate_record: dict[str, Any] | None = None,
+) -> str:
+    """Persist a complete non-STAMP answer with its exact packet provenance."""
+
+    stamped = read_attested_answer(parent_session_id)
+    if stamped:
+        return stamped
+    existing = read_best_effort_answer(parent_session_id)
+    if existing:
+        return existing
+    run_dir = _run_dir()
+    clean_answer = answer.strip()
+    if (
+        run_dir is None
+        or not clean_answer
+        or clean_answer.startswith(
+            ("PIPELINE_VALIDATION_FAILED:", "PIPELINE_INFRASTRUCTURE_ERROR:")
+        )
+    ):
+        return ""
+
+    scoped = _scope_parent_records(records, parent_session_id)
+    durable_scoped = read_attempt_collections(parent_session_id)
+    if durable_scoped:
+        enriched: list[dict[str, Any]] = []
+        for record in scoped:
+            durable = next(
+                (
+                    candidate
+                    for candidate in durable_scoped
+                    if candidate.get("agent") == record.get("agent")
+                    and candidate.get("title") == record.get("title")
+                    and str(candidate.get("child_session_id") or "")
+                    == str(record.get("child_session_id") or "")
+                    and str(candidate.get("work_id") or "")
+                    == str(record.get("work_id") or "")
+                    and candidate.get("output") == record.get("output")
+                ),
+                None,
+            )
+            enriched.append(durable or record)
+        scoped = enriched
+    generation = current_attempt_generation(parent_session_id)
+    try:
+        from triple_stamp_isaac_launcher import (
+            _best_effort_provenance,
+            _candidate_provenance,
+            _has_required_stage_chain,
+        )
+    except ImportError:
+        return ""
+    if not _has_required_stage_chain(
+        scoped,
+        cycle,
+        parent_session_id=parent_session_id,
+        attempt_generation=generation,
+    ):
+        return ""
+    dispatches = read_attempt_dispatches(
+        parent_session_id=parent_session_id
+    )
+    provenance = None
+    if candidate_record is not None:
+        candidate_index = next(
+            (
+                index
+                for index, record in enumerate(scoped)
+                if record.get("agent") == candidate_record.get("agent")
+                and record.get("title") == candidate_record.get("title")
+                and str(record.get("child_session_id") or "")
+                == str(candidate_record.get("child_session_id") or "")
+                and str(record.get("work_id") or "")
+                == str(candidate_record.get("work_id") or "")
+                and record.get("output") == candidate_record.get("output")
+            ),
+            None,
+        )
+        if candidate_index is not None:
+            provenance = _candidate_provenance(
+                scoped,
+                cycle,
+                candidate_index,
+                dispatches=dispatches,
+                parent_session_id=parent_session_id,
+            )
+    else:
+        provenance = _best_effort_provenance(
+            scoped,
+            cycle,
+            dispatches=dispatches,
+            parent_session_id=parent_session_id,
+        )
+    if provenance is None:
+        return ""
+
+    source_packets = []
+    source_roles = ["cursor", "opus"]
+    if provenance.get("codex") is not None:
+        source_roles.append("codex")
+    for role in source_roles:
+        record = provenance[role]
+        output_bytes = str(record["output"]).encode("utf-8")
+        source_packets.append(
+            {
+                "agent": record["agent"],
+                "title": str(record.get("title") or ""),
+                "child_session_id": str(record.get("child_session_id") or ""),
+                "work_id": str(record.get("work_id") or ""),
+                "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+                "output_length": len(output_bytes),
+                "collection_sequence": int(
+                    provenance["collection_sequences"][role]
+                ),
+                "collected_at_ns": int(record.get("collected_at_ns") or 0),
+                "dispatch_sequence": int(
+                    provenance["dispatch_sequences"][role]
+                ),
+                "dispatched_at_ns": int(
+                    provenance["dispatch_timestamps"][role]
+                ),
+            }
+        )
+
+    answer_bytes = clean_answer.encode("utf-8")
+    attestation = {
+        "version": 1,
+        "verdict": "BEST_EFFORT",
+        "quality_approved": False,
+        "cycle": max(0, int(cycle)),
+        "parent_session_id": parent_session_id,
+        "attempt_generation": generation,
+        "reason": " ".join(str(reason).replace("\x00", " ").split())[:2000],
+        "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
+        "answer_length": len(answer_bytes),
+        "provenance_version": 1,
+        "source_packets": source_packets,
+    }
+
+    try:
+        published = _publish_terminal_bundle(
+            parent_session_id,
+            {
+                "best-effort-answer.bin": answer_bytes,
+                "best-effort-attestation.json": (
+                    json.dumps(
+                        attestation,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            },
+        )
+    except OSError:
+        return ""
+    if not published:
+        return read_best_effort_answer(parent_session_id)
+    return clean_answer
+
+
+def read_best_effort_answer(parent_session_id: str = "") -> str:
+    """Return one parent's complete non-STAMP answer after digest verification."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return ""
+    generation = current_attempt_generation(parent_session_id)
+    try:
+        attestation = json.loads(
+            _read_artifact_path(
+                run_dir,
+                "best-effort-attestation.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+        answer = _read_artifact_path(
+            run_dir,
+            "best-effort-answer.bin",
+            parent_session_id,
+        ).read_bytes()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    try:
+        attested_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if (
+        not isinstance(attestation, dict)
+        or attestation.get("verdict") != "BEST_EFFORT"
+        or attestation.get("quality_approved") is not False
+        or attestation.get("provenance_version") != 1
+        or attested_generation != generation
+        or (
+            parent_session_id
+            and attestation.get("parent_session_id") != parent_session_id
+        )
+        or attestation.get("answer_length") != len(answer)
+        or not isinstance(attestation.get("answer_sha256"), str)
+        or not hashlib.sha256(answer).hexdigest()
+        == attestation["answer_sha256"]
+    ):
+        return ""
+    sources = attestation.get("source_packets")
+    if not isinstance(sources, list):
+        return ""
+    records = read_attempt_collections(parent_session_id)
+    dispatches = read_attempt_dispatches(parent_session_id)
+    try:
+        from triple_stamp_isaac_launcher import (
+            _best_effort_provenance,
+            _candidate_provenance,
+        )
+
+        codex_source = next(
+            (
+                source
+                for source in sources
+                if isinstance(source, dict)
+                and source.get("agent") == "codex_judge"
+            ),
+            None,
+        )
+        if codex_source is not None:
+            candidate_index = next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if record.get("agent") == codex_source.get("agent")
+                    and record.get("title") == codex_source.get("title")
+                    and str(record.get("child_session_id") or "")
+                    == str(codex_source.get("child_session_id") or "")
+                    and str(record.get("work_id") or "")
+                    == str(codex_source.get("work_id") or "")
+                ),
+                None,
+            )
+            provenance = (
+                _candidate_provenance(
+                    records,
+                    int(attestation.get("cycle") or 0),
+                    candidate_index,
+                    dispatches=dispatches,
+                    parent_session_id=parent_session_id,
+                )
+                if candidate_index is not None
+                else None
+            )
+        else:
+            provenance = _best_effort_provenance(
+                records,
+                int(attestation.get("cycle") or 0),
+                dispatches=dispatches,
+                parent_session_id=parent_session_id,
+            )
+    except (ImportError, TypeError, ValueError):
+        return ""
+    if provenance is None:
+        return ""
+    roles = ["cursor", "opus"]
+    if provenance.get("codex") is not None:
+        roles.append("codex")
+    if len(sources) != len(roles):
+        return ""
+    for source, role in zip(sources, roles, strict=True):
+        record = provenance[role]
+        if not isinstance(source, dict):
+            return ""
+        output = str(record.get("output") or "").encode("utf-8")
+        if (
+            source.get("agent") != record.get("agent")
+            or source.get("title") != str(record.get("title") or "")
+            or source.get("child_session_id")
+            != str(record.get("child_session_id") or "")
+            or source.get("work_id") != str(record.get("work_id") or "")
+            or source.get("collection_sequence")
+            != int(provenance["collection_sequences"][role])
+            or source.get("collected_at_ns")
+            != int(record.get("collected_at_ns") or 0)
+            or source.get("dispatch_sequence")
+            != int(provenance["dispatch_sequences"][role])
+            or source.get("dispatched_at_ns")
+            != int(provenance["dispatch_timestamps"][role])
+            or source.get("output_length") != len(output)
+            or source.get("output_sha256")
+            != hashlib.sha256(output).hexdigest()
+        ):
+            return ""
+    try:
+        decoded = answer.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    if not decoded.strip() or decoded.startswith(
+        ("PIPELINE_VALIDATION_FAILED:", "PIPELINE_INFRASTRUCTURE_ERROR:")
+    ):
+        return ""
+    return decoded
+
+
+def append_supervisor_tool_call(
+    name: str,
+    parent_session_id: str = "",
+) -> int:
     """Record and return the durable supervisor tool-call count."""
 
-    _append("supervisor-tool-calls.jsonl", {"name": str(name)})
-    return len(_read("supervisor-tool-calls.jsonl"))
+    _append(
+        "supervisor-tool-calls.jsonl",
+        {
+            "name": str(name),
+            "parent_session_id": parent_session_id,
+        },
+    )
+    return len(
+        _scope_parent_records(
+            _read("supervisor-tool-calls.jsonl"),
+            parent_session_id,
+        )
+    )
+
+
+def read_supervisor_tool_calls(
+    parent_session_id: str = "",
+) -> list[dict[str, Any]]:
+    """Return only the active attempt's durable supervisor tool calls."""
+
+    return _scope_parent_records(
+        _read("supervisor-tool-calls.jsonl"),
+        parent_session_id,
+    )
 
 
 def append_supervisor_continuation(payload: dict[str, Any]) -> None:
@@ -1193,10 +2500,15 @@ def append_supervisor_continuation(payload: dict[str, Any]) -> None:
     _append("supervisor-continuations.jsonl", record)
 
 
-def read_supervisor_continuations() -> list[dict[str, Any]]:
+def read_supervisor_continuations(
+    parent_session_id: str = "",
+) -> list[dict[str, Any]]:
     """Return the run-local supervisor continuation ledger."""
 
-    return _read("supervisor-continuations.jsonl")
+    return _scope_parent_records(
+        _read("supervisor-continuations.jsonl"),
+        parent_session_id,
+    )
 
 
 def write_budget_state(
@@ -1211,12 +2523,17 @@ def write_budget_state(
     projected_reserve_usd: float = 0.0,
     denial_reason: str = "",
     sessions: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
+    observed_cost_usd: float | None = None,
+    observed_reported_usd: float | None = None,
+    observed_estimated_unpriced_usd: float | None = None,
 ) -> None:
-    """Atomically retain the latest canonical cumulative budget decision."""
+    """Atomically retain the latest attempt-local budget decision."""
 
     run_dir = _run_dir()
     if run_dir is None:
         return
+    generation = activate_parent_attempt(parent_session_id, "")
     payload = {
         "cost_usd": round(max(0.0, float(cost)), 6),
         "max_cost_usd": float(maximum),
@@ -1247,20 +2564,92 @@ def write_budget_state(
         ),
         "denial_reason": " ".join(str(denial_reason).split())[:2000],
         "sessions": sessions or [],
+        "attempt_generation": generation,
+        "observed_cost_usd": round(
+            max(
+                0.0,
+                float(
+                    observed_cost_usd
+                    if observed_cost_usd is not None
+                    else cost
+                ),
+            ),
+            6,
+        ),
+        "observed_reported_usd": round(
+            max(
+                0.0,
+                float(
+                    observed_reported_usd
+                    if observed_reported_usd is not None
+                    else reported_usd
+                    if reported_usd is not None
+                    else cost
+                ),
+            ),
+            6,
+        ),
+        "observed_estimated_unpriced_usd": round(
+            max(
+                0.0,
+                float(
+                    observed_estimated_unpriced_usd
+                    if observed_estimated_unpriced_usd is not None
+                    else estimated_unpriced_usd
+                    or 0.0
+                ),
+            ),
+            6,
+        ),
     }
-    temporary = run_dir / f".budget-state-{os.getpid()}.tmp"
+    destination = _artifact_target_from_generation(
+        run_dir,
+        "budget-state.json",
+        parent_session_id,
+        generation,
+    )
+    temporary = destination.with_name(
+        f".{destination.name}-{os.getpid()}-{time.time_ns()}.tmp"
+    )
     try:
         temporary.write_text(
             json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         temporary.chmod(0o600)
-        os.replace(temporary, run_dir / "budget-state.json")
+        os.replace(temporary, destination)
     finally:
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def read_budget_state(parent_session_id: str = "") -> dict[str, Any]:
+    """Return the active attempt's latest budget decision."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return {}
+    try:
+        payload = json.loads(
+            _read_artifact_path(
+                run_dir,
+                "budget-state.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    try:
+        generation = int(payload.get("attempt_generation") or 1)
+    except (TypeError, ValueError):
+        return {}
+    if generation != current_attempt_generation(parent_session_id):
+        return {}
+    return payload
 
 
 def record_terminal_failure(
@@ -1271,9 +2660,15 @@ def record_terminal_failure(
     cycle: int = 0,
     cost_usd: float | None = None,
     calls: int | None = None,
+    parent_session_id: str = "",
 ) -> str:
     """Create one immutable sanitized terminal failure result and attestation."""
 
+    completed_answer = read_attested_answer(parent_session_id) or (
+        read_best_effort_answer(parent_session_id)
+    )
+    if completed_answer:
+        return completed_answer
     run_dir = _run_dir()
     normalized_kind = (
         "PIPELINE_VALIDATION_FAILED"
@@ -1286,12 +2681,7 @@ def record_terminal_failure(
             f"{normalized_kind}: stage {stage or 'unknown'}, cycle {max(0, int(cycle))}; "
             f"continuation denied: {clean_reason or 'unspecified terminal failure'}"
         )
-    try:
-        budget = json.loads(
-            (run_dir / "budget-state.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError, json.JSONDecodeError):
-        budget = {}
+    budget = read_budget_state(parent_session_id)
     reported = budget.get("reported_usd")
     estimated = budget.get("estimated_unpriced_usd")
     remaining = budget.get("remaining_usd")
@@ -1311,6 +2701,8 @@ def record_terminal_failure(
         f"of {money(maximum)}; continuation denied: "
         f"{clean_reason or 'unspecified terminal failure'}"
     )
+    result_bytes = result.encode("utf-8")
+    generation = current_attempt_generation(parent_session_id)
     attestation = {
         "version": 1,
         "result": normalized_kind,
@@ -1323,51 +2715,89 @@ def record_terminal_failure(
         "remaining_usd": remaining,
         "max_cost_usd": maximum,
         "calls": calls,
+        "parent_session_id": parent_session_id,
+        "attempt_generation": generation,
+        "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        "result_length": len(result_bytes),
     }
 
-    def create_once(path: Path, data: bytes) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-    for path, data in (
-        (run_dir / "terminal-failure.txt", result.encode("utf-8")),
-        (
-            run_dir / "failure-attestation.json",
-            (
+    try:
+        _publish_terminal_bundle(
+            parent_session_id,
+            {
+                "terminal-failure.txt": result_bytes,
+                "failure-attestation.json": (
                 json.dumps(attestation, sort_keys=True, separators=(",", ":"))
                 + "\n"
-            ).encode("utf-8"),
-        ),
-    ):
-        try:
-            create_once(path, data)
-        except FileExistsError:
-            pass
+                ).encode("utf-8"),
+            },
+        )
+    except OSError:
+        return result
     try:
-        return (run_dir / "terminal-failure.txt").read_text(encoding="utf-8")
+        return _read_artifact_path(
+            run_dir,
+            "terminal-failure.txt",
+            parent_session_id,
+        ).read_text(encoding="utf-8")
     except OSError:
         return result
 
 
-def read_terminal_failure() -> str:
-    """Return the run's recorded terminal failure text, or "" if none exists.
+def read_terminal_failure(parent_session_id: str = "") -> str:
+    """Return one parent's recorded terminal failure text, or "" if absent.
 
-    `record_terminal_failure` writes `terminal-failure.txt` with `O_EXCL`, so
-    the first failure wins and this is a stable, once-only fact about the run.
-    Every writer of that file has already decided the run is over: the state
-    machine's terminal marker, a budget denial that blocked the dispatch, and
-    the supervisor guard itself. Nothing downstream should keep dispatching
-    after it exists.
+    Each parent gets an immutable file, so a sibling failure cannot terminate
+    or overwrite this conversation.
     """
 
     run_dir = _run_dir()
     if run_dir is None:
         return ""
+    generation = current_attempt_generation(parent_session_id)
     try:
-        return (run_dir / "terminal-failure.txt").read_text(encoding="utf-8").strip()
-    except OSError:
+        data = _read_artifact_path(
+            run_dir,
+            "terminal-failure.txt",
+            parent_session_id,
+        ).read_bytes()
+        attestation = json.loads(
+            _read_artifact_path(
+                run_dir,
+                "failure-attestation.json",
+                parent_session_id,
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    try:
+        attested_generation = int(
+            attestation.get("attempt_generation") or 1
+        )
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if (
+        not isinstance(attestation, dict)
+        or attested_generation != generation
+        or (
+            parent_session_id
+            and attestation.get("parent_session_id") != parent_session_id
+        )
+    ):
+        return ""
+    result_digest = attestation.get("result_sha256")
+    result_length = attestation.get("result_length")
+    if result_digest is None and result_length is None and generation == 1:
+        # Compatibility with retained pre-generation failure pairs. New writes
+        # always carry both fields and publish atomically.
+        pass
+    elif (
+        result_length != len(data)
+        or not isinstance(result_digest, str)
+        or hashlib.sha256(data).hexdigest() != result_digest
+    ):
+        return ""
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeDecodeError:
         return ""

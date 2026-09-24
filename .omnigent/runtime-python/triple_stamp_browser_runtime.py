@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -521,6 +523,66 @@ def announce_after_browser_preflight(
     )
 
 
+def _wait_for_browser_shutdown() -> None:
+    """Keep the command-owned browser runtime alive until it receives a signal."""
+
+    while True:
+        signal.pause()
+
+
+def _run_non_tty_browser_client(
+    base_url: str,
+    _agent_name: str,
+    _tool_handler: object,
+    **kwargs: object,
+) -> None:
+    """Announce a prepared browser session without starting a stdin REPL."""
+
+    conversation_id = kwargs.get("resume_conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise BrowserHostPreflightError(
+            "browser runtime did not receive its prepared session id"
+        )
+
+    from omnigent import conversation_browser
+
+    announcer = getattr(
+        conversation_browser.announce_conversation_url,
+        "__triple_stamp_original__",
+        conversation_browser.announce_conversation_url,
+    )
+    announce_after_browser_preflight(
+        base_url=base_url,
+        conversation_id=conversation_id,
+        echo=lambda message: print(message, file=sys.stderr, flush=True),
+        announce=announcer,
+    )
+    conversation_browser.open_conversation_link_if_enabled(
+        base_url=base_url,
+        conversation_id=conversation_id,
+        enabled=bool(kwargs.get("auto_open_conversation")),
+        warn=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+    _wait_for_browser_shutdown()
+
+
+def _install_non_tty_browser_client() -> None:
+    """Replace the terminal REPL when the browser launcher has no input TTY."""
+
+    if sys.stdin.isatty():
+        return
+
+    from omnigent import chat
+
+    original = chat._run_repl
+    if getattr(original, "__triple_stamp_non_tty_browser__", False):
+        return
+
+    _run_non_tty_browser_client.__triple_stamp_non_tty_browser__ = True
+    _run_non_tty_browser_client.__triple_stamp_original__ = original
+    chat._run_repl = _run_non_tty_browser_client
+
+
 def install_browser_runtime_guard() -> None:
     """Install daemon env propagation and URL-announcement preflight once."""
 
@@ -556,3 +618,4 @@ def install_browser_runtime_guard() -> None:
     checked_announce.__triple_stamp_browser_preflight__ = True
     checked_announce.__triple_stamp_original__ = original
     conversation_browser.announce_conversation_url = checked_announce
+    _install_non_tty_browser_client()

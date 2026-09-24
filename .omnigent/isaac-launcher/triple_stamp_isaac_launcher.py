@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import textwrap
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,11 +23,27 @@ from triple_stamp_opus_mcp import (
     prepare_opus_mcp_config,
 )
 from triple_stamp_runtime_state import (
+    AttemptInFlightError,
+    activate_parent_attempt,
     append_supervisor_tool_call,
+    attempt_request_identity,
+    current_attempt_generation,
+    initialize_attempt_cost_baseline,
     parse_dispatch_title,
+    read_attempt_collections,
+    read_attempt_dispatches,
+    read_attempt_cost_baseline,
+    read_attested_answer,
+    read_best_effort_answer,
+    read_budget_state,
     read_collections,
     read_dispatches,
+    read_terminal_failure,
+    record_best_effort_answer,
+    read_supervisor_tool_calls,
     record_terminal_failure,
+    reserve_cursor_retry,
+    reserve_opus_retry,
     write_budget_state,
 )
 
@@ -113,6 +130,13 @@ _COMPLETION = re.compile(
     r"(?:(?: returned: | error: |: )(?P<output>.*))?\]$",
     re.DOTALL,
 )
+_WAKE_NOTICE = re.compile(
+    r"^\[System: sub-agent "
+    r"(?P<agent>cursor_workhorse|opus_auditor|codex_judge)/"
+    r"(?P<title>[^\s\]]+) finished "
+    r"\((?P<status>completed|failed|cancelled)\) — "
+    r"\d+ results? waiting in inbox\. Call sys_read_inbox to collect\.\]$"
+)
 _NO_OUTPUT = re.compile(
     r"^\[System: sub-agent task \S+ completed — "
     r"(?P<agent>cursor_workhorse|opus_auditor|codex_judge)"
@@ -121,6 +145,79 @@ _NO_OUTPUT = re.compile(
 )
 _INFRA_PREFIX = "PIPELINE_INFRASTRUCTURE_ERROR:"
 _VALIDATION_PREFIX = "PIPELINE_VALIDATION_FAILED:"
+
+# Every Opus audit-stage kind. A transient platform stream death on any of
+# these can be recovered by a fresh child under a unique title, exactly the way
+# NEEDS_WEB and NEEDS_INTERNAL already relaunch fresh Opus children.
+_OPUS_AUDIT_KINDS = frozenset(
+    {
+        "audit",
+        "audit_web",
+        "audit_retry",
+        "audit_internal",
+        "audit_repair",
+        "audit_repair_web",
+    }
+)
+# Lower-cased substrings that mark a transient, platform-side Opus stream death
+# in a launch/error envelope. They never override a semantically valid completed
+# audit merely because its analysis discusses one of these provider errors.
+_TRANSIENT_OPUS_STREAM_MARKERS = (
+    "server error mid-response",
+    "the response above may be incomplete",
+    "response may be incomplete",
+    "api error: server error",
+    "api error: overloaded",
+    "overloaded_error",
+    "internal server error",
+    "error streaming response",
+    "stream disconnected",
+    "connection reset by peer",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 529",
+)
+# One fresh retry per cycle. A transient death dispatches audit-retry-N-1; a
+# second transient death (on that retry) is terminal infrastructure failure.
+# The bound is deliberately conservative: every retry is a paid Opus launch, and
+# a single fresh child recovers the overwhelmingly common one-off provider blip
+# without risking repeated spend on a persistently failing provider.
+_OPUS_TRANSIENT_RETRY_CAP = 1
+# One fresh Cursor child may recover a definitive zero-output inactivity
+# timeout or an explicit provider-error turn. It is a transport recovery in
+# the same quality cycle, not a new research/rework cycle.
+_CURSOR_RETRY_CAP = 1
+
+
+def _has_incomplete_stream_marker(text: object) -> bool:
+    """Return whether text bears a transient mid-stream truncation marker."""
+
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _TRANSIENT_OPUS_STREAM_MARKERS)
+
+
+def _is_transient_opus_stream_error(record: dict[str, Any]) -> bool:
+    """Classify one Opus record as a recoverable, transient stream death.
+
+    Completed output is model-authored audit evidence, so marker-shaped prose
+    there is never a transport signal. A completed record retries only from an
+    explicit transport envelope. Non-completed records may carry the transport
+    marker in their partial output or envelope. A failed record without such a
+    marker (for example a native timeout, model/harness pin break, or empty
+    output) is a genuine worker failure and stays terminal.
+    """
+
+    fields = ("error", "launch_error", "stream_error")
+    if record.get("status") != "completed":
+        fields = ("output", *fields)
+    return any(
+        _has_incomplete_stream_marker(record.get(field))
+        for field in fields
+    )
 
 
 def _voice_profile_path() -> str:
@@ -878,6 +975,15 @@ def _valid_judgment(text: object) -> dict[str, Any] | None:
         return None
     if payload["needs_internal"] is not (verdict == "NEEDS_INTERNAL"):
         return None
+    best_supported = payload.get("best_supported_answer")
+    if best_supported is not None and (
+        not isinstance(best_supported, str)
+        or not best_supported.strip()
+        or best_supported.startswith(
+            ("PIPELINE_VALIDATION_FAILED:", "PIPELINE_INFRASTRUCTURE_ERROR:")
+        )
+    ):
+        return None
     if verdict == "REWORK":
         normalized = _normalized_codex_punch_list(payload)
         if len(normalized) != len(payload[field]):
@@ -969,10 +1075,21 @@ def _stage(title: object) -> _Stage | None:
 
 
 def _resume_child(
-    records: list[dict[str, Any]], agent: str, title: str
+    records: list[dict[str, Any]],
+    agent: str,
+    title: str,
+    *,
+    parent_session_id: str = "",
 ) -> str:
     for record in records:
-        if record.get("agent") == agent and record.get("title") == title:
+        if (
+            record.get("agent") == agent
+            and record.get("title") == title
+            and (
+                not parent_session_id
+                or record.get("parent_session_id") == parent_session_id
+            )
+        ):
             return str(record.get("child_session_id") or "")
     return ""
 
@@ -996,7 +1113,7 @@ def _internal_reaudit_route(
     )
     if used >= 2:
         return _Route(
-            "validation_failed",
+            "best_effort",
             cycle,
             requester="codex",
             hop=used,
@@ -1014,6 +1131,128 @@ def _internal_reaudit_route(
         requester="codex",
         hop=hop,
         reason=reason,
+    )
+
+
+def _cursor_retries_used(
+    records: list[dict[str, Any]],
+    cycle: int,
+) -> int:
+    """Count fresh Cursor recovery children already spent this cycle."""
+
+    return sum(
+        1
+        for record in records
+        if (
+            (parsed := _stage(record.get("title"))) is not None
+            and parsed.kind == "cursor_retry"
+            and parsed.cycle == cycle
+        )
+    )
+
+
+def _retryable_cursor_failure(record: dict[str, Any]) -> bool:
+    """Classify only definitive, safe-to-retry Cursor transport failures."""
+
+    if record.get("status") == "completed":
+        return False
+    output = str(record.get("output") or "")
+    return (
+        output.startswith("CURSOR_WORKER_TIMEOUT: kind=inactivity")
+        and "assistant_chars=0" in output
+    ) or output.startswith(
+        "CURSOR_WORKER_FAILED: Cursor turn ended with status "
+    )
+
+
+def _cursor_retry_route(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    reason: str,
+) -> _Route:
+    """Recover one definitive Cursor transport failure without a new cycle."""
+
+    used = _cursor_retries_used(records, cycle)
+    if used >= _CURSOR_RETRY_CAP:
+        return _Route(
+            "infrastructure_failed",
+            cycle,
+            reason=(
+                f"Cursor recovery retry exhausted in cycle {cycle}: {reason}"
+            ),
+        )
+    return _Route(
+        "dispatch",
+        cycle,
+        "cursor_workhorse",
+        f"cursor-retry-{cycle}-{used + 1}",
+        reason=reason,
+    )
+
+
+def _opus_transient_retries_used(
+    records: list[dict[str, Any]],
+    cycle: int,
+) -> int:
+    """Count fresh transient-retry Opus children already spent this cycle."""
+
+    return sum(
+        1
+        for record in records
+        if (
+            (parsed := _stage(record.get("title"))) is not None
+            and parsed.kind == "audit_retry"
+            and parsed.cycle == cycle
+        )
+    )
+
+
+def _opus_transient_retry_available(
+    records: list[dict[str, Any]],
+    cycle: int,
+) -> bool:
+    """Return whether another transient Opus retry is still within budget."""
+
+    return _opus_transient_retries_used(records, cycle) < _OPUS_TRANSIENT_RETRY_CAP
+
+
+def _opus_transient_retry_route(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    reason: str = "",
+) -> _Route:
+    """Recover a transient Opus stream death with a fresh, unique-title child.
+
+    This is not a model-quality cycle: it never advances the cycle counter, is
+    scoped to one parent's ledger, and the truncated packet that triggered it is
+    never read as audit evidence. Bounded to one retry per cycle; a second
+    transient death is terminal infrastructure failure.
+    """
+
+    used = _opus_transient_retries_used(records, cycle)
+    if used >= _OPUS_TRANSIENT_RETRY_CAP:
+        return _Route(
+            "infrastructure_failed",
+            cycle,
+            reason=(
+                f"Opus transient stream-error retries exhausted in cycle {cycle}"
+                + (f": {reason}" if reason else "")
+            ),
+        )
+    hop = used + 1
+    return _Route(
+        "dispatch",
+        cycle,
+        "opus_auditor",
+        f"audit-retry-{cycle}-{hop}",
+        requester="opus",
+        hop=hop,
+        reason=(
+            "transient Opus stream death recovered with a fresh child"
+            + (f": {reason}" if reason else "")
+        ),
     )
 
 
@@ -1065,7 +1304,7 @@ def _verdict_route(
         )
         if used >= 2:
             return _Route(
-                "validation_failed",
+                "best_effort",
                 cycle,
                 requester=requester,
                 hop=used,
@@ -1120,7 +1359,7 @@ def _verdict_route(
             title = f"judge-convergence-{cycle}"
             if any(record.get("title") == title for record in records):
                 return _Route(
-                    "validation_failed",
+                    "best_effort",
                     cycle,
                     reason=(
                         "bounded convergence adjudication declined STAMP; "
@@ -1140,7 +1379,7 @@ def _verdict_route(
             )
         if cycle >= _MAX_CYCLES:
             return _Route(
-                "validation_failed",
+                "best_effort",
                 cycle,
                 reason=(
                     "Codex requested rework after configured final cycle "
@@ -1153,15 +1392,13 @@ def _verdict_route(
     return _Route("success", cycle)
 
 
-def _next_route(
+def _reduce_next_route(
     records: list[dict[str, Any]],
     parent_session_id: str = "",
 ) -> _Route:
-    """Reduce the ledger to one deterministic next transition."""
+    """Reduce collected packets to one deterministic next transition."""
 
-    if parent_session_id and any(
-        record.get("parent_session_id") for record in records
-    ):
+    if parent_session_id:
         records = [
             record
             for record in records
@@ -1169,6 +1406,29 @@ def _next_route(
         ]
     if not records:
         return _Route("dispatch", 1, "cursor_workhorse", "cursor-cycle-1")
+    # A retained Cursor child can report a duplicate completion after its
+    # original packet already advanced the cycle to Opus. Ignore only trailing
+    # duplicates backed by an earlier complete non-empty packet of the exact
+    # same cycle/title. The original packet remains the Cursor evidence; a lone
+    # failed or empty Cursor packet still fails closed.
+    while records:
+        trailing = records[-1]
+        trailing_stage = _stage(trailing.get("title"))
+        if trailing_stage is None or trailing_stage.kind not in {
+            "cursor_grunt",
+            "cursor_retry",
+        }:
+            break
+        title = trailing.get("title")
+        if not any(
+            prior.get("agent") == "cursor_workhorse"
+            and prior.get("title") == title
+            and prior.get("status") == "completed"
+            and bool(str(prior.get("output") or "").strip())
+            for prior in records[:-1]
+        ):
+            break
+        records = records[:-1]
     last = records[-1]
     parsed = _stage(last.get("title"))
     if parsed is None:
@@ -1179,6 +1439,27 @@ def _next_route(
             parsed.cycle,
             reason=f"cycle {parsed.cycle} exceeds configured maximum {_MAX_CYCLES}",
         )
+    # A transient, platform-side Opus stream death (server error mid-response,
+    # truncated stream) on any audit stage is recoverable with a fresh child
+    # under a unique title. Intercept it before the generic failure guard and
+    # before any audit parsing, so an incomplete packet is never read as
+    # evidence and a genuine failure (native timeout, empty output, pin break)
+    # still falls through to terminal infrastructure failure below.
+    if parsed.kind in _OPUS_AUDIT_KINDS and _is_transient_opus_stream_error(last):
+        return _opus_transient_retry_route(
+            records,
+            parsed.cycle,
+            reason="Opus native audit stream ended mid-response",
+        )
+    if (
+        parsed.kind in {"cursor_grunt", "cursor_retry"}
+        and _retryable_cursor_failure(last)
+    ):
+        return _cursor_retry_route(
+            records,
+            parsed.cycle,
+            reason="Cursor produced no complete packet after a retryable transport failure",
+        )
     if last.get("status") != "completed" or not str(last.get("output", "")).strip():
         return _Route(
             "infrastructure_failed",
@@ -1186,7 +1467,7 @@ def _next_route(
             reason="failed, cancelled, or empty worker result",
         )
     cycle = parsed.cycle
-    if parsed.kind == "cursor_grunt":
+    if parsed.kind in {"cursor_grunt", "cursor_retry"}:
         return _Route("dispatch", cycle, "opus_auditor", f"audit-cycle-{cycle}")
     if parsed.kind == "cursor_web":
         if parsed.requester == "opus":
@@ -1210,16 +1491,13 @@ def _next_route(
             requester="codex",
             hop=parsed.hop,
             resume_child_session_id=_resume_child(
-                records, "codex_judge", title
+                records,
+                "codex_judge",
+                title,
+                parent_session_id=parent_session_id,
             ),
         )
-    if parsed.kind in {
-        "audit",
-        "audit_web",
-        "audit_internal",
-        "audit_repair",
-        "audit_repair_web",
-    }:
+    if parsed.kind in _OPUS_AUDIT_KINDS:
         audit_observation = (
             last.get("internal_mcp_observation")
             if isinstance(last.get("internal_mcp_observation"), dict)
@@ -1296,6 +1574,12 @@ def _next_route(
         )
     if parsed.kind == "judge_convergence":
         payload = _valid_judgment(last.get("output"))
+        if payload is None:
+            return _Route(
+                "infrastructure_failed",
+                cycle,
+                reason="Codex convergence judgment was incomplete or malformed",
+            )
         if payload is not None and payload.get("verdict") == "STAMP":
             return _Route("success", cycle)
         limitations = (
@@ -1305,7 +1589,7 @@ def _next_route(
             else []
         )
         return _Route(
-            "validation_failed",
+            "best_effort",
             cycle,
             reason=(
                 "bounded convergence adjudication did not STAMP"
@@ -1368,22 +1652,138 @@ def _next_route(
     return _Route("infrastructure_failed", cycle, reason="invalid route state")
 
 
+def _dispatch_matches_collection(
+    dispatch: dict[str, Any],
+    collection: dict[str, Any],
+) -> bool:
+    """Match one durable dispatch to its exact collected work generation."""
+
+    dispatch_work = str(dispatch.get("work_id") or "")
+    collection_work = str(collection.get("work_id") or "")
+    if dispatch_work and collection_work:
+        return dispatch_work == collection_work
+    dispatch_child = str(dispatch.get("child_session_id") or "")
+    collection_child = str(collection.get("child_session_id") or "")
+    if dispatch_child and collection_child:
+        return (
+            dispatch_child == collection_child
+            and dispatch.get("title") == collection.get("title")
+        )
+    return (
+        dispatch.get("agent") == collection.get("agent")
+        and dispatch.get("title") == collection.get("title")
+    )
+
+
+def _uncollected_corrective_audit_route(
+    records: list[dict[str, Any]],
+    dispatches: list[dict[str, Any]],
+    cycle: int,
+    *,
+    parent_session_id: str = "",
+) -> _Route | None:
+    """Return an already-paid audit that must be collected before terminalizing."""
+
+    scoped_records = [
+        record
+        for record in records
+        if (
+            not parent_session_id
+            or record.get("parent_session_id") == parent_session_id
+        )
+    ]
+    pending: list[tuple[dict[str, Any], _Stage]] = []
+    for dispatch in dispatches:
+        if (
+            parent_session_id
+            and dispatch.get("parent_session_id") != parent_session_id
+        ):
+            continue
+        parsed = _stage(dispatch.get("title"))
+        if (
+            dispatch.get("agent") != "opus_auditor"
+            or parsed is None
+            or parsed.cycle != cycle
+            or parsed.kind not in _OPUS_AUDIT_KINDS
+            or any(
+                _dispatch_matches_collection(dispatch, record)
+                for record in scoped_records
+            )
+        ):
+            continue
+        pending.append((dispatch, parsed))
+    if not pending:
+        return None
+    dispatch, parsed = pending[-1]
+    return _Route(
+        "dispatch",
+        cycle,
+        "opus_auditor",
+        str(dispatch.get("title") or ""),
+        requester=parsed.requester,
+        hop=parsed.hop,
+        reason=(
+            "an already-dispatched corrective audit remains in flight or "
+            "completed-but-uncollected"
+        ),
+    )
+
+
+def _next_route(
+    records: list[dict[str, Any]],
+    parent_session_id: str = "",
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+) -> _Route:
+    """Reduce the durable ledger without terminalizing ahead of paid audits."""
+
+    route = _reduce_next_route(records, parent_session_id=parent_session_id)
+    if route.status not in {"best_effort", "infrastructure_failed"}:
+        return route
+    durable_dispatches = dispatches
+    if durable_dispatches is None and parent_session_id:
+        durable_dispatches = read_attempt_dispatches(
+            parent_session_id=parent_session_id
+        )
+    pending = _uncollected_corrective_audit_route(
+        records,
+        durable_dispatches or [],
+        route.cycle,
+        parent_session_id=parent_session_id,
+    )
+    return pending or route
+
+
 def _route_dispatch_pending(
     route: _Route,
     records: list[dict[str, Any]] | None = None,
     dispatches: list[dict[str, Any]] | None = None,
+    *,
+    parent_session_id: str = "",
 ) -> bool:
     """Return whether the canonical route has an uncollected dispatch in flight."""
 
     if route.status != "dispatch" or not route.agent or not route.title:
         return False
-    collected = records if records is not None else read_collections()
-    sent = dispatches if dispatches is not None else read_dispatches()
+    collected = (
+        records
+        if records is not None
+        else read_collections(parent_session_id=parent_session_id)
+    )
+    sent = (
+        dispatches
+        if dispatches is not None
+        else read_dispatches(parent_session_id=parent_session_id)
+    )
 
     def matches(record: dict[str, Any]) -> bool:
         return (
             record.get("agent") == route.agent
             and record.get("title") == route.title
+            and (
+                not parent_session_id
+                or record.get("parent_session_id") == parent_session_id
+            )
         )
 
     return sum(matches(record) for record in sent) > sum(
@@ -1413,39 +1813,73 @@ def _observed_nonmax_opus_effort(
     return False
 
 
-def _has_required_stage_chain(records: list[dict[str, Any]], cycle: int) -> bool:
-    """Confirm the final cycle collected Cursor and Opus before Codex.
+def _has_required_stage_chain(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    parent_session_id: str = "",
+    attempt_generation: int | None = None,
+) -> bool:
+    """Confirm exact-cycle Cursor plus a semantically valid Opus audit."""
 
-    This is a final-attestation prerequisite, not routing authorization. Tool
-    calls remain unrestricted by message content or project-owned stage gates.
-    """
-
-    if _observed_nonmax_opus_effort(records, cycle):
+    scoped: list[dict[str, Any]] = []
+    for record in records:
+        if (
+            parent_session_id
+            and record.get("parent_session_id") != parent_session_id
+        ):
+            continue
+        if attempt_generation is not None:
+            try:
+                generation = int(record.get("attempt_generation") or 1)
+            except (TypeError, ValueError):
+                continue
+            if generation != attempt_generation:
+                continue
+        scoped.append(record)
+    if _observed_nonmax_opus_effort(scoped, cycle):
         return False
     cursor_seen = False
-    for record in records:
+    for record in scoped:
         if record.get("status") != "completed":
             continue
-        title = str(record.get("title") or "")
-        if title == f"cursor-cycle-{cycle}":
-            cursor_seen = True
-        elif cursor_seen and title in {
-            f"audit-cycle-{cycle}",
-            f"audit-format-repair-{cycle}",
-        } or (
-            cursor_seen
-            and re.fullmatch(
-                rf"audit-(?:cycle|format-repair)-{cycle}-web-[1-2]",
-                title,
+        if (
+            record.get("agent") == "cursor_workhorse"
+            and (
+                record.get("title") == f"cursor-cycle-{cycle}"
+                or record.get("title") == f"cursor-retry-{cycle}-1"
             )
-            is not None
+            and bool(str(record.get("output") or "").strip())
+        ):
+            cursor_seen = True
+            continue
+        parsed = _stage(record.get("title"))
+        observation = (
+            record.get("internal_mcp_observation")
+            if isinstance(record.get("internal_mcp_observation"), dict)
+            else None
+        )
+        if (
+            cursor_seen
+            and record.get("agent") == "opus_auditor"
+            and parsed is not None
+            and parsed.cycle == cycle
+            and parsed.kind in _OPUS_AUDIT_KINDS
+            and _valid_audit(record.get("output"), observation) is not None
         ):
             return True
     return False
 
 
-def _latest_codex_stamp() -> tuple[str, int] | None:
-    for record in reversed(_completion_records()):
+def _latest_codex_stamp(
+    parent_session_id: str = "",
+) -> tuple[str, int] | None:
+    records = (
+        read_attempt_collections(parent_session_id=parent_session_id)
+        if parent_session_id
+        else _completion_records()
+    )
+    for record in reversed(records):
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
         match = re.fullmatch(
@@ -1471,6 +1905,25 @@ def _contains_text(value: object, needle: str) -> bool:
     return False
 
 
+def _valid_voice_profile_check(check: object) -> bool:
+    """Validate the exact configured-profile load receipt.
+
+    The digest proves which profile bytes Codex reports loading; it does not
+    prove that the resulting answer follows every style constraint.
+    """
+
+    expected_path = _voice_profile_path()
+    expected_digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
+    if not expected_path and not expected_digest:
+        return True
+    if not expected_path or not expected_digest or not isinstance(check, dict):
+        return False
+    return (
+        check.get("source_path") == expected_path
+        and check.get("sha256") == expected_digest
+    )
+
+
 def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
     if payload is None or payload.get("verdict") != "STAMP":
         return None
@@ -1483,26 +1936,485 @@ def _valid_stamp(payload: dict[str, Any] | None) -> str | None:
     answer = payload.get("shippable_answer")
     citations = payload.get("citations_that_hold")
     check = payload.get("voice_profile_check")
-    expected_digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "")
-    expected_path = _voice_profile_path()
     if not isinstance(answer, str) or not answer.strip() or "\u2014" in answer:
         return None
     if not isinstance(citations, list) or not citations:
         return None
     # Voice rendering is optional. When a profile is configured the stamp must
-    # prove Codex read that exact file; when it is not, there is nothing to
-    # prove and requiring a digest would reject every otherwise valid stamp.
-    if expected_path or expected_digest:
-        if (
-            not expected_digest
-            or not _contains_text(check, expected_path)
-            or not _contains_text(check, expected_digest)
-        ):
-            return None
+    # carry the canonical exact-file receipt accepted by persistence too.
+    if not _valid_voice_profile_check(check):
+        return None
     return answer
 
 
-def _has_terminal_worker_failure() -> bool:
+def _safe_customer_answer(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    answer = value.strip()
+    if not answer or answer.startswith(
+        (
+            "PIPELINE_VALIDATION_FAILED:",
+            "PIPELINE_INFRASTRUCTURE_ERROR:",
+            "CURSOR_FINALIZATION_REQUIRED:",
+            "CURSOR_WORKER_STALLED:",
+            "CURSOR_WORKER_FAILED:",
+            "CURSOR_WORKER_TIMEOUT:",
+            "TRIPLE_STAMP_NONTERMINAL_CONTINUATION",
+        )
+    ):
+        return ""
+    return answer
+
+
+def _cursor_answer_draft(output: object) -> str:
+    """Extract only Cursor's explicitly completed customer-answer draft."""
+
+    if not isinstance(output, str):
+        return ""
+    for payload in _mapping_candidates(output):
+        answer = _safe_customer_answer(
+            payload.get("suggested_customer_answer_draft")
+        )
+        if answer:
+            return answer
+    marker = re.search(
+        r"(?im)^\s*(?:[-*]\s*)?suggested_customer_answer_draft\s*:\s*",
+        output,
+    )
+    if marker is None:
+        return ""
+    remainder = output[marker.end() :]
+    boundary = re.search(
+        (
+            r"(?im)^\s*(?:[-*]\s*)?"
+            r"(?:question_restated|purpose_run|findings|web_sources|unverified|"
+            r"weakest_part)\s*:"
+        ),
+        remainder,
+    )
+    draft = remainder[: boundary.start()] if boundary is not None else remainder
+    return _safe_customer_answer(textwrap.dedent(draft))
+
+
+def _judgment_gaps(payload: dict[str, Any]) -> list[str]:
+    """Render concrete unresolved evidence gaps without infrastructure prose."""
+
+    gaps: list[str] = []
+    limitations = payload.get("limitations")
+    if isinstance(limitations, list):
+        gaps.extend(
+            str(item).strip()
+            for item in limitations
+            if isinstance(item, str) and item.strip()
+        )
+    field = {
+        "REWORK": "punch_list_for_cursor",
+        "NEEDS_WEB": "web_queries",
+        "NEEDS_INTERNAL": "internal_queries",
+    }.get(str(payload.get("verdict")), "")
+    items = payload.get(field) if field else []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, str) and item.strip():
+                gaps.append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim") or "").strip()
+            proof = str(
+                item.get("requested_proof")
+                or item.get("prove_condition")
+                or item.get("where_to_look")
+                or ""
+            ).strip()
+            if claim and proof:
+                gaps.append(f"{claim} Required evidence: {proof}")
+            elif claim or proof:
+                gaps.append(claim or proof)
+    if not gaps:
+        why = str(payload.get("why") or "").strip()
+        if why:
+            gaps.append(why)
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for gap in gaps:
+        normalized = _normalize_gap_text(gap)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduplicated.append(gap)
+    return deduplicated
+
+
+def _record_precedes(
+    records: list[dict[str, Any]],
+    first_index: int,
+    second_index: int,
+) -> bool:
+    """Compare collection sequence, strengthened by durable timestamps."""
+
+    first_ns = int(records[first_index].get("collected_at_ns") or 0)
+    second_ns = int(records[second_index].get("collected_at_ns") or 0)
+    if first_ns and second_ns and first_ns != second_ns:
+        return first_ns < second_ns
+    return first_index < second_index
+
+
+def _dispatch_provenance(
+    record: dict[str, Any],
+    dispatches: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Return the exact dispatch sequence and timestamp for one packet."""
+
+    matches = [
+        (index, dispatch)
+        for index, dispatch in enumerate(dispatches)
+        if _dispatch_matches_collection(dispatch, record)
+    ]
+    if not matches:
+        return 0, 0
+    index, dispatch = matches[-1]
+    return index + 1, int(dispatch.get("dispatched_at_ns") or 0)
+
+
+def _valid_audit_at(
+    records: list[dict[str, Any]],
+    index: int,
+) -> dict[str, Any] | None:
+    """Validate one audit, reusing its source observation for format repair."""
+
+    record = records[index]
+    parsed = _stage(record.get("title"))
+    if parsed is None or parsed.kind not in _OPUS_AUDIT_KINDS:
+        return None
+    observation = (
+        record.get("internal_mcp_observation")
+        if isinstance(record.get("internal_mcp_observation"), dict)
+        else None
+    )
+    if parsed.kind in {"audit_repair", "audit_repair_web"}:
+        observation = next(
+            (
+                prior.get("internal_mcp_observation")
+                for prior in reversed(records[:index])
+                if (
+                    (prior_stage := _stage(prior.get("title"))) is not None
+                    and prior_stage.cycle == parsed.cycle
+                    and prior_stage.kind in {"audit", "audit_web", "audit_internal"}
+                    and isinstance(prior.get("internal_mcp_observation"), dict)
+                )
+            ),
+            None,
+        )
+    return _valid_audit(record.get("output"), observation)
+
+
+def _candidate_provenance(
+    records: list[dict[str, Any]],
+    cycle: int,
+    candidate_index: int,
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
+) -> dict[str, Any] | None:
+    """Bind a candidate to the latest completed Cursor-audit-judge lineage."""
+
+    durable_dispatches = list(dispatches or [])
+    if _uncollected_corrective_audit_route(
+        records,
+        durable_dispatches,
+        cycle,
+        parent_session_id=parent_session_id,
+    ) is not None:
+        return None
+    audit_indexes = [
+        index
+        for index, record in enumerate(records)
+        if (
+            record.get("agent") == "opus_auditor"
+            and record.get("status") == "completed"
+            and bool(str(record.get("output") or "").strip())
+            and (parsed := _stage(record.get("title"))) is not None
+            and parsed.cycle == cycle
+            and parsed.kind in _OPUS_AUDIT_KINDS
+        )
+    ]
+    if any(
+        _record_precedes(records, candidate_index, audit_index)
+        for audit_index in audit_indexes
+    ):
+        return None
+    source_audit_index = next(
+        (
+            audit_index
+            for audit_index in reversed(audit_indexes)
+            if _record_precedes(records, audit_index, candidate_index)
+            and _valid_audit_at(records, audit_index) is not None
+        ),
+        None,
+    )
+    if source_audit_index is None:
+        return None
+    cursor_index = next(
+        (
+            index
+            for index in range(source_audit_index - 1, -1, -1)
+            if (
+                records[index].get("agent") == "cursor_workhorse"
+                and records[index].get("status") == "completed"
+                and records[index].get("title")
+                in {
+                    f"cursor-cycle-{cycle}",
+                    f"cursor-retry-{cycle}-1",
+                }
+                and bool(_safe_customer_answer(records[index].get("output")))
+            )
+        ),
+        None,
+    )
+    if cursor_index is None:
+        return None
+    candidate_dispatch_sequence, candidate_dispatched_at_ns = (
+        _dispatch_provenance(records[candidate_index], durable_dispatches)
+    )
+    audit_dispatch_sequence, audit_dispatched_at_ns = _dispatch_provenance(
+        records[source_audit_index],
+        durable_dispatches,
+    )
+    audit_collected_at_ns = int(
+        records[source_audit_index].get("collected_at_ns") or 0
+    )
+    if (
+        candidate_dispatched_at_ns
+        and audit_collected_at_ns
+        and candidate_dispatched_at_ns < audit_collected_at_ns
+    ):
+        return None
+    if (
+        candidate_dispatch_sequence
+        and audit_dispatch_sequence
+        and candidate_dispatch_sequence <= audit_dispatch_sequence
+    ):
+        return None
+    return {
+        "cursor": records[cursor_index],
+        "opus": records[source_audit_index],
+        "codex": records[candidate_index],
+        "collection_sequences": {
+            "cursor": cursor_index + 1,
+            "opus": source_audit_index + 1,
+            "codex": candidate_index + 1,
+        },
+        "dispatch_sequences": {
+            "cursor": _dispatch_provenance(
+                records[cursor_index], durable_dispatches
+            )[0],
+            "opus": audit_dispatch_sequence,
+            "codex": candidate_dispatch_sequence,
+        },
+        "dispatch_timestamps": {
+            "cursor": _dispatch_provenance(
+                records[cursor_index], durable_dispatches
+            )[1],
+            "opus": audit_dispatched_at_ns,
+            "codex": candidate_dispatched_at_ns,
+        },
+    }
+
+
+def _best_effort_provenance(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
+) -> dict[str, Any] | None:
+    """Return the freshest complete chain that may support BEST_EFFORT."""
+
+    scoped = [
+        record
+        for record in records
+        if (
+            not parent_session_id
+            or record.get("parent_session_id") == parent_session_id
+        )
+    ]
+    durable_dispatches = [
+        dispatch
+        for dispatch in (dispatches or [])
+        if (
+            not parent_session_id
+            or dispatch.get("parent_session_id") == parent_session_id
+        )
+    ]
+    for index in range(len(scoped) - 1, -1, -1):
+        record = scoped[index]
+        parsed = _stage(record.get("title"))
+        if (
+            record.get("agent") != "codex_judge"
+            or record.get("status") != "completed"
+            or parsed is None
+            or parsed.cycle != cycle
+            or parsed.kind not in {"judge", "judge_repair", "judge_convergence"}
+        ):
+            continue
+        review = _valid_judgment(record.get("output"))
+        if review is None or review.get("verdict") == "STAMP":
+            continue
+        provenance = _candidate_provenance(
+            scoped,
+            cycle,
+            index,
+            dispatches=durable_dispatches,
+            parent_session_id=parent_session_id,
+        )
+        if provenance is not None:
+            provenance["review"] = review
+            return provenance
+
+    if _uncollected_corrective_audit_route(
+        scoped,
+        durable_dispatches,
+        cycle,
+        parent_session_id=parent_session_id,
+    ) is not None:
+        return None
+    if any(
+        record.get("agent") == "codex_judge"
+        and record.get("status") == "completed"
+        and bool(str(record.get("output") or "").strip())
+        and (parsed := _stage(record.get("title"))) is not None
+        and parsed.cycle == cycle
+        for record in scoped
+    ):
+        return None
+    latest_audit_index = next(
+        (
+            index
+            for index in range(len(scoped) - 1, -1, -1)
+            if (
+                scoped[index].get("agent") == "opus_auditor"
+                and scoped[index].get("status") == "completed"
+                and bool(str(scoped[index].get("output") or "").strip())
+                and (parsed := _stage(scoped[index].get("title"))) is not None
+                and parsed.cycle == cycle
+                and parsed.kind in _OPUS_AUDIT_KINDS
+            )
+        ),
+        None,
+    )
+    for audit_index in (
+        [latest_audit_index] if latest_audit_index is not None else []
+    ):
+        audit = scoped[audit_index]
+        parsed = _stage(audit.get("title"))
+        review = _valid_audit_at(scoped, audit_index)
+        if (
+            audit.get("agent") != "opus_auditor"
+            or audit.get("status") != "completed"
+            or parsed is None
+            or parsed.cycle != cycle
+            or review is None
+            or review.get("verdict") not in {"PASS_WITH_GAPS", "NEEDS_WEB"}
+        ):
+            continue
+        cursor_index = next(
+            (
+                index
+                for index in range(audit_index - 1, -1, -1)
+                if (
+                    scoped[index].get("agent") == "cursor_workhorse"
+                    and scoped[index].get("status") == "completed"
+                    and scoped[index].get("title")
+                    in {
+                        f"cursor-cycle-{cycle}",
+                        f"cursor-retry-{cycle}-1",
+                    }
+                    and bool(_safe_customer_answer(scoped[index].get("output")))
+                )
+            ),
+            None,
+        )
+        if cursor_index is None:
+            return None
+        cursor_dispatch = _dispatch_provenance(
+            scoped[cursor_index], durable_dispatches
+        )
+        audit_dispatch = _dispatch_provenance(
+            audit, durable_dispatches
+        )
+        return {
+            "cursor": scoped[cursor_index],
+            "opus": audit,
+            "codex": None,
+            "review": review,
+            "collection_sequences": {
+                "cursor": cursor_index + 1,
+                "opus": audit_index + 1,
+            },
+            "dispatch_sequences": {
+                "cursor": cursor_dispatch[0],
+                "opus": audit_dispatch[0],
+            },
+            "dispatch_timestamps": {
+                "cursor": cursor_dispatch[1],
+                "opus": audit_dispatch[1],
+            },
+        }
+    return None
+
+
+def _best_effort_answer(
+    records: list[dict[str, Any]],
+    route: _Route,
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
+) -> str | None:
+    """Build a finished conclusion-plus-gaps answer from complete packets only."""
+
+    if route.status != "best_effort" or not _has_required_stage_chain(
+        records, route.cycle
+    ):
+        return None
+    provenance = _best_effort_provenance(
+        records,
+        route.cycle,
+        dispatches=dispatches,
+        parent_session_id=parent_session_id,
+    )
+    if provenance is None:
+        return None
+    complete_cursor = provenance["cursor"]
+    review = provenance["review"]
+
+    conclusion = _safe_customer_answer(review.get("best_supported_answer"))
+    if not conclusion:
+        conclusion = _cursor_answer_draft(complete_cursor.get("output"))
+    if not conclusion:
+        conclusion = _safe_customer_answer(complete_cursor.get("output"))
+    if not conclusion:
+        why = _safe_customer_answer(review.get("why"))
+        if not why:
+            return None
+        conclusion = (
+            "Based on the completed review, the strongest supported conclusion "
+            f"is: {why}"
+        )
+
+    gaps = _judgment_gaps(review)
+    gap_lines = "\n".join(f"- {gap}" for gap in gaps)
+    if not gap_lines:
+        gap_lines = "- Final quality approval was not granted."
+    return (
+        f"{conclusion}\n\n"
+        "Remaining evidence gaps:\n"
+        f"{gap_lines}\n\n"
+        "These gaps are explicit because the completed evidence did not support "
+        "final quality approval."
+    )
+
+
+def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
     pin_markers = (
         "pin broke",
         "model drift",
@@ -1510,13 +2422,44 @@ def _has_terminal_worker_failure() -> bool:
         "wrong harness",
         "produced no output",
     )
-    for record in _completion_records():
-        if record["status"] in {"failed", "cancelled"} or not record["output"].strip():
+    records = (
+        read_attempt_collections(parent_session_id=parent_session_id)
+        if parent_session_id
+        else _completion_records()
+    )
+    for record in records:
+        output = str(record.get("output") or "")
+        if record.get("status") in {"failed", "cancelled"} or not output.strip():
+            parsed = _stage(record.get("title"))
+            if (
+                parsed is not None
+                and parsed.kind in {"cursor_grunt", "cursor_retry"}
+                and _retryable_cursor_failure(record)
+                and (
+                    parsed.kind == "cursor_grunt"
+                    or _cursor_retries_used(records, parsed.cycle)
+                    < _CURSOR_RETRY_CAP
+                )
+            ):
+                continue
+            # A transient Opus stream death is only terminal once its bounded
+            # retry budget for the cycle is spent. While a fresh retry child is
+            # still available, this is recoverable, not a terminal failure, and
+            # the user must not see PIPELINE_INFRASTRUCTURE_ERROR.
+            if (
+                parsed is not None
+                and parsed.kind in _OPUS_AUDIT_KINDS
+                and _is_transient_opus_stream_error(record)
+                and _opus_transient_retry_available(records, parsed.cycle)
+            ):
+                continue
             return True
-        lowered = record["output"].lower()
+        lowered = output.lower()
         if any(marker in lowered for marker in pin_markers):
             return True
-    for record in read_collections():
+    for record in read_attempt_collections(
+        parent_session_id=parent_session_id
+    ):
         title = str(record.get("title", ""))
         if title.startswith("audit-format-repair-") and _valid_audit(
             record.get("output")
@@ -1525,51 +2468,63 @@ def _has_terminal_worker_failure() -> bool:
     return False
 
 
-def _max_unstamped_judgments() -> bool:
-    count = 0
-    for record in _completion_records():
+def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
+    cycles: set[int] = set()
+    records = (
+        read_attempt_collections(parent_session_id=parent_session_id)
+        if parent_session_id
+        else _completion_records()
+    )
+    for record in records:
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
-        payload = next(iter(_mapping_candidates(record["output"])), None)
+        title = str(record.get("title") or "")
+        match = re.fullmatch(r"judge-cycle-([1-4])", title)
+        if match is None:
+            continue
+        payload = _valid_judgment(record["output"])
         if payload is not None and payload.get("verdict") in {
             "REWORK",
             "NEEDS_WEB",
             "NEEDS_INTERNAL",
         }:
-            count += 1
-    return count >= _MAX_CYCLES
+            cycles.add(int(match.group(1)))
+    return len(cycles) >= _MAX_CYCLES
 
 
-def _failure_metrics() -> tuple[float | None, int | None]:
+def _failure_metrics(
+    parent_session_id: str = "",
+) -> tuple[float | None, int | None]:
     raw = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
     if not raw:
         return None, None
-    run_dir = Path(raw)
     try:
-        budget = json.loads((run_dir / "budget-state.json").read_text(encoding="utf-8"))
+        budget = read_budget_state(parent_session_id)
         cost = float(budget["cost_usd"])
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError):
         cost = None
-    try:
-        calls = len(
-            (run_dir / "supervisor-tool-calls.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-    except OSError:
+    calls = len(read_supervisor_tool_calls(parent_session_id))
+    if calls == 0:
         calls = None
     return cost, calls
 
 
 def _mark_terminal(
-    kind: str, answer: str | None = None, *, reason: str = ""
+    kind: str,
+    answer: str | None = None,
+    *,
+    reason: str = "",
+    parent_session_id: str = "",
 ) -> None:
     raw = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
     if not raw:
         return
     if kind != "STAMP":
-        route = _next_route(read_collections())
-        cost, calls = _failure_metrics()
+        route = _next_route(
+            read_attempt_collections(parent_session_id=parent_session_id),
+            parent_session_id=parent_session_id,
+        )
+        cost, calls = _failure_metrics(parent_session_id)
         record_terminal_failure(
             kind,
             reason or route.reason or "pipeline reached a terminal failure",
@@ -1577,20 +2532,67 @@ def _mark_terminal(
             cycle=route.cycle,
             cost_usd=cost,
             calls=calls,
+            parent_session_id=parent_session_id,
         )
     try:
+        from triple_stamp_runtime_state import _parent_artifact_path
+
         run_dir = Path(raw)
-        marker = run_dir / "pipeline-terminal"
+        marker = _parent_artifact_path(
+            run_dir,
+            "pipeline-terminal",
+            parent_session_id,
+        )
         marker.write_text(kind + "\n", encoding="utf-8")
         marker.chmod(0o600)
         if answer is not None:
             data = answer.encode("utf-8")
-            relay = run_dir / "stamped-answer.bin"
-            relay.write_bytes(data)
-            relay.chmod(0o600)
-            digest = run_dir / "stamped-answer.sha256"
-            digest.write_text(hashlib.sha256(data).hexdigest() + "\n", encoding="ascii")
-            digest.chmod(0o600)
+            relay = _parent_artifact_path(
+                run_dir,
+                "stamped-answer.bin",
+                parent_session_id,
+            )
+            attested = read_attested_answer(parent_session_id)
+            if attested:
+                if attested.encode("utf-8") != data:
+                    return
+            else:
+                try:
+                    fd = os.open(
+                        relay,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o400,
+                    )
+                except FileExistsError:
+                    if relay.read_bytes() != data:
+                        return
+                else:
+                    try:
+                        os.write(fd, data)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+            digest = _parent_artifact_path(
+                run_dir,
+                "stamped-answer.sha256",
+                parent_session_id,
+            )
+            digest_data = hashlib.sha256(data).hexdigest() + "\n"
+            try:
+                fd = os.open(
+                    digest,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o400,
+                )
+            except FileExistsError:
+                if digest.read_text(encoding="ascii") != digest_data:
+                    return
+            else:
+                try:
+                    os.write(fd, digest_data.encode("ascii"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
     except OSError:
         return
 
@@ -1598,11 +2600,11 @@ def _mark_terminal(
 def supervisor_contract(
     enabled: bool = True,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """Observe routing calls and enforce only terminal response attestation.
+    """Observe routing calls and enforce terminal and paid-retry safety.
 
-    Worker sends and inbox reads are authorized by their mechanically minimal
-    tool surface, not by this policy. Native Omnigent validation and errors pass
-    through unchanged.
+    A transient Opus retry is atomically reserved before native dispatch, and a
+    Cursor stage can never be resumed after its first dispatch. These denials
+    prevent duplicate paid work even if stale supervisor context asks for it.
     """
 
     def evaluate(event: dict[str, Any]) -> dict[str, Any]:
@@ -1621,10 +2623,139 @@ def supervisor_contract(
             data = event.get("data")
             raw_name = data.get("name") if isinstance(data, dict) else ""
             try:
-                append_supervisor_tool_call(str(raw_name or "unknown"))
+                append_supervisor_tool_call(
+                    str(raw_name or "unknown"),
+                    parent_session_id=parent_session_id,
+                )
             except OSError:
                 # Observability must never become routing authorization.
                 pass
+            arguments = data.get("arguments") if isinstance(data, dict) else None
+            title = (
+                str(arguments.get("title") or "")
+                if isinstance(arguments, dict)
+                else ""
+            )
+            if str(raw_name or "").rsplit("__", 1)[-1] != "sys_session_send":
+                return {"result": "ALLOW"}
+            if parent_session_id and (
+                read_attested_answer(parent_session_id)
+                or read_best_effort_answer(parent_session_id)
+                or read_terminal_failure(parent_session_id)
+                or _latest_codex_stamp(parent_session_id) is not None
+            ):
+                # A terminal artifact is still an absolute no-spend boundary.
+                # The native dispatch wrapper converts this raced/stale call to
+                # an internal no-op, while the response guard relays the terminal
+                # once or stays silent. Returning DENY here leaked policy text as
+                # the newest customer-visible output on delayed child wakes.
+                return {"result": "ALLOW"}
+            parsed = _stage(title)
+            if title.startswith("cursor-retry-"):
+                retry = re.fullmatch(r"cursor-retry-([1-4])-([1-9][0-9]*)", title)
+                if retry is None or int(retry.group(2)) != 1:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one Cursor transport retry is allowed per "
+                            "cycle; cursor-retry-N-2 and higher are forbidden."
+                        ),
+                    }
+                if not parent_session_id:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Cursor retry lacks an authoritative parent "
+                            "session; unscoped dispatch is forbidden."
+                        ),
+                    }
+                active_records = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                route = _next_route(
+                    active_records,
+                    parent_session_id=parent_session_id,
+                )
+                if route.status != "dispatch" or route.title != title:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"{title} is not the durable next route for this "
+                            "attempt; speculative Cursor retry is forbidden."
+                        ),
+                    }
+                if not reserve_cursor_retry(
+                    parent_session_id,
+                    int(retry.group(1)),
+                ):
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one Cursor transport retry is allowed per "
+                            "parent, attempt generation, and cycle; the retry "
+                            "reservation is already spent or unavailable."
+                        ),
+                    }
+            if (
+                parsed is not None
+                and parsed.kind == "cursor_grunt"
+                and parent_session_id
+            ):
+                active_records = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                active_dispatches = read_attempt_dispatches(
+                    parent_session_id=parent_session_id
+                )
+                cursor_already_spent = any(
+                    record.get("title") == title
+                    for record in (*active_dispatches, *active_records)
+                )
+                later_stage_started = any(
+                    (record_stage := _stage(record.get("title"))) is not None
+                    and record_stage.cycle == parsed.cycle
+                    and record_stage.kind != "cursor_grunt"
+                    for record in (*active_dispatches, *active_records)
+                )
+                if cursor_already_spent or later_stage_started:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"{title} was already dispatched or superseded by "
+                            "a later stage in this attempt; duplicate Cursor "
+                            "resume/relaunch is forbidden."
+                        ),
+                    }
+            if title.startswith("audit-retry-"):
+                retry = re.fullmatch(r"audit-retry-([1-4])-([1-9][0-9]*)", title)
+                if retry is None or int(retry.group(2)) != 1:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one paid transient Opus retry is allowed per "
+                            "cycle; audit-retry-N-2 and higher are forbidden."
+                        ),
+                    }
+                if not parent_session_id:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Paid transient Opus retry lacks an authoritative "
+                            "parent session; unscoped dispatch is forbidden."
+                        ),
+                    }
+                if not reserve_opus_retry(
+                    parent_session_id,
+                    int(retry.group(1)),
+                ):
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one paid transient Opus retry is allowed per "
+                            "parent, attempt generation, and cycle; the retry "
+                            "reservation is already spent or unavailable."
+                        ),
+                    }
             return {"result": "ALLOW"}
         if event_type != "response":
             return {"result": "ALLOW"}
@@ -1634,41 +2765,93 @@ def supervisor_contract(
         response = event.get("data")
         if not isinstance(response, str):
             return {"result": "DENY", "reason": "supervisor response is not text"}
-        latest_stamp = _latest_codex_stamp()
+        if (
+            not parent_session_id
+            and any(
+                record.get("parent_session_id")
+                for record in read_collections()
+            )
+        ):
+            if response == "":
+                return {"result": "ALLOW"}
+            return {
+                "result": "DENY",
+                "reason": (
+                    "Supervisor response lacks one authoritative root "
+                    "conversation id; cross-parent ledger reduction is forbidden."
+                ),
+            }
+        collections = read_attempt_collections(
+            parent_session_id=parent_session_id
+        )
+        latest_stamp = _latest_codex_stamp(parent_session_id)
         if latest_stamp is not None:
             stamped, cycle = latest_stamp
         else:
             stamped, cycle = None, 0
         if (
             stamped is not None
-            and _has_required_stage_chain(read_collections(), cycle)
-            and response == stamped
+            and _has_required_stage_chain(collections, cycle)
         ):
-            _mark_terminal("STAMP", stamped)
-            return {"result": "ALLOW"}
+            if response == stamped:
+                _mark_terminal(
+                    "STAMP",
+                    stamped,
+                    parent_session_id=parent_session_id,
+                )
+                return {"result": "ALLOW"}
+            return {
+                "result": "DENY",
+                "reason": (
+                    "A valid Codex STAMP already exists and its byte-exact "
+                    "shippable_answer must be preserved."
+                ),
+            }
         route = _next_route(
-            read_collections(),
+            collections,
             parent_session_id=parent_session_id,
         )
+        best_effort = _best_effort_answer(collections, route)
+        if best_effort is not None and response == best_effort:
+            persisted = record_best_effort_answer(
+                best_effort,
+                collections,
+                cycle=route.cycle,
+                reason=route.reason,
+                parent_session_id=parent_session_id,
+            )
+            if persisted == best_effort:
+                return {"result": "ALLOW"}
         if (
             response == ""
-            and _route_dispatch_pending(route)
+            and _route_dispatch_pending(
+                route,
+                collections,
+                read_attempt_dispatches(parent_session_id=parent_session_id),
+                parent_session_id=parent_session_id,
+            )
         ):
             # The runtime continuation guard suppressed an ordinary status
             # reply after the required child was durably dispatched. Empty
             # completion keeps Omnigent in its native async waiting state.
             return {"result": "ALLOW"}
         if response.startswith(_INFRA_PREFIX) and (
-            _has_terminal_worker_failure()
+            _has_terminal_worker_failure(parent_session_id)
             or route.status == "infrastructure_failed"
         ):
             _mark_terminal(
                 "PIPELINE_INFRASTRUCTURE_ERROR",
                 reason=route.reason or "worker or native infrastructure failed",
+                parent_session_id=parent_session_id,
             )
             return {"result": "ALLOW"}
-        if response.startswith(_VALIDATION_PREFIX) and (
-            _max_unstamped_judgments() or route.status == "validation_failed"
+        if (
+            route.status != "best_effort"
+            and response.startswith(_VALIDATION_PREFIX)
+            and (
+                _max_unstamped_judgments(parent_session_id)
+                or route.status == "validation_failed"
+            )
         ):
             _mark_terminal(
                 "PIPELINE_VALIDATION_FAILED",
@@ -1677,6 +2860,7 @@ def supervisor_contract(
                     f"{_MAX_CYCLES} complete cycles ended without "
                     "Codex STAMP"
                 ),
+                parent_session_id=parent_session_id,
             )
             return {"result": "ALLOW"}
         return {
@@ -1744,7 +2928,16 @@ def supervisor_route_call_limit(
         state = event.get("session_state")
         if not isinstance(state, dict):
             return {"result": "ALLOW"}
-        raw_count = state.get(_SUPERVISOR_ROUTE_COUNT_STATE_KEY, 0)
+        generation = current_attempt_generation(root_conversation_id)
+        state_key = (
+            _SUPERVISOR_ROUTE_COUNT_STATE_KEY
+            if generation == 1
+            else (
+                f"{_SUPERVISOR_ROUTE_COUNT_STATE_KEY}"
+                f":attempt-{generation}"
+            )
+        )
+        raw_count = state.get(state_key, 0)
         if (
             isinstance(raw_count, bool)
             or not isinstance(raw_count, int)
@@ -1763,7 +2956,7 @@ def supervisor_route_call_limit(
             "result": "ALLOW",
             "state_updates": [
                 {
-                    "key": _SUPERVISOR_ROUTE_COUNT_STATE_KEY,
+                    "key": state_key,
                     "action": "increment",
                     "value": 1,
                 }
@@ -1923,7 +3116,10 @@ def _cost_snapshot_from_conversations(
     }
 
 
-def _stored_cost_snapshot(event: dict[str, Any]) -> dict[str, Any]:
+def _stored_cost_snapshot(
+    event: dict[str, Any],
+    parent_session_id: str = "",
+) -> dict[str, Any]:
     """Read the canonical per-session rows; event usage is test-only fallback."""
 
     source_error = ""
@@ -1931,7 +3127,7 @@ def _stored_cost_snapshot(event: dict[str, Any]) -> dict[str, Any]:
         from omnigent.debug_logging import runner_primary_session_id
         from omnigent.runtime import get_conversation_store
 
-        root_id = runner_primary_session_id()
+        root_id = parent_session_id or runner_primary_session_id()
         if root_id:
             store = get_conversation_store()
             cursor: str | None = None
@@ -2014,6 +3210,70 @@ def _project_dispatch_cost(event: dict[str, Any]) -> tuple[str, float]:
     return title, reserve
 
 
+def _top_level_request_identity(data: object) -> str:
+    """Fingerprint request data without inferring provenance from user text.
+
+    The request policy's trusted harness context decides whether this is a UI
+    submit or a synthetic hook invocation. Marker-like text remains valid user
+    input and must never erase a genuine request identity.
+    """
+
+    if not isinstance(data, dict) or "user_content" not in data:
+        return ""
+    return attempt_request_identity(data)
+
+
+def _request_text(data: object) -> str:
+    """Return policy request text without assigning request provenance."""
+
+    if not isinstance(data, dict):
+        return ""
+    content = data.get("user_content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        nested = content.get("text") or content.get("user_content")
+        return nested if isinstance(nested, str) else ""
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text") or block.get("input_text") or "")
+            for block in content
+            if isinstance(block, dict)
+            and isinstance(
+                block.get("text") or block.get("input_text"),
+                str,
+            )
+        )
+    return ""
+
+
+def _authenticated_child_wake(data: object, parent_session_id: str) -> bool:
+    """Recognize only framework wakes backed by this parent's dispatch ledger."""
+
+    text = _request_text(data).strip()
+    wake = _WAKE_NOTICE.fullmatch(text)
+    completion = _COMPLETION.fullmatch(text)
+    if wake is None and completion is None:
+        return False
+    match = wake or completion
+    assert match is not None
+    expected_title = match.group("title") or ""
+    expected_child = match.group("id") if completion is not None else ""
+    return any(
+        record.get("parent_session_id") == parent_session_id
+        and record.get("agent") == match.group("agent")
+        and (
+            not expected_title
+            or record.get("title") == expected_title
+        )
+        and (
+            not expected_child
+            or record.get("child_session_id") == expected_child
+        )
+        for record in read_dispatches()
+    )
+
+
 def strict_cost_budget(
     max_cost_usd: float = 50.0,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -2025,15 +3285,113 @@ def strict_cost_budget(
     def evaluate(event: dict[str, Any]) -> dict[str, Any]:
         if event.get("type") not in {"request", "tool_call", "response"}:
             return {"result": "ALLOW"}
-        snapshot = _stored_cost_snapshot(event)
+        context = event.get("context")
+        parent_session_id = (
+            str(
+                context.get("root_conversation_id")
+                or context.get("conversation_id")
+                or ""
+            )
+            if isinstance(context, dict)
+            else ""
+        )
+        if (
+            not parent_session_id
+            and any(
+                record.get("parent_session_id")
+                for record in read_collections()
+            )
+        ):
+            return {"result": "ALLOW"}
+        is_request = event.get("type") == "request"
+        harness = context.get("harness") if isinstance(context, dict) else None
+        conversation_id = (
+            str(context.get("conversation_id") or "")
+            if isinstance(context, dict)
+            else ""
+        )
+        is_root_request = bool(
+            parent_session_id
+            and conversation_id
+            and conversation_id == parent_session_id
+        )
+        is_child_wake = (
+            is_request
+            and is_root_request
+            and _authenticated_child_wake(
+                event.get("data"),
+                parent_session_id,
+            )
+        )
+        request_identity = (
+            _top_level_request_identity(event.get("data"))
+            if (
+                is_request
+                and is_root_request
+                and not harness
+                and not is_child_wake
+            )
+            else ""
+        )
+        if request_identity:
+            try:
+                activate_parent_attempt(
+                    parent_session_id,
+                    request_identity,
+                    new_request=True,
+                )
+            except AttemptInFlightError:
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        "prior attempt still in flight; wait for it to finish "
+                        "before sending a new request"
+                    ),
+                }
+        elif is_request:
+            # Native harness hooks re-evaluate REQUEST policy for the rendered
+            # prompt and for synthetic continuation/wake prompts. They are not
+            # new UI submissions and their wrapper text is not a stable request
+            # identity. Ensure the current generation exists without replacing
+            # the identity established by the server-side UI input gate.
+            activate_parent_attempt(parent_session_id, "")
+        snapshot = _stored_cost_snapshot(event, parent_session_id)
         if snapshot.get("available") is False:
             # The runner cannot observe canonical usage in-process. Allow this
             # evaluation to fall through to the server-side policy evaluation.
             return {"result": "ALLOW"}
-        cost = float(snapshot["total_usd"])
-        reported = float(snapshot["reported_usd"])
-        estimated = float(snapshot["estimated_unpriced_usd"])
-        route = _next_route(read_collections())
+        observed_cost = float(snapshot["total_usd"])
+        observed_reported = float(snapshot["reported_usd"])
+        observed_estimated = float(snapshot["estimated_unpriced_usd"])
+        baseline = read_attempt_cost_baseline(parent_session_id)
+        if baseline is None:
+            if current_attempt_generation(parent_session_id) == 1:
+                baseline = initialize_attempt_cost_baseline(
+                    parent_session_id,
+                    reported_usd=0.0,
+                    estimated_unpriced_usd=0.0,
+                    cost_usd=0.0,
+                )
+            else:
+                baseline = initialize_attempt_cost_baseline(
+                    parent_session_id,
+                    reported_usd=observed_reported,
+                    estimated_unpriced_usd=observed_estimated,
+                    cost_usd=observed_cost,
+                )
+        cost = max(0.0, observed_cost - baseline["cost_usd"])
+        reported = max(
+            0.0,
+            observed_reported - baseline["reported_usd"],
+        )
+        estimated = max(
+            0.0,
+            observed_estimated - baseline["estimated_unpriced_usd"],
+        )
+        route = _next_route(
+            read_attempt_collections(parent_session_id=parent_session_id),
+            parent_session_id=parent_session_id,
+        )
         projected_stage, reserve = _project_dispatch_cost(event)
         stage = projected_stage or route.title
         remaining = max(0.0, max_cost_usd - cost)
@@ -2071,10 +3429,14 @@ def strict_cost_budget(
                 projected_reserve_usd=reserve,
                 denial_reason=denial_reason,
                 sessions=snapshot.get("sessions", []),
+                parent_session_id=parent_session_id,
+                observed_cost_usd=observed_cost,
+                observed_reported_usd=observed_reported,
+                observed_estimated_unpriced_usd=observed_estimated,
             )
         if denied:
             if authoritative:
-                _cost_value, calls = _failure_metrics()
+                _cost_value, calls = _failure_metrics(parent_session_id)
                 record_terminal_failure(
                     "PIPELINE_INFRASTRUCTURE_ERROR",
                     denial_reason,
@@ -2082,6 +3444,7 @@ def strict_cost_budget(
                     cycle=route.cycle,
                     cost_usd=cost,
                     calls=calls,
+                    parent_session_id=parent_session_id,
                 )
             return {"result": "DENY", "reason": denial_reason}
         return {"result": "ALLOW"}
