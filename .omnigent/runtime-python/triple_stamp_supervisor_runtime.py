@@ -396,6 +396,9 @@ def _attested_stamp_answer(
 
 def _raw_stamp_fallback_answer(
     records: list[dict[str, Any]],
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
 ) -> tuple[str, int, dict[str, Any] | None]:
     """Recover a safe answer when routing after a raw STAMP cannot continue.
 
@@ -407,6 +410,7 @@ def _raw_stamp_fallback_answer(
     """
 
     from triple_stamp_isaac_launcher import (
+        _candidate_provenance,
         _has_required_stage_chain,
         _mapping_candidates,
         _safe_customer_answer,
@@ -417,7 +421,8 @@ def _raw_stamp_fallback_answer(
     digest = os.environ.get("TRIPLE_STAMP_VOICE_PROFILE_SHA256", "").strip()
     if not profile or not digest:
         return "", 0, None
-    for record in reversed(records):
+    for index in range(len(records) - 1, -1, -1):
+        record = records[index]
         title = str(record.get("title") or "")
         match = re.fullmatch(r"judge-cycle-([1-4])", title)
         if (
@@ -449,6 +454,14 @@ def _raw_stamp_fallback_answer(
                 answer
                 and "\u2014" not in answer
                 and _valid_stamp(receipt_probe) == answer
+                and _candidate_provenance(
+                    records,
+                    cycle,
+                    index,
+                    dispatches=dispatches,
+                    parent_session_id=parent_session_id,
+                )
+                is not None
             ):
                 return answer, cycle, record
     return "", 0, None
@@ -604,6 +617,9 @@ def _terminal_response_allowed(
     route: object,
     response: str,
     records: list[dict[str, Any]],
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
 ) -> bool:
     """Recognize only the three terminal response shapes."""
 
@@ -619,7 +635,12 @@ def _terminal_response_allowed(
     if status == "best_effort":
         from triple_stamp_isaac_launcher import _best_effort_answer
 
-        answer = _best_effort_answer(records, route)
+        answer = _best_effort_answer(
+            records,
+            route,
+            dispatches=dispatches,
+            parent_session_id=parent_session_id,
+        )
         return answer is not None and response == answer
     if status == "validation_failed":
         return response.startswith(_VALIDATION_PREFIX)
@@ -1099,7 +1120,12 @@ def install_supervisor_continuation_guard() -> None:
                         "but the judge format repair was unrecoverable"
                     ),
                 )
-                fallback = _best_effort_answer(records, fallback_route)
+                fallback = _best_effort_answer(
+                    records,
+                    fallback_route,
+                    dispatches=dispatches,
+                    parent_session_id=session_id,
+                )
                 if fallback:
                     persisted = record_best_effort_answer(
                         fallback,
@@ -1217,7 +1243,12 @@ def install_supervisor_continuation_guard() -> None:
                     )
                     return
 
-            bounded_answer = _best_effort_answer(records, route)
+            bounded_answer = _best_effort_answer(
+                records,
+                route,
+                dispatches=dispatches,
+                parent_session_id=session_id,
+            )
             if bounded_answer is not None:
                 persisted = record_best_effort_answer(
                     bounded_answer,
@@ -1245,7 +1276,13 @@ def install_supervisor_continuation_guard() -> None:
                     )
                     return
 
-            if _terminal_response_allowed(route, response, records):
+            if _terminal_response_allowed(
+                route,
+                response,
+                records,
+                dispatches=dispatches,
+                parent_session_id=session_id,
+            ):
                 for event in buffered_text:
                     yield event
                 yield completed
@@ -1539,7 +1576,11 @@ def install_supervisor_continuation_guard() -> None:
                     )
 
             fallback, fallback_cycle, fallback_source = (
-                _raw_stamp_fallback_answer(records)
+                _raw_stamp_fallback_answer(
+                    records,
+                    dispatches=dispatches,
+                    parent_session_id=session_id,
+                )
             )
             if fallback:
                 fallback_records = [
@@ -1558,6 +1599,7 @@ def install_supervisor_continuation_guard() -> None:
                         "the deterministic continuation bound"
                     ),
                     parent_session_id=session_id,
+                    candidate_record=fallback_source,
                 )
                 if persisted:
                     _record(

@@ -1392,11 +1392,11 @@ def _verdict_route(
     return _Route("success", cycle)
 
 
-def _next_route(
+def _reduce_next_route(
     records: list[dict[str, Any]],
     parent_session_id: str = "",
 ) -> _Route:
-    """Reduce the ledger to one deterministic next transition."""
+    """Reduce collected packets to one deterministic next transition."""
 
     if parent_session_id:
         records = [
@@ -1650,6 +1650,108 @@ def _next_route(
             records, requester="codex", cycle=cycle, payload=payload
         )
     return _Route("infrastructure_failed", cycle, reason="invalid route state")
+
+
+def _dispatch_matches_collection(
+    dispatch: dict[str, Any],
+    collection: dict[str, Any],
+) -> bool:
+    """Match one durable dispatch to its exact collected work generation."""
+
+    dispatch_work = str(dispatch.get("work_id") or "")
+    collection_work = str(collection.get("work_id") or "")
+    if dispatch_work and collection_work:
+        return dispatch_work == collection_work
+    dispatch_child = str(dispatch.get("child_session_id") or "")
+    collection_child = str(collection.get("child_session_id") or "")
+    if dispatch_child and collection_child:
+        return (
+            dispatch_child == collection_child
+            and dispatch.get("title") == collection.get("title")
+        )
+    return (
+        dispatch.get("agent") == collection.get("agent")
+        and dispatch.get("title") == collection.get("title")
+    )
+
+
+def _uncollected_corrective_audit_route(
+    records: list[dict[str, Any]],
+    dispatches: list[dict[str, Any]],
+    cycle: int,
+    *,
+    parent_session_id: str = "",
+) -> _Route | None:
+    """Return an already-paid audit that must be collected before terminalizing."""
+
+    scoped_records = [
+        record
+        for record in records
+        if (
+            not parent_session_id
+            or record.get("parent_session_id") == parent_session_id
+        )
+    ]
+    pending: list[tuple[dict[str, Any], _Stage]] = []
+    for dispatch in dispatches:
+        if (
+            parent_session_id
+            and dispatch.get("parent_session_id") != parent_session_id
+        ):
+            continue
+        parsed = _stage(dispatch.get("title"))
+        if (
+            dispatch.get("agent") != "opus_auditor"
+            or parsed is None
+            or parsed.cycle != cycle
+            or parsed.kind not in _OPUS_AUDIT_KINDS
+            or any(
+                _dispatch_matches_collection(dispatch, record)
+                for record in scoped_records
+            )
+        ):
+            continue
+        pending.append((dispatch, parsed))
+    if not pending:
+        return None
+    dispatch, parsed = pending[-1]
+    return _Route(
+        "dispatch",
+        cycle,
+        "opus_auditor",
+        str(dispatch.get("title") or ""),
+        requester=parsed.requester,
+        hop=parsed.hop,
+        reason=(
+            "an already-dispatched corrective audit remains in flight or "
+            "completed-but-uncollected"
+        ),
+    )
+
+
+def _next_route(
+    records: list[dict[str, Any]],
+    parent_session_id: str = "",
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+) -> _Route:
+    """Reduce the durable ledger without terminalizing ahead of paid audits."""
+
+    route = _reduce_next_route(records, parent_session_id=parent_session_id)
+    if route.status not in {"best_effort", "infrastructure_failed"}:
+        return route
+    durable_dispatches = dispatches
+    if durable_dispatches is None and parent_session_id:
+        durable_dispatches = read_attempt_dispatches(
+            parent_session_id=parent_session_id
+        )
+    pending = _uncollected_corrective_audit_route(
+        records,
+        durable_dispatches or [],
+        route.cycle,
+        parent_session_id=parent_session_id,
+    )
+    return pending or route
 
 
 def _route_dispatch_pending(
@@ -1943,9 +2045,330 @@ def _judgment_gaps(payload: dict[str, Any]) -> list[str]:
     return deduplicated
 
 
+def _record_precedes(
+    records: list[dict[str, Any]],
+    first_index: int,
+    second_index: int,
+) -> bool:
+    """Compare collection sequence, strengthened by durable timestamps."""
+
+    first_ns = int(records[first_index].get("collected_at_ns") or 0)
+    second_ns = int(records[second_index].get("collected_at_ns") or 0)
+    if first_ns and second_ns and first_ns != second_ns:
+        return first_ns < second_ns
+    return first_index < second_index
+
+
+def _dispatch_provenance(
+    record: dict[str, Any],
+    dispatches: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Return the exact dispatch sequence and timestamp for one packet."""
+
+    matches = [
+        (index, dispatch)
+        for index, dispatch in enumerate(dispatches)
+        if _dispatch_matches_collection(dispatch, record)
+    ]
+    if not matches:
+        return 0, 0
+    index, dispatch = matches[-1]
+    return index + 1, int(dispatch.get("dispatched_at_ns") or 0)
+
+
+def _valid_audit_at(
+    records: list[dict[str, Any]],
+    index: int,
+) -> dict[str, Any] | None:
+    """Validate one audit, reusing its source observation for format repair."""
+
+    record = records[index]
+    parsed = _stage(record.get("title"))
+    if parsed is None or parsed.kind not in _OPUS_AUDIT_KINDS:
+        return None
+    observation = (
+        record.get("internal_mcp_observation")
+        if isinstance(record.get("internal_mcp_observation"), dict)
+        else None
+    )
+    if parsed.kind in {"audit_repair", "audit_repair_web"}:
+        observation = next(
+            (
+                prior.get("internal_mcp_observation")
+                for prior in reversed(records[:index])
+                if (
+                    (prior_stage := _stage(prior.get("title"))) is not None
+                    and prior_stage.cycle == parsed.cycle
+                    and prior_stage.kind in {"audit", "audit_web", "audit_internal"}
+                    and isinstance(prior.get("internal_mcp_observation"), dict)
+                )
+            ),
+            None,
+        )
+    return _valid_audit(record.get("output"), observation)
+
+
+def _candidate_provenance(
+    records: list[dict[str, Any]],
+    cycle: int,
+    candidate_index: int,
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
+) -> dict[str, Any] | None:
+    """Bind a candidate to the latest completed Cursor-audit-judge lineage."""
+
+    durable_dispatches = list(dispatches or [])
+    if _uncollected_corrective_audit_route(
+        records,
+        durable_dispatches,
+        cycle,
+        parent_session_id=parent_session_id,
+    ) is not None:
+        return None
+    audit_indexes = [
+        index
+        for index, record in enumerate(records)
+        if (
+            record.get("agent") == "opus_auditor"
+            and record.get("status") == "completed"
+            and bool(str(record.get("output") or "").strip())
+            and (parsed := _stage(record.get("title"))) is not None
+            and parsed.cycle == cycle
+            and parsed.kind in _OPUS_AUDIT_KINDS
+        )
+    ]
+    if any(
+        _record_precedes(records, candidate_index, audit_index)
+        for audit_index in audit_indexes
+    ):
+        return None
+    source_audit_index = next(
+        (
+            audit_index
+            for audit_index in reversed(audit_indexes)
+            if _record_precedes(records, audit_index, candidate_index)
+            and _valid_audit_at(records, audit_index) is not None
+        ),
+        None,
+    )
+    if source_audit_index is None:
+        return None
+    cursor_index = next(
+        (
+            index
+            for index in range(source_audit_index - 1, -1, -1)
+            if (
+                records[index].get("agent") == "cursor_workhorse"
+                and records[index].get("status") == "completed"
+                and records[index].get("title")
+                in {
+                    f"cursor-cycle-{cycle}",
+                    f"cursor-retry-{cycle}-1",
+                }
+                and bool(_safe_customer_answer(records[index].get("output")))
+            )
+        ),
+        None,
+    )
+    if cursor_index is None:
+        return None
+    candidate_dispatch_sequence, candidate_dispatched_at_ns = (
+        _dispatch_provenance(records[candidate_index], durable_dispatches)
+    )
+    audit_dispatch_sequence, audit_dispatched_at_ns = _dispatch_provenance(
+        records[source_audit_index],
+        durable_dispatches,
+    )
+    audit_collected_at_ns = int(
+        records[source_audit_index].get("collected_at_ns") or 0
+    )
+    if (
+        candidate_dispatched_at_ns
+        and audit_collected_at_ns
+        and candidate_dispatched_at_ns < audit_collected_at_ns
+    ):
+        return None
+    if (
+        candidate_dispatch_sequence
+        and audit_dispatch_sequence
+        and candidate_dispatch_sequence <= audit_dispatch_sequence
+    ):
+        return None
+    return {
+        "cursor": records[cursor_index],
+        "opus": records[source_audit_index],
+        "codex": records[candidate_index],
+        "collection_sequences": {
+            "cursor": cursor_index + 1,
+            "opus": source_audit_index + 1,
+            "codex": candidate_index + 1,
+        },
+        "dispatch_sequences": {
+            "cursor": _dispatch_provenance(
+                records[cursor_index], durable_dispatches
+            )[0],
+            "opus": audit_dispatch_sequence,
+            "codex": candidate_dispatch_sequence,
+        },
+        "dispatch_timestamps": {
+            "cursor": _dispatch_provenance(
+                records[cursor_index], durable_dispatches
+            )[1],
+            "opus": audit_dispatched_at_ns,
+            "codex": candidate_dispatched_at_ns,
+        },
+    }
+
+
+def _best_effort_provenance(
+    records: list[dict[str, Any]],
+    cycle: int,
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
+) -> dict[str, Any] | None:
+    """Return the freshest complete chain that may support BEST_EFFORT."""
+
+    scoped = [
+        record
+        for record in records
+        if (
+            not parent_session_id
+            or record.get("parent_session_id") == parent_session_id
+        )
+    ]
+    durable_dispatches = [
+        dispatch
+        for dispatch in (dispatches or [])
+        if (
+            not parent_session_id
+            or dispatch.get("parent_session_id") == parent_session_id
+        )
+    ]
+    for index in range(len(scoped) - 1, -1, -1):
+        record = scoped[index]
+        parsed = _stage(record.get("title"))
+        if (
+            record.get("agent") != "codex_judge"
+            or record.get("status") != "completed"
+            or parsed is None
+            or parsed.cycle != cycle
+            or parsed.kind not in {"judge", "judge_repair", "judge_convergence"}
+        ):
+            continue
+        review = _valid_judgment(record.get("output"))
+        if review is None or review.get("verdict") == "STAMP":
+            continue
+        provenance = _candidate_provenance(
+            scoped,
+            cycle,
+            index,
+            dispatches=durable_dispatches,
+            parent_session_id=parent_session_id,
+        )
+        if provenance is not None:
+            provenance["review"] = review
+            return provenance
+
+    if _uncollected_corrective_audit_route(
+        scoped,
+        durable_dispatches,
+        cycle,
+        parent_session_id=parent_session_id,
+    ) is not None:
+        return None
+    if any(
+        record.get("agent") == "codex_judge"
+        and record.get("status") == "completed"
+        and bool(str(record.get("output") or "").strip())
+        and (parsed := _stage(record.get("title"))) is not None
+        and parsed.cycle == cycle
+        for record in scoped
+    ):
+        return None
+    latest_audit_index = next(
+        (
+            index
+            for index in range(len(scoped) - 1, -1, -1)
+            if (
+                scoped[index].get("agent") == "opus_auditor"
+                and scoped[index].get("status") == "completed"
+                and bool(str(scoped[index].get("output") or "").strip())
+                and (parsed := _stage(scoped[index].get("title"))) is not None
+                and parsed.cycle == cycle
+                and parsed.kind in _OPUS_AUDIT_KINDS
+            )
+        ),
+        None,
+    )
+    for audit_index in (
+        [latest_audit_index] if latest_audit_index is not None else []
+    ):
+        audit = scoped[audit_index]
+        parsed = _stage(audit.get("title"))
+        review = _valid_audit_at(scoped, audit_index)
+        if (
+            audit.get("agent") != "opus_auditor"
+            or audit.get("status") != "completed"
+            or parsed is None
+            or parsed.cycle != cycle
+            or review is None
+            or review.get("verdict") not in {"PASS_WITH_GAPS", "NEEDS_WEB"}
+        ):
+            continue
+        cursor_index = next(
+            (
+                index
+                for index in range(audit_index - 1, -1, -1)
+                if (
+                    scoped[index].get("agent") == "cursor_workhorse"
+                    and scoped[index].get("status") == "completed"
+                    and scoped[index].get("title")
+                    in {
+                        f"cursor-cycle-{cycle}",
+                        f"cursor-retry-{cycle}-1",
+                    }
+                    and bool(_safe_customer_answer(scoped[index].get("output")))
+                )
+            ),
+            None,
+        )
+        if cursor_index is None:
+            return None
+        cursor_dispatch = _dispatch_provenance(
+            scoped[cursor_index], durable_dispatches
+        )
+        audit_dispatch = _dispatch_provenance(
+            audit, durable_dispatches
+        )
+        return {
+            "cursor": scoped[cursor_index],
+            "opus": audit,
+            "codex": None,
+            "review": review,
+            "collection_sequences": {
+                "cursor": cursor_index + 1,
+                "opus": audit_index + 1,
+            },
+            "dispatch_sequences": {
+                "cursor": cursor_dispatch[0],
+                "opus": audit_dispatch[0],
+            },
+            "dispatch_timestamps": {
+                "cursor": cursor_dispatch[1],
+                "opus": audit_dispatch[1],
+            },
+        }
+    return None
+
+
 def _best_effort_answer(
     records: list[dict[str, Any]],
     route: _Route,
+    *,
+    dispatches: list[dict[str, Any]] | None = None,
+    parent_session_id: str = "",
 ) -> str | None:
     """Build a finished conclusion-plus-gaps answer from complete packets only."""
 
@@ -1953,55 +2376,16 @@ def _best_effort_answer(
         records, route.cycle
     ):
         return None
-    complete_cursor = next(
-        (
-            record
-            for record in reversed(records)
-            if record.get("agent") == "cursor_workhorse"
-            and record.get("status") == "completed"
-            and record.get("title")
-            in {
-                f"cursor-cycle-{route.cycle}",
-                f"cursor-retry-{route.cycle}-1",
-            }
-            and _safe_customer_answer(record.get("output"))
-        ),
-        None,
+    provenance = _best_effort_provenance(
+        records,
+        route.cycle,
+        dispatches=dispatches,
+        parent_session_id=parent_session_id,
     )
-    if complete_cursor is None:
+    if provenance is None:
         return None
-    review: dict[str, Any] | None = None
-    for record in reversed(records):
-        parsed = _stage(record.get("title"))
-        if (
-            record.get("agent") != "codex_judge"
-            or record.get("status") != "completed"
-            or parsed is None
-            or parsed.cycle != route.cycle
-            or parsed.kind not in {"judge", "judge_repair", "judge_convergence"}
-        ):
-            continue
-        review = _valid_judgment(record.get("output"))
-        if review is not None and review.get("verdict") != "STAMP":
-            break
-        review = None
-    if review is None:
-        for record in reversed(records):
-            parsed = _stage(record.get("title"))
-            if (
-                record.get("agent") != "opus_auditor"
-                or record.get("status") != "completed"
-                or parsed is None
-                or parsed.cycle != route.cycle
-                or parsed.kind not in {"audit", "audit_web", "audit_repair_web"}
-            ):
-                continue
-            review = _valid_audit(record.get("output"))
-            if review is not None and review.get("verdict") == "NEEDS_WEB":
-                break
-            review = None
-    if review is None:
-        return None
+    complete_cursor = provenance["cursor"]
+    review = provenance["review"]
 
     conclusion = _safe_customer_answer(review.get("best_supported_answer"))
     if not conclusion:

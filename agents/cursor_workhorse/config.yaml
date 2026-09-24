@@ -2,12 +2,12 @@ spec_version: 1
 name: cursor_workhorse
 description: >
   Grunt work and live verification. Looks up internals, runs the product,
-  and tests claims. Pinned to Cursor Grok 4.6 Extra High.
+  and tests claims. Pinned to Grok 4.6 Extra High.
 
 executor:
   type: omnigent
   # cursor-native forwards this live-catalog ID to cursor-agent --model.
-  # Cursor labels this exact ID "Cursor Grok 4.6 Extra High".
+  # Cursor labels this exact ID "Grok 4.6 Extra High".
   model: "cursor-grok-4.6-xhigh"
   config:
     harness: cursor-native

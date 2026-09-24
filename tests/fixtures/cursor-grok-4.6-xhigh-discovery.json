@@ -3,8 +3,8 @@
   "model": {
     "modelId": "grok-4.6",
     "displayModelId": "grok-4.6",
-    "displayName": "Cursor Grok 4.6 Extra High",
-    "displayNameShort": "Cursor Grok 4.6 Extra High",
+    "displayName": "Grok 4.6 Extra High",
+    "displayNameShort": "Grok 4.6 Extra High",
     "aliases": [],
     "maxMode": false
   },

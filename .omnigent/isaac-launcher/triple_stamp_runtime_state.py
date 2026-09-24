@@ -2160,6 +2160,7 @@ def record_best_effort_answer(
     cycle: int,
     reason: str,
     parent_session_id: str = "",
+    candidate_record: dict[str, Any] | None = None,
 ) -> str:
     """Persist a complete non-STAMP answer with its exact packet provenance."""
 
@@ -2181,12 +2182,32 @@ def record_best_effort_answer(
         return ""
 
     scoped = _scope_parent_records(records, parent_session_id)
+    durable_scoped = read_attempt_collections(parent_session_id)
+    if durable_scoped:
+        enriched: list[dict[str, Any]] = []
+        for record in scoped:
+            durable = next(
+                (
+                    candidate
+                    for candidate in durable_scoped
+                    if candidate.get("agent") == record.get("agent")
+                    and candidate.get("title") == record.get("title")
+                    and str(candidate.get("child_session_id") or "")
+                    == str(record.get("child_session_id") or "")
+                    and str(candidate.get("work_id") or "")
+                    == str(record.get("work_id") or "")
+                    and candidate.get("output") == record.get("output")
+                ),
+                None,
+            )
+            enriched.append(durable or record)
+        scoped = enriched
     generation = current_attempt_generation(parent_session_id)
     try:
         from triple_stamp_isaac_launcher import (
+            _best_effort_provenance,
+            _candidate_provenance,
             _has_required_stage_chain,
-            _stage,
-            _valid_audit,
         )
     except ImportError:
         return ""
@@ -2197,82 +2218,49 @@ def record_best_effort_answer(
         attempt_generation=generation,
     ):
         return ""
-
-    def complete(record: dict[str, Any], agent: str) -> bool:
-        output = record.get("output")
-        parsed = parse_dispatch_title(record.get("title"))
-        return (
-            record.get("agent") == agent
-            and record.get("status") == "completed"
-            and isinstance(output, str)
-            and bool(output.strip())
-            and parsed is not None
-            and parsed["cycle"] == cycle
-            and not output.startswith(
-                (
-                    "CURSOR_FINALIZATION_REQUIRED:",
-                    "CURSOR_WORKER_STALLED:",
-                    "CURSOR_WORKER_FAILED:",
-                    "CURSOR_WORKER_TIMEOUT:",
-                )
-            )
+    dispatches = read_attempt_dispatches(
+        parent_session_id=parent_session_id
+    )
+    provenance = None
+    if candidate_record is not None:
+        candidate_index = next(
+            (
+                index
+                for index, record in enumerate(scoped)
+                if record.get("agent") == candidate_record.get("agent")
+                and record.get("title") == candidate_record.get("title")
+                and str(record.get("child_session_id") or "")
+                == str(candidate_record.get("child_session_id") or "")
+                and str(record.get("work_id") or "")
+                == str(candidate_record.get("work_id") or "")
+                and record.get("output") == candidate_record.get("output")
+            ),
+            None,
         )
-
-    cursor = next(
-        (
-            record
-            for record in reversed(scoped)
-            if complete(record, "cursor_workhorse")
-            and record.get("title")
-            in {f"cursor-cycle-{cycle}", f"cursor-retry-{cycle}-1"}
-        ),
-        None,
-    )
-    opus = next(
-        (
-            record
-            for record in reversed(scoped)
-            if complete(record, "opus_auditor")
-            and (parsed := _stage(record.get("title"))) is not None
-            and parsed.cycle == cycle
-            and parsed.kind
-            in {
-                "audit",
-                "audit_web",
-                "audit_retry",
-                "audit_internal",
-                "audit_repair",
-                "audit_repair_web",
-            }
-            and _valid_audit(
-                record.get("output"),
-                (
-                    record.get("internal_mcp_observation")
-                    if isinstance(record.get("internal_mcp_observation"), dict)
-                    else None
-                ),
+        if candidate_index is not None:
+            provenance = _candidate_provenance(
+                scoped,
+                cycle,
+                candidate_index,
+                dispatches=dispatches,
+                parent_session_id=parent_session_id,
             )
-            is not None
-        ),
-        None,
-    )
-    codex = next(
-        (
-            record
-            for record in reversed(scoped)
-            if complete(record, "codex_judge")
-            and str(record.get("title") or "").startswith("judge-")
-        ),
-        None,
-    )
-    if cursor is None or opus is None:
+    else:
+        provenance = _best_effort_provenance(
+            scoped,
+            cycle,
+            dispatches=dispatches,
+            parent_session_id=parent_session_id,
+        )
+    if provenance is None:
         return ""
 
     source_packets = []
-    sources = [cursor, opus]
-    if codex is not None:
-        sources.append(codex)
-    for record in sources:
+    source_roles = ["cursor", "opus"]
+    if provenance.get("codex") is not None:
+        source_roles.append("codex")
+    for role in source_roles:
+        record = provenance[role]
         output_bytes = str(record["output"]).encode("utf-8")
         source_packets.append(
             {
@@ -2282,6 +2270,16 @@ def record_best_effort_answer(
                 "work_id": str(record.get("work_id") or ""),
                 "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
                 "output_length": len(output_bytes),
+                "collection_sequence": int(
+                    provenance["collection_sequences"][role]
+                ),
+                "collected_at_ns": int(record.get("collected_at_ns") or 0),
+                "dispatch_sequence": int(
+                    provenance["dispatch_sequences"][role]
+                ),
+                "dispatched_at_ns": int(
+                    provenance["dispatch_timestamps"][role]
+                ),
             }
         )
 
@@ -2296,6 +2294,7 @@ def record_best_effort_answer(
         "reason": " ".join(str(reason).replace("\x00", " ").split())[:2000],
         "answer_sha256": hashlib.sha256(answer_bytes).hexdigest(),
         "answer_length": len(answer_bytes),
+        "provenance_version": 1,
         "source_packets": source_packets,
     }
 
@@ -2353,6 +2352,7 @@ def read_best_effort_answer(parent_session_id: str = "") -> str:
         not isinstance(attestation, dict)
         or attestation.get("verdict") != "BEST_EFFORT"
         or attestation.get("quality_approved") is not False
+        or attestation.get("provenance_version") != 1
         or attested_generation != generation
         or (
             parent_session_id
@@ -2364,6 +2364,91 @@ def read_best_effort_answer(parent_session_id: str = "") -> str:
         == attestation["answer_sha256"]
     ):
         return ""
+    sources = attestation.get("source_packets")
+    if not isinstance(sources, list):
+        return ""
+    records = read_attempt_collections(parent_session_id)
+    dispatches = read_attempt_dispatches(parent_session_id)
+    try:
+        from triple_stamp_isaac_launcher import (
+            _best_effort_provenance,
+            _candidate_provenance,
+        )
+
+        codex_source = next(
+            (
+                source
+                for source in sources
+                if isinstance(source, dict)
+                and source.get("agent") == "codex_judge"
+            ),
+            None,
+        )
+        if codex_source is not None:
+            candidate_index = next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if record.get("agent") == codex_source.get("agent")
+                    and record.get("title") == codex_source.get("title")
+                    and str(record.get("child_session_id") or "")
+                    == str(codex_source.get("child_session_id") or "")
+                    and str(record.get("work_id") or "")
+                    == str(codex_source.get("work_id") or "")
+                ),
+                None,
+            )
+            provenance = (
+                _candidate_provenance(
+                    records,
+                    int(attestation.get("cycle") or 0),
+                    candidate_index,
+                    dispatches=dispatches,
+                    parent_session_id=parent_session_id,
+                )
+                if candidate_index is not None
+                else None
+            )
+        else:
+            provenance = _best_effort_provenance(
+                records,
+                int(attestation.get("cycle") or 0),
+                dispatches=dispatches,
+                parent_session_id=parent_session_id,
+            )
+    except (ImportError, TypeError, ValueError):
+        return ""
+    if provenance is None:
+        return ""
+    roles = ["cursor", "opus"]
+    if provenance.get("codex") is not None:
+        roles.append("codex")
+    if len(sources) != len(roles):
+        return ""
+    for source, role in zip(sources, roles, strict=True):
+        record = provenance[role]
+        if not isinstance(source, dict):
+            return ""
+        output = str(record.get("output") or "").encode("utf-8")
+        if (
+            source.get("agent") != record.get("agent")
+            or source.get("title") != str(record.get("title") or "")
+            or source.get("child_session_id")
+            != str(record.get("child_session_id") or "")
+            or source.get("work_id") != str(record.get("work_id") or "")
+            or source.get("collection_sequence")
+            != int(provenance["collection_sequences"][role])
+            or source.get("collected_at_ns")
+            != int(record.get("collected_at_ns") or 0)
+            or source.get("dispatch_sequence")
+            != int(provenance["dispatch_sequences"][role])
+            or source.get("dispatched_at_ns")
+            != int(provenance["dispatch_timestamps"][role])
+            or source.get("output_length") != len(output)
+            or source.get("output_sha256")
+            != hashlib.sha256(output).hexdigest()
+        ):
+            return ""
     try:
         decoded = answer.decode("utf-8")
     except UnicodeDecodeError:

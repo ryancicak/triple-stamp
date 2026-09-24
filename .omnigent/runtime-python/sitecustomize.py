@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import importlib.util
 import logging
 import os
 import sys
@@ -39,9 +40,11 @@ def _is_runner_process(argv: object) -> bool:
 
 _is_runner = _is_runner_process(getattr(sys, "orig_argv", ()))
 _is_probe = os.environ.get(_PROBE_ENV_NAME) == "1"
+_has_omnigent_runtime = importlib.util.find_spec("omnigent") is not None
 
-install_browser_runtime_guard()
-_supervisor_runtime.install_headless_pipeline_wait()
+if _has_omnigent_runtime:
+    install_browser_runtime_guard()
+    _supervisor_runtime.install_headless_pipeline_wait()
 
 
 def _install_fail_closed_claude_launcher() -> None:
@@ -311,7 +314,7 @@ def _install_native_request_provenance() -> None:
             module.hook_payload_to_evaluation_request = with_request_provenance
 
 
-if os.environ.get(_ENV_NAME) == _MODE:
+if os.environ.get(_ENV_NAME) == _MODE and _has_omnigent_runtime:
     try:
         _install_policy_identity_context()
         _install_native_request_provenance()
@@ -319,7 +322,11 @@ if os.environ.get(_ENV_NAME) == _MODE:
         os._exit(78)
 
 
-if os.environ.get(_ENV_NAME) == _MODE and (_is_runner or _is_probe):
+if (
+    os.environ.get(_ENV_NAME) == _MODE
+    and _has_omnigent_runtime
+    and (_is_runner or _is_probe)
+):
     try:
         from omnigent import cursor_native_permissions as _permissions
 

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -233,6 +234,52 @@ def _managed_claude_environment(
             if isinstance(value, str):
                 merged[name] = value
     return merged
+
+
+def _managed_claude_bearer(
+    real_home: Path,
+    host_env: dict[str, str],
+    paths: tuple[Path, ...] = CLAUDE_MANAGED_SETTINGS,
+) -> str:
+    """Mint gateway auth before the isolated HOME loses secure-store access."""
+
+    helper = ""
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            candidate = payload.get("apiKeyHelper", "")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(candidate, str) and candidate.strip():
+            helper = candidate.strip()
+    try:
+        argv = shlex.split(helper)
+        expected = (real_home / ".local/bin/ug").resolve()
+        executable = Path(argv[0]).expanduser().resolve()
+    except (IndexError, OSError, ValueError):
+        argv = []
+        executable = Path("/")
+    if (
+        len(argv) != 6
+        or executable != expected
+        or argv[1] != "auth-token"
+        or argv[2] != "--host"
+        or not argv[3].startswith("https://")
+        or argv[4] != "--profile"
+        or not argv[5]
+    ):
+        _die(
+            "managed Claude apiKeyHelper is unavailable or has an unexpected shape",
+            EXIT_AUTH,
+        )
+    result = _run(argv, env=host_env, timeout=30)
+    token = result.stdout.strip()
+    if result.returncode or len(token) < 20:
+        _die(
+            "managed Claude gateway token could not be minted before isolation",
+            EXIT_AUTH,
+        )
+    return token
 
 
 def _detect_claude_namespace(
@@ -2127,7 +2174,7 @@ def _inner_validate(root: Path, args: list[str]) -> int:
         )
         if cursor_pin.returncode:
             _die(
-                "Cursor Grok 4.6 Extra High wrapper self-test failed: "
+                "Grok 4.6 Extra High wrapper self-test failed: "
                 f"{cursor_pin.stderr.strip() or cursor_pin.stdout.strip() or 'no output'}"
             )
         codex_probe_env = {
@@ -2205,7 +2252,7 @@ def _inner_validate(root: Path, args: list[str]) -> int:
         )
         print(f"  provider: {provider}")
         print(f"  supervisor: {os.environ['TRIPLE_STAMP_SUPERVISOR_MODEL']}")
-        print("  Cursor: cursor-grok-4.6-xhigh (Cursor Grok 4.6 Extra High)")
+        print("  Cursor: cursor-grok-4.6-xhigh (Grok 4.6 Extra High)")
         print(f"  Opus: {os.environ['TRIPLE_STAMP_OPUS_MODEL']}, max")
         print(f"  Codex: {os.environ['TRIPLE_STAMP_CODEX_MODEL']}, ultra")
         print(
@@ -2488,12 +2535,27 @@ def _validated_best_effort_exit(
             .splitlines()
             if line.strip()
         ]
+        dispatch_path = run_dir / "routing-dispatches.jsonl"
+        dispatches = (
+            [
+                json.loads(line)
+                for line in dispatch_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if dispatch_path.exists()
+            else []
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     if attested_parent:
         collections = [
             record
             for record in collections
+            if record.get("parent_session_id") == attested_parent
+        ]
+        dispatches = [
+            record
+            for record in dispatches
             if record.get("parent_session_id") == attested_parent
         ]
     try:
@@ -2506,12 +2568,19 @@ def _validated_best_effort_exit(
             if int(record.get("attempt_generation") or 1)
             == attempt_generation
         ]
+        dispatches = [
+            record
+            for record in dispatches
+            if int(record.get("attempt_generation") or 1)
+            == attempt_generation
+        ]
     except (TypeError, ValueError):
         return False
     sources = attestation.get("source_packets")
     if (
         attestation.get("verdict") != "BEST_EFFORT"
         or attestation.get("quality_approved") is not False
+        or attestation.get("provenance_version") != 1
         or not answer
         or answer.startswith(
             (b"PIPELINE_VALIDATION_FAILED:", b"PIPELINE_INFRASTRUCTURE_ERROR:")
@@ -2553,6 +2622,8 @@ def _validated_best_effort_exit(
             rf"judge-(?:cycle|convergence|format-repair)-{cycle}"
         ),
     }
+    collection_sequences: list[int] = []
+    dispatch_sequences: list[int] = []
     for source in sources:
         if not isinstance(source, dict):
             return False
@@ -2565,10 +2636,10 @@ def _validated_best_effort_exit(
             is None
         ):
             return False
-        matching = next(
+        matching_pair = next(
             (
-                record
-                for record in collections
+                (index, record)
+                for index, record in enumerate(collections)
                 if record.get("agent") == source.get("agent")
                 and record.get("title") == source.get("title")
                 and str(record.get("child_session_id") or "")
@@ -2580,9 +2651,41 @@ def _validated_best_effort_exit(
             ),
             None,
         )
-        if matching is None:
+        if matching_pair is None:
             return False
+        collection_index, matching = matching_pair
         output = str(matching["output"]).encode("utf-8")
+        matching_dispatch_pair = next(
+            (
+                (index, record)
+                for index, record in enumerate(dispatches)
+                if (
+                    (
+                        str(source.get("work_id") or "")
+                        and str(record.get("work_id") or "")
+                        == str(source.get("work_id") or "")
+                    )
+                    or (
+                        not str(source.get("work_id") or "")
+                        and str(source.get("child_session_id") or "")
+                        and str(record.get("child_session_id") or "")
+                        == str(source.get("child_session_id") or "")
+                        and record.get("title") == source.get("title")
+                    )
+                )
+            ),
+            None,
+        )
+        dispatch_sequence = (
+            matching_dispatch_pair[0] + 1
+            if matching_dispatch_pair is not None
+            else 0
+        )
+        dispatched_at_ns = (
+            int(matching_dispatch_pair[1].get("dispatched_at_ns") or 0)
+            if matching_dispatch_pair is not None
+            else 0
+        )
         if (
             source.get("output_length") != len(output)
             or not isinstance(source.get("output_sha256"), str)
@@ -2590,6 +2693,62 @@ def _validated_best_effort_exit(
                 hashlib.sha256(output).hexdigest(),
                 source["output_sha256"],
             )
+            or source.get("collection_sequence") != collection_index + 1
+            or source.get("collected_at_ns")
+            != int(matching.get("collected_at_ns") or 0)
+            or source.get("dispatch_sequence") != dispatch_sequence
+            or source.get("dispatched_at_ns") != dispatched_at_ns
+        ):
+            return False
+        collection_sequences.append(collection_index + 1)
+        dispatch_sequences.append(dispatch_sequence)
+    if collection_sequences != sorted(collection_sequences):
+        return False
+    nonzero_dispatches = [
+        sequence for sequence in dispatch_sequences if sequence
+    ]
+    if nonzero_dispatches != sorted(nonzero_dispatches):
+        return False
+    terminal_source_sequence = collection_sequences[-1]
+    for index, record in enumerate(collections):
+        if (
+            index + 1 > terminal_source_sequence
+            and record.get("agent") == "opus_auditor"
+            and re.fullmatch(
+                rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
+                rf"retry-{cycle}-1|internal-{cycle}-[1-2]|"
+                rf"format-repair-{cycle}(?:-web-[1-2])?)",
+                str(record.get("title") or ""),
+            )
+        ):
+            return False
+    for dispatch in dispatches:
+        if (
+            dispatch.get("agent") != "opus_auditor"
+            or re.fullmatch(
+                rf"audit-(?:cycle-{cycle}(?:-web-[1-2])?|"
+                rf"retry-{cycle}-1|internal-{cycle}-[1-2]|"
+                rf"format-repair-{cycle}(?:-web-[1-2])?)",
+                str(dispatch.get("title") or ""),
+            )
+            is None
+        ):
+            continue
+        work_id = str(dispatch.get("work_id") or "")
+        child_session_id = str(dispatch.get("child_session_id") or "")
+        if not any(
+            (
+                work_id
+                and str(record.get("work_id") or "") == work_id
+            )
+            or (
+                not work_id
+                and child_session_id
+                and str(record.get("child_session_id") or "")
+                == child_session_id
+                and record.get("title") == dispatch.get("title")
+            )
+            for record in collections
         ):
             return False
     return True
@@ -3130,6 +3289,11 @@ def _outer_main(root: Path, args: list[str]) -> int:
     )
     _ensure_plugin(root, tools, host_env)
     cursor_token = _cursor_token(tools, host_env)
+    claude_bearer = (
+        _managed_claude_bearer(real_home, host_env)
+        if provider == "direct" and model_namespace == "databricks_gateway"
+        else ""
+    )
     if provider == "databricks":
         omnigent_token, omnigent_expiry = _omnigent_remote_auth(tools, host_env)
         supervisor_provider = _supervisor_provider(real_home)
@@ -3155,6 +3319,9 @@ def _outer_main(root: Path, args: list[str]) -> int:
         provider,
         models,
     )
+    if claude_bearer:
+        runtime_env["DATABRICKS_BEARER"] = claude_bearer
+        runtime_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] += ",DATABRICKS_BEARER"
     runtime_args, browser_mode, translated_no_session = _browser_launch_args(args)
     if browser_mode:
         _configure_browser_runtime(runtime_env, root)

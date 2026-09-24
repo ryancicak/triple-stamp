@@ -1,5 +1,5 @@
 # Deterministic three-stage pipeline:
-# Cursor Grok 4.6 Extra High -> Claude Opus 5 Max
+# Grok 4.6 Extra High -> Claude Opus 5 Max
 # -> Codex GPT-5.6 Sol Ultra.
 spec_version: 1
 name: triple-stamp

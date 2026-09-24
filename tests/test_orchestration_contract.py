@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import venv
 from pathlib import Path
 from unittest import mock
 
@@ -1697,6 +1698,37 @@ print("exact temp boundary: PASS")
                 ["python", "-m", "omnigent.cli", "server"]
             )
         )
+
+    def test_sitecustomize_ignores_foreign_python_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            foreign_home = Path(value) / "foreign-python"
+            venv.EnvBuilder(with_pip=False).create(foreign_home)
+            result = subprocess.run(
+                [
+                    str(foreign_home / "bin/python"),
+                    "-c",
+                    (
+                        "import importlib.util; "
+                        "assert importlib.util.find_spec('omnigent') is None"
+                    ),
+                ],
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(RUNTIME_PYTHON),
+                    "TRIPLE_STAMP_RUN_ID": "foreign-helper-probe",
+                    "TRIPLE_STAMP_BROWSER_HOST_PREFLIGHT": "1",
+                    "TRIPLE_STAMP_CURSOR_APPROVAL_GUARD": (
+                        "suppress-yolo-false-cards"
+                    ),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_policy_identity_bridge_uses_engine_current_and_root_ids(self) -> None:
         from omnigent.policies.function import FunctionPolicy
@@ -4136,6 +4168,293 @@ print("exact temp boundary: PASS")
             route = plugin._next_route(records, parent_session_id=parent)
             self.assertEqual(route.status, "dispatch")
             self.assertEqual(route.title, "cursor-cycle-2")
+
+    def test_inflight_corrective_audit_blocks_best_effort_terminalization(
+        self,
+    ) -> None:
+        parent = "pending-corrective-audit-parent"
+        malformed_repair = json.loads(_judgment("NEEDS_INTERNAL"))
+        malformed_repair["needs_web"] = True
+        records = [
+            {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "fresh customer evidence",
+                ),
+                "parent_session_id": parent,
+            },
+            {
+                **_route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS_WITH_GAPS"),
+                ),
+                "parent_session_id": parent,
+            },
+            {
+                **_route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    _judgment("REWORK"),
+                ),
+                "parent_session_id": parent,
+            },
+            {
+                **_route_packet(
+                    "codex_judge",
+                    "judge-format-repair-1",
+                    json.dumps(malformed_repair),
+                ),
+                "parent_session_id": parent,
+            },
+        ]
+        pending = {
+            "parent_session_id": parent,
+            "child_session_id": "corrective-audit-child",
+            "work_id": "corrective-audit-work",
+            "agent": "opus_auditor",
+            "title": "audit-internal-1-2",
+            "dispatched_at_ns": 500,
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            runtime_state.append_dispatch(pending)
+            for record in records:
+                runtime_state.append_collection(record)
+            durable_records = runtime_state.read_attempt_collections(parent)
+            route = plugin._next_route(
+                durable_records,
+                parent_session_id=parent,
+            )
+            self.assertEqual(
+                (route.status, route.agent, route.title),
+                ("dispatch", "opus_auditor", "audit-internal-1-2"),
+            )
+            fallback = plugin._Route("best_effort", 1)
+            self.assertIsNone(
+                plugin._best_effort_answer(
+                    durable_records,
+                    fallback,
+                    dispatches=runtime_state.read_attempt_dispatches(parent),
+                    parent_session_id=parent,
+                )
+            )
+            self.assertEqual(
+                runtime_state.record_best_effort_answer(
+                    "stale answer",
+                    durable_records,
+                    cycle=1,
+                    reason="must wait for corrective audit",
+                    parent_session_id=parent,
+                ),
+                "",
+            )
+            self.assertEqual(runtime_state.read_best_effort_answer(parent), "")
+
+    def test_completed_late_audit_is_recovered_and_included(self) -> None:
+        cursor_lifecycle.install_parent_inbox_guard()
+        parent = "completed-late-audit-parent"
+        corrective_output = _audit(
+            "FAIL",
+            attack="OAuth scope and endpoint guidance are materially wrong",
+        )
+
+        class Entry:
+            work_id = "late-audit-work"
+            agent = "opus_auditor"
+            title = "audit-internal-1-2"
+            status = "completed"
+            output = corrective_output
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_SANDBOX_TOKEN": "unit-test-secret",
+            },
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": "late-audit-child",
+                    "work_id": Entry.work_id,
+                    "agent": Entry.agent,
+                    "title": Entry.title,
+                    "dispatched_at_ns": 400,
+                }
+            )
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": "repair-child",
+                    "work_id": "repair-work",
+                    "agent": "codex_judge",
+                    "title": "judge-format-repair-1",
+                    "dispatched_at_ns": 500,
+                }
+            )
+            malformed_repair = json.loads(_judgment("NEEDS_INTERNAL"))
+            malformed_repair["needs_web"] = True
+            for packet in (
+                _route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "cursor evidence",
+                ),
+                _route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS_WITH_GAPS"),
+                ),
+                {
+                    **_route_packet(
+                        "codex_judge",
+                        "judge-format-repair-1",
+                        json.dumps(malformed_repair),
+                    ),
+                    "child_session_id": "repair-child",
+                    "work_id": "repair-work",
+                },
+            ):
+                runtime_state.append_collection(
+                    {**packet, "parent_session_id": parent}
+                )
+            empty: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+            with mock.patch.object(
+                runner_app,
+                "get_subagent_work",
+                return_value=Entry(),
+            ):
+                result = asyncio.run(
+                    tool_dispatch._drain_inbox(
+                        empty,
+                        server_client=None,
+                        conversation_id=parent,
+                    )
+                )
+
+            records = runtime_state.read_attempt_collections(parent)
+            self.assertIn(corrective_output, result)
+            self.assertEqual(records[-1]["title"], "audit-internal-1-2")
+            self.assertEqual(records[-1]["output"], corrective_output)
+            route = plugin._next_route(records, parent_session_id=parent)
+            self.assertEqual(
+                (route.status, route.agent, route.title),
+                ("dispatch", "codex_judge", "judge-cycle-1"),
+            )
+
+    def test_materially_contradicted_stale_candidate_is_rejected(self) -> None:
+        stale = json.loads(_judgment("REWORK"))
+        stale["best_supported_answer"] = (
+            "Use the old OAuth scope and unresolved endpoint."
+        )
+        records = [
+            _route_packet(
+                "cursor_workhorse",
+                "cursor-cycle-1",
+                "cursor evidence",
+            ),
+            _route_packet(
+                "opus_auditor",
+                "audit-cycle-1",
+                _audit("PASS_WITH_GAPS"),
+            ),
+            _route_packet(
+                "codex_judge",
+                "judge-cycle-1",
+                json.dumps(stale),
+            ),
+            _route_packet(
+                "opus_auditor",
+                "audit-internal-1-1",
+                _audit(
+                    "FAIL",
+                    attack=(
+                        "The OAuth scope, endpoint, RPC path, and ownership "
+                        "claims are materially contradicted."
+                    ),
+                ),
+            ),
+        ]
+        self.assertIsNone(
+            plugin._best_effort_answer(
+                records,
+                plugin._Route("best_effort", 1),
+            )
+        )
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            for record in records:
+                runtime_state.append_collection(record)
+            self.assertEqual(
+                runtime_state.record_best_effort_answer(
+                    stale["best_supported_answer"],
+                    records,
+                    cycle=1,
+                    reason="later corrective audit contradicts candidate",
+                ),
+                "",
+            )
+            self.assertEqual(runtime_state.read_best_effort_answer(), "")
+
+    def test_best_effort_requires_post_audit_dispatch_lineage(self) -> None:
+        records = [
+            {
+                **_route_packet(
+                    "cursor_workhorse",
+                    "cursor-cycle-1",
+                    "cursor evidence",
+                ),
+                "collected_at_ns": 100,
+            },
+            {
+                **_route_packet(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                    _audit("PASS_WITH_GAPS"),
+                ),
+                "collected_at_ns": 300,
+            },
+            {
+                **_route_packet(
+                    "codex_judge",
+                    "judge-cycle-1",
+                    _judgment("REWORK"),
+                ),
+                "collected_at_ns": 400,
+            },
+        ]
+        dispatches = [
+            {
+                **records[0],
+                "dispatched_at_ns": 50,
+            },
+            {
+                **records[1],
+                "dispatched_at_ns": 150,
+            },
+            {
+                **records[2],
+                "dispatched_at_ns": 250,
+            },
+        ]
+        self.assertIsNone(
+            plugin._best_effort_answer(
+                records,
+                plugin._Route("best_effort", 1),
+                dispatches=dispatches,
+            )
+        )
 
     def test_terminal_native_send_is_internal_noop_without_child_dispatch(
         self,

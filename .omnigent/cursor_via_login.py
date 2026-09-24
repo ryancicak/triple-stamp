@@ -30,7 +30,7 @@ from pathlib import Path
 #    an explicit rate class).
 EXPECTED_ALIAS = "cursor-grok-4.6-xhigh"
 BASE_MODEL = "grok-4.6"
-DISPLAY_NAME = "Cursor Grok 4.6 Extra High"
+DISPLAY_NAME = "Grok 4.6 Extra High"
 EXPECTED_PARAMETERS = (
     {"id": "effort", "value": "xhigh"},
     {"id": "fast", "value": "false"},
@@ -74,6 +74,7 @@ _RUNNER_ONLY_ENV = frozenset(
         "TRIPLE_STAMP_OPUS_MODEL",
         "TRIPLE_STAMP_PROVIDER",
         "TRIPLE_STAMP_SUPERVISOR_MODEL",
+        "DATABRICKS_BEARER",
     }
 )
 

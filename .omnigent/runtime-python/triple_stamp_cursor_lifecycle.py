@@ -1894,30 +1894,55 @@ def install_parent_inbox_guard() -> None:
                     parent_session_id=parent_session_id
                 )
                 if dispatches:
-                    latest = dispatches[-1]
-                    child = str(latest.get("child_session_id") or "")
-                    work_id = str(latest.get("work_id") or "")
                     collections = read_attempt_collections(
                         parent_session_id=parent_session_id
                     )
-                    recovered = next(
-                        (
-                            record
-                            for record in reversed(collections)
-                            if (
-                                (work_id and record.get("work_id") == work_id)
-                                or (
-                                    child
-                                    and record.get("child_session_id") == child
-                                )
+
+                    def matches(
+                        dispatch_record: dict[str, Any],
+                        collection_record: dict[str, Any],
+                    ) -> bool:
+                        dispatch_work = str(
+                            dispatch_record.get("work_id") or ""
+                        )
+                        collection_work = str(
+                            collection_record.get("work_id") or ""
+                        )
+                        if dispatch_work and collection_work:
+                            return dispatch_work == collection_work
+                        dispatch_child = str(
+                            dispatch_record.get("child_session_id") or ""
+                        )
+                        collection_child = str(
+                            collection_record.get("child_session_id") or ""
+                        )
+                        if dispatch_child and collection_child:
+                            return (
+                                dispatch_child == collection_child
+                                and dispatch_record.get("title")
+                                == collection_record.get("title")
                             )
-                            and record.get("status")
-                            in {"completed", "failed", "cancelled"}
-                            and str(record.get("output") or "").strip()
-                        ),
-                        None,
-                    )
-                    if recovered is None and child:
+                        return (
+                            dispatch_record.get("agent")
+                            == collection_record.get("agent")
+                            and dispatch_record.get("title")
+                            == collection_record.get("title")
+                        )
+
+                    uncollected = [
+                        dispatch_record
+                        for dispatch_record in reversed(dispatches)
+                        if not any(
+                            matches(dispatch_record, collection_record)
+                            for collection_record in collections
+                        )
+                    ]
+                    recovered = None
+                    for pending in uncollected:
+                        child = str(pending.get("child_session_id") or "")
+                        work_id = str(pending.get("work_id") or "")
+                        if not child:
+                            continue
                         entry = runner_app.get_subagent_work(child)
                         if (
                             entry is not None
@@ -1935,14 +1960,28 @@ def install_parent_inbox_guard() -> None:
                                 "child_session_id": child,
                                 "work_id": getattr(entry, "work_id", work_id),
                                 "agent": getattr(entry, "agent", None)
-                                or latest.get("agent"),
+                                or pending.get("agent"),
                                 "title": getattr(entry, "title", None)
-                                or latest.get("title"),
+                                or pending.get("title"),
                                 "status": getattr(entry, "status", ""),
                                 "output": getattr(entry, "output", ""),
                             }
                             append_collection(recovered)
                             attest_codex_stamp(recovered)
+                            break
+                    if recovered is None and not uncollected:
+                        latest = dispatches[-1]
+                        recovered = next(
+                            (
+                                record
+                                for record in reversed(collections)
+                                if matches(latest, record)
+                                and record.get("status")
+                                in {"completed", "failed", "cancelled"}
+                                and str(record.get("output") or "").strip()
+                            ),
+                            None,
+                        )
                     if recovered is not None:
                         payload = {
                             "type": "sub_agent",
