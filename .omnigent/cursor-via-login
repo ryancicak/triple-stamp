@@ -32,9 +32,55 @@ if [ -L "$SCRIPT" ]; then
   esac
 fi
 ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")" && pwd)
-PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python"
+
+resolve_omnigent_python() {
+  if [ -n "${STABLE_OMNIGENT_PY:-}" ] && [ -x "$STABLE_OMNIGENT_PY" ]; then
+    printf '%s\n' "$STABLE_OMNIGENT_PY"
+    return 0
+  fi
+
+  OMNIGENT_BIN=$(command -v omnigent 2>/dev/null || true)
+  if [ -n "$OMNIGENT_BIN" ] && [ -f "$OMNIGENT_BIN" ]; then
+    IFS= read -r SHEBANG <"$OMNIGENT_BIN" || SHEBANG=
+    case "$SHEBANG" in
+      '#!'/*)
+        CANDIDATE=${SHEBANG#\#!}
+        if [ -x "$CANDIDATE" ]; then
+          printf '%s\n' "$CANDIDATE"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  if command -v uv >/dev/null 2>&1; then
+    UV_TOOL_ROOT=$(uv tool dir 2>/dev/null || true)
+    for CANDIDATE in \
+      "$UV_TOOL_ROOT/omnigent/bin/python" \
+      "$UV_TOOL_ROOT/omnigent/bin/python3"
+    do
+      if [ -x "$CANDIDATE" ]; then
+        printf '%s\n' "$CANDIDATE"
+        return 0
+      fi
+    done
+  fi
+
+  for CANDIDATE in \
+    "$HOME/.local/share/uv/tools/omnigent/bin/python" \
+    "$HOME/.local/share/uv/tools/omnigent/bin/python3"
+  do
+    if [ -x "$CANDIDATE" ]; then
+      printf '%s\n' "$CANDIDATE"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON=$(resolve_omnigent_python || true)
 if [ ! -x "$PYTHON" ]; then
-  echo "triple-stamp: stable Omnigent Python is unavailable to Cursor" >&2
+  echo "triple-stamp: supported Omnigent Python is unavailable to Cursor" >&2
   exit 127
 fi
 exec "$PYTHON" -I "$ROOT/cursor_via_login.py" "$@"

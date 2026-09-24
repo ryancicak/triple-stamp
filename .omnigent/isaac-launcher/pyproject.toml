@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "triple-stamp-isaac-launcher"
 version = "0.4.0"
 description = "Project-owned fail-closed Isaac launcher for Omnigent."
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.12,<3.15"
 
 [project.entry-points."omnigent.claude_launcher"]
 isaac = "triple_stamp_isaac_launcher:IsaacClaudeLauncher"

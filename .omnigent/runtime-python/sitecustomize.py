@@ -8,6 +8,17 @@ import logging
 import os
 import sys
 
+# Resolve Omnigent 0.14's relocated harness modules to their 0.12 import paths
+# before any guard, plugin, or attestation imports them, so those import
+# statements keep working unchanged on both runtimes. No-op on 0.12; never
+# raises (the launcher capability probe is the fail-closed gate).
+try:
+    import triple_stamp_omnigent_compat as _omnigent_compat
+
+    _omnigent_compat.install_all()
+except Exception:  # noqa: BLE001 - compat install is best-effort; probe gates
+    pass
+
 import triple_stamp_cursor_lifecycle as _lifecycle
 import triple_stamp_supervisor_runtime as _supervisor_runtime
 from triple_stamp_browser_runtime import install_browser_runtime_guard
@@ -318,7 +329,12 @@ if os.environ.get(_ENV_NAME) == _MODE and _has_omnigent_runtime:
     try:
         _install_policy_identity_context()
         _install_native_request_provenance()
-    except Exception:  # noqa: BLE001 - missing identity would weaken the route cap
+    except Exception as exc:  # noqa: BLE001 - missing identity would weaken the route cap
+        print(
+            f"triple-stamp: policy identity guard failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         os._exit(78)
 
 
@@ -334,8 +350,13 @@ if (
         _install_minimal_supervisor_tool_surface()
         _install_parent_inbox_guard()
         _supervisor_runtime.install_supervisor_continuation_guard()
-    except Exception:  # noqa: BLE001 - fail closed on any partial guard install
+    except Exception as exc:  # noqa: BLE001 - fail closed on any partial guard install
         # Continuing would restore the premature Cursor completion path.
+        print(
+            f"triple-stamp: runtime guard install failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         os._exit(78)
 
     _original = _permissions._yolo_auto_accept

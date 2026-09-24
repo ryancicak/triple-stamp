@@ -4,22 +4,46 @@
 # Voice rendering is off unless TRIPLE_STAMP_VOICE_PROFILE names a readable
 # markdown file, which most people will never set.
 set -eu
+umask 077
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TRIPLE_STAMP_ROOT=$ROOT
+export TRIPLE_STAMP_ROOT
 
-PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python"
+# Help must be safe even on an empty or offline Mac: no downloads, package
+# mutation, login, or lock acquisition.
+case "${1:-}" in
+  --help|-h)
+    cat <<'HELP'
+Usage: ./triple-stamp               set up and start the browser UI and
+                                    interactive terminal
+       ./triple-stamp --self-test   set up and verify the complete install
+
+The first real run automatically installs or repairs user-scoped prerequisites.
+It never uses sudo. Browser sign-in opens only when an account is not ready.
+
+Environment (all optional):
+  TRIPLE_STAMP_VOICE_PROFILE   markdown file to render the answer
+  TRIPLE_STAMP_MAX_CYCLES      2 (default) or 4 for a deeper bound
+  TRIPLE_STAMP_PROVIDER        direct (default) or databricks
+  TRIPLE_STAMP_BOOTSTRAP       set to 0 to disable automatic setup
+  TRIPLE_STAMP_BOOTSTRAP_OFFLINE
+                               set to 1 to forbid setup downloads
+HELP
+    exit 0
+    ;;
+esac
+
+# One command owns first-run setup. It finds or installs uv, selects a proven
+# Omnigent 0.12/0.14 runtime (or creates a private 0.14 runtime), repairs the SDK
+# pin, and installs any missing public CLIs before the strict launcher runs.
+# shellcheck source=.omnigent/bootstrap.sh
+. "$ROOT/.omnigent/bootstrap.sh"
+triple_stamp_bootstrap "$@" || exit $?
+
+PYTHON=${STABLE_OMNIGENT_PY:-}
 if [ ! -x "$PYTHON" ]; then
-  PYTHON="$HOME/.local/share/uv/tools/omnigent/bin/python3"
-fi
-if [ ! -x "$PYTHON" ]; then
-  cat >&2 <<'MISSING'
-triple-stamp: the Omnigent 0.12 Python runtime is not installed.
-
-Install it, then run this script again:
-
-  uv tool install omnigent==0.12.0
-
-MISSING
+  echo "triple-stamp: bootstrap did not produce a supported Omnigent runtime" >&2
   exit 127
 fi
 

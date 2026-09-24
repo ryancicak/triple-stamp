@@ -16,7 +16,7 @@ displayed as GPT-5.6 Sol Extra High.
   issuing another. Do not batch or parallelize tool calls in this repository.
 - Return the complete evidence packet inline in the same Cursor session. Do not
   return a workflow announcement, delegation stub, or "still researching" text.
-- Never invoke `triple-stamp`, `run-with-isaac`, `--self-test`, Omnigent, or
+- Never invoke `triple-stamp`, `--self-test`, Omnigent, or
   another recursive triple-stamp run. The outer pipeline already owns the
   workspace lock.
 - For this Stage 1 `cursor_workhorse` runtime only, the required model is

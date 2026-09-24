@@ -1172,6 +1172,10 @@ class OrchestrationContractTests(unittest.TestCase):
         )
 
     def test_provider_profiles_select_exact_child_launchers(self) -> None:
+        isaac_codex_wrapper = (
+            ROOT / ".omnigent/codex-via-isaac"
+        ).read_text(encoding="utf-8")
+        self.assertIn("-u PYTHONPATH", isaac_codex_wrapper)
         common = dict(
             root=ROOT,
             real_home=Path("/Users/unit"),
@@ -6185,11 +6189,21 @@ print("exact temp boundary: PASS")
                 "ALLOW",
             )
 
-    def test_auth_preflight_precedes_lock_and_model_launch(self) -> None:
+    def test_lock_precedes_workspace_mutation_auth_and_model_launch(self) -> None:
         source = (ROOT / ".omnigent/launcher.py").read_text(encoding="utf-8")
         outer = source[source.index("def _outer_main") :]
-        self.assertLess(outer.index("_sandboxed_auth_preflight("), outer.index("with _RunLock"))
-        self.assertLess(outer.index("with _RunLock"), outer.index("_spawn_sandboxed("))
+        self.assertLess(
+            outer.index("with _RunLock"),
+            outer.index("_remove_managed_cursor_files(root)"),
+        )
+        self.assertLess(
+            outer.index("_remove_managed_cursor_files(root)"),
+            outer.index("_sandboxed_auth_preflight("),
+        )
+        self.assertLess(
+            outer.index("_sandboxed_auth_preflight("),
+            outer.index("_spawn_sandboxed("),
+        )
 
     def test_sandbox_signal_handlers_precede_spawn_and_exceptions_reap_child(
         self,
@@ -6682,11 +6696,18 @@ print("exact temp boundary: PASS")
                 return_code=0,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             launcher._retain_runtime_diagnostics(
                 models_started=False,
                 keep_runtime=True,
-                return_code=launcher.EXIT_PIPELINE,
+                return_code=0,
+            )
+        )
+        self.assertTrue(
+            launcher._retain_runtime_diagnostics(
+                models_started=False,
+                keep_runtime=False,
+                return_code=None,
             )
         )
 

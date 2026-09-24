@@ -346,6 +346,113 @@ class CursorStartupTests(unittest.TestCase):
         self.assertFalse(details["worker_socket_isolated"])
         self.assertTrue(process.terminated)
 
+    def test_interactive_probe_accepts_socket_file_under_data_dir(self) -> None:
+        process = FakeProcess(polls_before_exit=10_000)
+        process.poll = lambda: None  # type: ignore[method-assign]
+
+        with tempfile.TemporaryDirectory() as value:
+            data_root = Path(value) / ".cursor"
+            sock = data_root / "projects" / "demo" / "worker.sock"
+            sock.parent.mkdir(parents=True)
+            sock.write_text("", encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "TRIPLE_STAMP_CURSOR_HOME": value,
+                        "CURSOR_DATA_DIR": str(data_root),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(cursor, "STARTUP_PREFLIGHT_TIMEOUT_SECONDS", 0.2),
+                mock.patch.object(cursor.subprocess, "Popen", return_value=process),
+                mock.patch.object(cursor, "_file_sizes", return_value={}),
+                mock.patch.object(
+                    cursor,
+                    "_file_deltas",
+                    return_value="startup.metrics ready",
+                ),
+            ):
+                ok, _diagnostic, _pid, _code, details = (
+                    cursor._run_interactive_startup_probe(
+                        "/verified/cursor-agent",
+                        "01234567-89ab-cdef-0123-456789abcdef",
+                    )
+                )
+        self.assertTrue(ok)
+        self.assertTrue(details["worker_socket_isolated"])
+        self.assertTrue(details["interactive_startup_seen"])
+        self.assertTrue(process.terminated)
+
+    def test_startup_preflight_retries_transient_interactive_probe(self) -> None:
+        failed = (
+            False,
+            "timed out waiting for worker",
+            11,
+            None,
+            {
+                "interactive_startup_seen": False,
+                "worker_server_seen": False,
+                "worker_socket_isolated": False,
+                "paid_request_seen": False,
+            },
+        )
+        passed = (
+            True,
+            "",
+            12,
+            None,
+            {
+                "interactive_startup_seen": True,
+                "worker_server_seen": True,
+                "worker_socket_isolated": True,
+                "paid_request_seen": False,
+            },
+        )
+        probes = [failed, passed]
+
+        def probe(*_args: object, **_kwargs: object) -> object:
+            return probes.pop(0)
+
+        with tempfile.TemporaryDirectory() as value:
+            run = Path(value)
+            home = run / "cursor-home"
+            (home / ".cursor").mkdir(parents=True)
+            real_popen = subprocess.Popen
+
+            def spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                del args
+                return real_popen(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        "printf '01234567-89ab-cdef-0123-456789abcdef\\n'",
+                    ],
+                    **kwargs,
+                )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "TRIPLE_STAMP_RUN_DIR": str(run),
+                        "TRIPLE_STAMP_CURSOR_HOME": str(home),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(cursor, "model_config_is_exact", return_value=True),
+                mock.patch.object(cursor.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(
+                    cursor, "_run_interactive_startup_probe", side_effect=probe
+                ),
+                mock.patch.object(cursor.time, "sleep"),
+            ):
+                result = cursor._run_startup_preflight("/verified/cursor-agent")
+            self.assertEqual(result, 0)
+            self.assertEqual(probes, [])
+            status = json.loads((run / "cursor-startup-preflight.json").read_text())
+            self.assertEqual(status["state"], "passed")
+
 
 if __name__ == "__main__":
     unittest.main()
