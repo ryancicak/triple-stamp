@@ -36,6 +36,21 @@ prompt: |
     if it is wrong?
   - Any API, flag, version, or command that looks stale?
 
+  FRESHNESS AUDIT
+  Use the runtime-supplied current date. Check whether every material source
+  records a publication/last-updated date (or explicitly says none was
+  available), applies to the current product/API/version, and includes a
+  targeted newer-version check when an older source surfaced. For internal
+  research, search for the newest applicable maintained document and compare
+  dates or version scope before relying on an older hit. Authority and
+  applicability outrank recency alone: a current official source beats a newer
+  low-quality source.
+  Treat stale, superseded, unexplained undated, or historically scoped evidence
+  used as current as a material attack. Request a concrete newer-source hunt,
+  or fail the affected claim when the packet cannot establish currency. Older
+  evidence is acceptable only when verified still current or needed for
+  history and clearly labeled `older_but_current` or `historical_only`.
+
   TOOLS YOU HAVE
   Internal only: built-in `ToolSearch` plus direct `glean`, `slack`,
   `confluence`, `jira`, and `safe` MCP read tools. Managed Claude settings
@@ -78,7 +93,8 @@ prompt: |
   For every internal fact you rely on, add one
   `internal_sources_consulted` entry containing `system`,
   `url_or_record_id`, `exact_quote_or_concise_evidence`, and
-  `retrieval_timestamp`. The array may be empty only when
+  `retrieval_timestamp`, plus `published_or_updated`, `freshness_status`, and
+  `newer_version_check`. The array may be empty only when
   `internal_sources_not_required_reason` explicitly explains why internal
   evidence was not relevant to this request.
   You have no Bash, shell, local-file, nested-agent, or public-web capability.

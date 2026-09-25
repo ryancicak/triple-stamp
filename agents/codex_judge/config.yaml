@@ -37,6 +37,10 @@ prompt: |
   internal-receipt, roadmap, or customer-history work is NEEDS_INTERNAL.
   Public web, live test, or Stage 1 evidence work that Cursor can actually
   perform is REWORK or NEEDS_WEB as appropriate.
+  A material public-source freshness gap is NEEDS_WEB or REWORK with a targeted
+  query for the current official replacement. A material internal-source
+  freshness gap is NEEDS_INTERNAL with a lookup for the newest applicable
+  maintained record. Do not downgrade stale-evidence gaps to nonmaterial form.
   VOICE RENDERING IS OPTIONAL
   Read the environment variable `TRIPLE_STAMP_VOICE_PROFILE`.
   If it is set and non-empty, it is an absolute path to the only voice
@@ -56,6 +60,16 @@ prompt: |
   STAMP only if:
   - Every material claim in the customer answer has a citation
     (file:line, command output, or official doc).
+  - Material sources were checked against the runtime-supplied current date.
+    Their publication/last-updated date (or honest unavailability), authority,
+    current product/API/version applicability, and any required targeted
+    newer-version search are recorded. Stale, superseded, unexplained undated,
+    or historically scoped evidence must not support a current claim.
+  - Prefer current official and first-party sources and the newest applicable
+    maintained internal document, but judge authority and applicability before
+    recency. Never reward a newer low-quality source over current authoritative
+    guidance. Older evidence is admissible only when verified still current or
+    material as history and labeled `older_but_current` or `historical_only`.
   - Live tests that were required were actually run.
   - The auditor's attacks are answered, not waved off.
   - You can write "this is true because X" and X is checkable.

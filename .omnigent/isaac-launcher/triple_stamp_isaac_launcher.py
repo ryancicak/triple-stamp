@@ -137,6 +137,26 @@ _WAKE_NOTICE = re.compile(
     r"\((?P<status>completed|failed|cancelled)\) — "
     r"\d+ results? waiting in inbox\. Call sys_read_inbox to collect\.\]$"
 )
+_PROGRESS_PREFIX = "TRIPLE_STAMP_PROGRESS "
+_PROGRESS_STAGE = {
+    "cursor_workhorse": ("cursor_research", 1),
+    "opus_auditor": ("opus_audit", 2),
+    "codex_judge": ("codex_judgment", 3),
+}
+_PROGRESS_STAGE_IDS = {
+    "cursor_workhorse": frozenset({"cursor_grunt", "cursor_retry", "cursor_web"}),
+    "opus_auditor": frozenset(
+        {
+            "audit",
+            "audit_web",
+            "audit_retry",
+            "audit_internal",
+            "audit_repair",
+            "audit_repair_web",
+        }
+    ),
+    "codex_judge": frozenset({"judge", "judge_convergence", "judge_repair"}),
+}
 _NO_OUTPUT = re.compile(
     r"^\[System: sub-agent task \S+ completed — "
     r"(?P<agent>cursor_workhorse|opus_auditor|codex_judge)"
@@ -1071,6 +1091,71 @@ def _stage(title: object) -> _Stage | None:
         int(parsed["cycle"]),
         requester=str(parsed["requester"]),
         hop=int(parsed["hop"]),
+    )
+
+
+def supervisor_progress_message(agent: str, title: str) -> str:
+    """Return one canonical, content-free pipeline status envelope."""
+
+    parsed = parse_dispatch_title(title)
+    stage = _PROGRESS_STAGE.get(agent)
+    if (
+        parsed is None
+        or stage is None
+        or parsed["stage_id"] not in _PROGRESS_STAGE_IDS[agent]
+    ):
+        return ""
+    status = (
+        "retrying_after_infrastructure_failure"
+        if parsed["stage_id"] in {"cursor_retry", "audit_retry"}
+        else "started"
+    )
+    payload = {
+        "agent": agent,
+        "cycle": parsed["cycle"],
+        "kind": "pipeline_status",
+        "stage": stage[0],
+        "status": status,
+        "step": stage[1],
+        "steps": 3,
+        "title": title,
+        "version": 1,
+    }
+    return _PROGRESS_PREFIX + json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _validated_supervisor_progress(
+    response: str,
+    route: _Route,
+) -> bool:
+    """Allow only a canonical status envelope for the current durable route."""
+
+    if (
+        not response.startswith(_PROGRESS_PREFIX)
+        or "\n" in response
+        or len(response) > 512
+    ):
+        return False
+    try:
+        payload = json.loads(response.removeprefix(_PROGRESS_PREFIX))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    agent = payload.get("agent")
+    title = payload.get("title")
+    if not isinstance(agent, str) or not isinstance(title, str):
+        return False
+    if response != supervisor_progress_message(agent, title):
+        return False
+    return (
+        route.status == "dispatch"
+        and route.agent == agent
+        and route.title == title
     )
 
 
@@ -2811,6 +2896,9 @@ def supervisor_contract(
             collections,
             parent_session_id=parent_session_id,
         )
+        dispatches = read_attempt_dispatches(
+            parent_session_id=parent_session_id
+        )
         best_effort = _best_effort_answer(collections, route)
         if best_effort is not None and response == best_effort:
             persisted = record_best_effort_answer(
@@ -2822,12 +2910,18 @@ def supervisor_contract(
             )
             if persisted == best_effort:
                 return {"result": "ALLOW"}
+        if _validated_supervisor_progress(response, route):
+            # This envelope contains only canonical stage metadata. It neither
+            # authorizes a route nor finalizes a turn; the continuation guard
+            # still suppresses the model completion and parks on the durable
+            # child dispatch.
+            return {"result": "ALLOW"}
         if (
             response == ""
             and _route_dispatch_pending(
                 route,
                 collections,
-                read_attempt_dispatches(parent_session_id=parent_session_id),
+                dispatches,
                 parent_session_id=parent_session_id,
             )
         ):

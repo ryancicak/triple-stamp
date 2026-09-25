@@ -85,6 +85,14 @@ class VersionPolicyTests(unittest.TestCase):
 class RelocationMapTests(unittest.TestCase):
     def test_only_harness_modules_relocate(self) -> None:
         expected = {
+            "omnigent.native_policy_hook": "omnigent.native.native_policy_hook",
+            "omnigent._native_post_delivery": "omnigent.native._native_post_delivery",
+            "omnigent.claude_native_hook": "omnigent.harnesses.claude_native.hook",
+            "omnigent.codex_native_hook": "omnigent.harnesses.codex_native.hook",
+            "omnigent.kimi_native_hook": "omnigent.harnesses.kimi_native.hook",
+            "omnigent.codex_native_app_server": (
+                "omnigent.harnesses.codex_native.app_server"
+            ),
             "omnigent.claude_native_bridge": "omnigent.harnesses.claude_native.bridge",
             "omnigent.cursor_native_permissions": "omnigent.harnesses.cursor_native.permissions",
             "omnigent.cursor_native_usage": "omnigent.harnesses.cursor_native.usage",
@@ -92,6 +100,14 @@ class RelocationMapTests(unittest.TestCase):
             "omnigent.cursor_native_status": "omnigent.harnesses.cursor_native.status",
         }
         self.assertEqual(compat.MODULE_RELOCATIONS, expected)
+
+    def test_native_policy_hook_accepts_legacy_and_relocated_surfaces(self) -> None:
+        candidates, attributes = compat.REQUIRED_SURFACES["native_policy_hook"]
+        self.assertEqual(
+            candidates,
+            ["omnigent.native_policy_hook", "omnigent.native.native_policy_hook"],
+        )
+        self.assertEqual(attributes, ["hook_payload_to_evaluation_request"])
 
     def test_cleanup_tokens_cover_both_spellings(self) -> None:
         self.assertIn("omnigent.claude_native_bridge", compat.CLAUDE_BRIDGE_TOKENS)

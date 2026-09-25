@@ -45,33 +45,9 @@ _TERMINAL_RELAY_ACTIONS = frozenset(
     }
 )
 
-# What the reader is told when each stage starts. The supervisor is forbidden to
-# emit status prose and every attempt is suppressed, which is why the UI showed
-# raw `sys_session_send` rows and nothing else. The runtime holds the same facts
-# and cannot drift from them, so it narrates instead of the model.
+# Titles already narrated to the reader. The runtime, rather than the model,
+# authors progress so no worker output or candidate answer can leak.
 _NARRATED_STAGES: dict[tuple[str, str, int], set[str]] = {}
-_STAGE_STEP = {
-    "cursor_workhorse": ("1 of 3", "public-web research"),
-    "opus_auditor": ("2 of 3", "internal audit"),
-    "codex_judge": ("3 of 3", "final judgment"),
-}
-_STAGE_DOING = {
-    "cursor_workhorse": (
-        "Cursor, pinned to Grok 4.6 Extra High, is gathering public-web"
-        " evidence and has to attach a URL, a quote, and a retrieval date to"
-        " every claim. It has no access to internal systems."
-    ),
-    "opus_auditor": (
-        "Opus is attacking that evidence and checking it against Glean, Jira,"
-        " Slack, Confluence, and SAFE. This is normally the slowest step, and"
-        " its verdict is an opinion for the judge rather than a decision."
-    ),
-    "codex_judge": (
-        "Codex, on Sol Ultra, decides whether this ships as written or goes"
-        " back for another cycle, and writes the final answer in Ryan's voice"
-        " if it stamps. It does no research of its own."
-    ),
-}
 
 
 def _safe_titles(titles: list[str]) -> list[str]:
@@ -513,74 +489,6 @@ def _deterministic_cursor_cycle_handoff(
     )
 
 
-def _thousands(value: object) -> str:
-    try:
-        return f"{int(value):,}"
-    except (TypeError, ValueError):
-        return "?"
-
-
-def _elapsed(started_ns: object) -> str:
-    try:
-        seconds = max(0, int((time.time_ns() - int(started_ns)) // 1_000_000_000))
-    except (TypeError, ValueError):
-        return ""
-    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
-
-
-def _finished_clause(
-    records: list[dict[str, Any]],
-    dispatches: list[dict[str, Any]],
-    announced: set[str],
-) -> str:
-    """Describe the newest collected triple-stamp packet in one sentence.
-
-    Returns "" when the newest packet was already announced, which happens on a
-    rework cycle where the judge sends work back without a new packet arriving.
-    """
-
-    known = [record for record in records if record.get("agent") in _STAGE_STEP]
-    if not known:
-        return ""
-    newest = known[-1]
-    title = str(newest.get("title") or "")
-    marker = f"packet:{title}"
-    if not title or marker in announced:
-        return ""
-    announced.add(marker)
-    started = next(
-        (
-            row.get("dispatched_at_ns")
-            for row in reversed(dispatches)
-            if row.get("title") == title
-        ),
-        None,
-    )
-    # Measured from its dispatch to now, so it includes the supervisor's own
-    # hand-off turn and is very slightly longer than the child's own runtime.
-    took = _elapsed(started) if started else ""
-    parts = [
-        f"Just in: {title}, {_thousands(newest.get('output_bytes'))} bytes"
-        + (f", {took} since it was dispatched" if took else "")
-        + "."
-    ]
-    observation = newest.get("internal_mcp_observation")
-    if isinstance(observation, dict) and observation.get("status") == "observed":
-        families = ", ".join(
-            f"{system} {count}"
-            for system, count in (observation.get("by_system") or {}).items()
-            if count
-        )
-        parts.append(
-            f"The runtime observed {observation.get('count')} internal MCP calls"
-            + (f" ({families})." if families else ".")
-        )
-    validation = newest.get("audit_validation")
-    if isinstance(validation, dict) and validation.get("status"):
-        parts.append(f"Receipt check: {validation['status']}.")
-    return " ".join(parts)
-
-
 def _progress_note(
     agent: str,
     title: str,
@@ -588,29 +496,12 @@ def _progress_note(
     *,
     parent_session_id: str,
 ) -> str:
-    """Author one deterministic status line for a stage that is starting now."""
+    """Return the canonical content-free status for a stage starting now."""
 
-    from triple_stamp_runtime_state import (
-        parse_dispatch_title,
-        read_attempt_collections,
-        read_attempt_dispatches,
-    )
+    del announced, parent_session_id
+    from triple_stamp_isaac_launcher import supervisor_progress_message
 
-    step, kind = _STAGE_STEP.get(agent, ("", ""))
-    if not step or not title:
-        return ""
-    parsed = parse_dispatch_title(title)
-    cycle = f"cycle {parsed['cycle']}" if parsed else "cycle ?"
-    lines = [f"**Triple-stamp, {cycle} - step {step}, {kind}** (`{title}`)"]
-    finished = _finished_clause(
-        read_attempt_collections(parent_session_id=parent_session_id),
-        read_attempt_dispatches(parent_session_id=parent_session_id),
-        announced,
-    )
-    if finished:
-        lines.append(finished)
-    lines.append(_STAGE_DOING[agent])
-    return "\n\n".join(lines) + "\n\n"
+    return supervisor_progress_message(agent, title)
 
 
 def _terminal_response_allowed(
@@ -647,6 +538,26 @@ def _terminal_response_allowed(
     if status == "infrastructure_failed":
         return response.startswith(_INFRA_PREFIX)
     return False
+
+
+def _terminal_already_relayed(parent_session_id: str) -> bool:
+    """Return True once any terminal answer or failure has been streamed.
+
+    The durable continuation ledger is authoritative: a later wake must stay
+    silent even when the attested artifact path is briefly unreadable (wrong
+    generation snapshot, alias flap, or IO). Nesting this check under
+    ``read_attested_answer`` previously let a post-STAMP reconnect turn reopen
+    the model, re-read the judge inbox, and emit the stamped answer twice.
+    """
+
+    from triple_stamp_runtime_state import read_supervisor_continuations
+
+    return any(
+        row.get("action") in _TERMINAL_RELAY_ACTIONS
+        for row in read_supervisor_continuations(
+            parent_session_id=parent_session_id
+        )
+    )
 
 
 def _customer_safe_terminal_failure() -> str:
@@ -845,6 +756,26 @@ def install_supervisor_continuation_guard() -> None:
         )
         while True:
             attest_latest_codex_stamp(session_id)
+            # Fail closed on the delivery ledger first. Artifact readability is
+            # not required: a reconnect wake after STAMP must not reopen the
+            # model just because stamped-answer.bin is momentarily unreachable.
+            if _terminal_already_relayed(session_id):
+                route = _next_route(
+                    read_attempt_collections(parent_session_id=session_id),
+                    parent_session_id=session_id,
+                )
+                _record(
+                    "terminal_stamp_suppressed",
+                    route,
+                    attempt=continuation_attempt,
+                    reason=(
+                        "terminal answer or failure was already relayed; "
+                        "stale wake cannot reopen routing"
+                    ),
+                    parent_session_id=session_id,
+                )
+                yield TurnComplete(response="", modified_by_policy=True)
+                return
             attested_answer = read_attested_answer(
                 parent_session_id=session_id
             )
@@ -853,24 +784,6 @@ def install_supervisor_continuation_guard() -> None:
                     read_attempt_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
-                if any(
-                    row.get("action") in _TERMINAL_RELAY_ACTIONS
-                    for row in read_supervisor_continuations(
-                        parent_session_id=session_id
-                    )
-                ):
-                    _record(
-                        "terminal_stamp_suppressed",
-                        route,
-                        attempt=continuation_attempt,
-                        reason=(
-                            "STAMP was already relayed; stale completion wake "
-                            "cannot reopen routing"
-                        ),
-                        parent_session_id=session_id,
-                    )
-                    yield TurnComplete(response="", modified_by_policy=True)
-                    return
                 _record(
                     "deterministic_stamp_relay",
                     route,
@@ -905,24 +818,6 @@ def install_supervisor_continuation_guard() -> None:
                     read_attempt_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
-                if any(
-                    row.get("action") in _TERMINAL_RELAY_ACTIONS
-                    for row in read_supervisor_continuations(
-                        parent_session_id=session_id
-                    )
-                ):
-                    _record(
-                        "terminal_best_effort_suppressed",
-                        route,
-                        attempt=continuation_attempt,
-                        reason=(
-                            "completed answer was already relayed; stale "
-                            "completion wake cannot reopen routing"
-                        ),
-                        parent_session_id=session_id,
-                    )
-                    yield TurnComplete(response="", modified_by_policy=True)
-                    return
                 _record(
                     "deterministic_best_effort_relay",
                     route,
@@ -957,29 +852,10 @@ def install_supervisor_continuation_guard() -> None:
                 parent_session_id=session_id
             )
             if recorded_failure:
-                relayed = any(
-                    row.get("action") in _TERMINAL_RELAY_ACTIONS
-                    for row in read_supervisor_continuations(
-                        parent_session_id=session_id
-                    )
-                )
                 route = _next_route(
                     read_attempt_collections(parent_session_id=session_id),
                     parent_session_id=session_id,
                 )
-                if relayed:
-                    # A child that was already in flight when the run died still
-                    # wakes this loop once. The reader has the reason; repeating
-                    # it would be its own kind of noise.
-                    _record(
-                        "terminal_failure_suppressed",
-                        route,
-                        attempt=continuation_attempt,
-                        reason="terminal failure was already relayed to the reader",
-                        parent_session_id=session_id,
-                    )
-                    yield TurnComplete(response="", modified_by_policy=True)
-                    return
                 _record(
                     "terminal_failure_relayed",
                     route,
@@ -1019,6 +895,7 @@ def install_supervisor_continuation_guard() -> None:
                             read_attested_answer(parent_session_id=session_id)
                             or read_best_effort_answer(parent_session_id=session_id)
                             or read_terminal_failure(parent_session_id=session_id)
+                            or _terminal_already_relayed(session_id)
                         ):
                             # A child can terminalize the attempt while this
                             # already-started model turn is still streaming.
@@ -1283,8 +1160,40 @@ def install_supervisor_continuation_guard() -> None:
                 dispatches=dispatches,
                 parent_session_id=session_id,
             ):
+                if (
+                    str(getattr(route, "status", "") or "") == "success"
+                    and _terminal_already_relayed(session_id)
+                ):
+                    _record(
+                        "terminal_stamp_suppressed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "byte-exact supervisor echo suppressed; "
+                            "STAMP was already relayed"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(
+                        response="",
+                        modified_by_policy=True,
+                        usage=completed.usage,
+                    )
+                    return
                 for event in buffered_text:
                     yield event
+                if str(getattr(route, "status", "") or "") == "success":
+                    # Mark after TextChunk so a crash before the UI consumes the
+                    # bytes still replays; matching the deterministic relay path.
+                    _record(
+                        "terminal_stamp_delivered",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "byte-exact supervisor STAMP TextChunk was consumed"
+                        ),
+                        parent_session_id=session_id,
+                    )
                 yield completed
                 return
 
@@ -1300,6 +1209,23 @@ def install_supervisor_continuation_guard() -> None:
             # nothing before or after the answer.
             attested = _attested_stamp_answer(route, records)
             if attested is not None:
+                if _terminal_already_relayed(session_id):
+                    _record(
+                        "terminal_stamp_suppressed",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "deterministic STAMP relay suppressed; answer was "
+                            "already streamed"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(
+                        response="",
+                        modified_by_policy=True,
+                        usage=completed.usage,
+                    )
+                    return
                 _record(
                     "deterministic_stamp_relay",
                     route,

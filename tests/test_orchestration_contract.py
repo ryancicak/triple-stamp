@@ -637,6 +637,49 @@ class OrchestrationContractTests(unittest.TestCase):
         )
         self.assertIn("At most two web hops for each", prompt)
         self.assertIn("cursor-retry-N-1", prompt)
+        self.assertIn("Apply the source-freshness contract by default", prompt)
+        self.assertIn("applicability outrank recency alone", prompt)
+
+    def test_latest_authoritative_research_contract_spans_all_stages(self) -> None:
+        cursor_prompt = yaml.safe_load(
+            (ROOT / "agents/cursor_workhorse/config.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["prompt"]
+        opus_prompt = yaml.safe_load(
+            (ROOT / "agents/opus_auditor/config.yaml").read_text(encoding="utf-8")
+        )["prompt"]
+        codex_prompt = yaml.safe_load(
+            (ROOT / "agents/codex_judge/config.yaml").read_text(encoding="utf-8")
+        )["prompt"]
+
+        for marker in (
+            "current date supplied by the runtime",
+            "last-updated date when available",
+            "targeted follow-up for a newer",
+            "newer low-quality post",
+            "`older_but_current`",
+            "published_or_updated",
+            "newer_version_check",
+        ):
+            self.assertIn(marker, cursor_prompt)
+        for marker in (
+            "Use the runtime-supplied current date",
+            "newest applicable maintained document",
+            "applicability outrank recency alone",
+            "material attack",
+            "`historical_only`",
+            "`newer_version_check`",
+        ):
+            self.assertIn(marker, opus_prompt)
+        for marker in (
+            "runtime-supplied current date",
+            "current product/API/version applicability",
+            "newer low-quality source",
+            "Do not downgrade stale-evidence gaps",
+            "`older_but_current`",
+        ):
+            self.assertIn(marker, codex_prompt)
 
     def test_final_response_policy_atomically_reserves_one_paid_retry(
         self,
@@ -4104,6 +4147,119 @@ print("exact temp boundary: PASS")
             self.assertIn("Inbox is empty", result)
             self.assertEqual(contract(send)["result"], "ALLOW")
 
+    def test_inflight_opus_failure_parks_then_retries_without_cursor(self) -> None:
+        cursor_lifecycle.install_parent_inbox_guard()
+        parent = "parent_live_route_cap_regression"
+        child = "opus_live_route_cap_regression"
+        work_id = "work_live_route_cap_regression"
+        failure = (
+            "API Error: Server error mid-response. "
+            "The response above may be incomplete."
+        )
+        inbox: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+
+        class Entry:
+            status = "running"
+            output: str | None = None
+            agent = "opus_auditor"
+            title = "audit-cycle-1"
+
+            def __init__(self) -> None:
+                self.work_id = work_id
+
+        entry = Entry()
+
+        class AllowResponse:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"result": "POLICY_ACTION_ALLOW"}
+
+        class AllowClient:
+            @staticmethod
+            async def post(*args: object, **kwargs: object) -> AllowResponse:
+                return AllowResponse()
+
+        async def collect_after_live_worker_finishes() -> str:
+            read = asyncio.create_task(
+                tool_dispatch._drain_inbox(
+                    inbox,
+                    server_client=AllowClient(),
+                    conversation_id=parent,
+                )
+            )
+            # The live failure made 84 verified route calls while workers were
+            # still running. Repeated scheduler opportunities must not turn one
+            # legitimate collection into an empty-inbox polling loop.
+            for _ in range(plugin._SUPERVISOR_ROUTE_LIMIT):
+                await asyncio.sleep(0)
+                self.assertFalse(read.done())
+            entry.status = "failed"
+            entry.output = failure
+            inbox.put_nowait(
+                {
+                    "type": "sub_agent",
+                    "conversation_id": child,
+                    "work_id": work_id,
+                    "agent": entry.agent,
+                    "title": entry.title,
+                    "status": entry.status,
+                    "output": failure,
+                }
+            )
+            return await asyncio.wait_for(read, timeout=1.0)
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_SANDBOX_TOKEN": "unit-test-secret",
+            },
+            clear=False,
+        ):
+            runtime_state.append_collection(
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        "cursor evidence",
+                    ),
+                    "parent_session_id": parent,
+                }
+            )
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": child,
+                    "work_id": work_id,
+                    "agent": entry.agent,
+                    "title": entry.title,
+                }
+            )
+            with mock.patch.object(
+                runner_app,
+                "get_subagent_work",
+                return_value=entry,
+            ) as get_work:
+                result = asyncio.run(collect_after_live_worker_finishes())
+
+            self.assertIn(failure, result)
+            self.assertEqual(get_work.call_count, 1)
+            collections = runtime_state.read_attempt_collections(parent)
+            self.assertEqual(collections[-1]["child_session_id"], child)
+            self.assertEqual(collections[-1]["status"], "failed")
+            route = plugin._next_route(
+                collections,
+                parent_session_id=parent,
+            )
+            self.assertEqual(
+                (route.agent, route.title, route.resume_child_session_id),
+                ("opus_auditor", "audit-retry-1-1", ""),
+            )
+            self.assertNotEqual(route.agent, "cursor_workhorse")
+
     def test_empty_inbox_recovers_completed_judge_repair_from_work_record(
         self,
     ) -> None:
@@ -5738,6 +5894,93 @@ print("exact temp boundary: PASS")
             decision = contract({"type": "response", "data": "answer from training"})
         self.assertEqual(decision["result"], "DENY")
 
+    def test_pre_stamp_progress_is_canonical_route_scoped_and_nonterminal(
+        self,
+    ) -> None:
+        parent = "progress-policy-parent"
+        context = {
+            "conversation_id": parent,
+            "root_conversation_id": parent,
+        }
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            contract = plugin.supervisor_contract(enabled=True)
+            progress = plugin.supervisor_progress_message(
+                "cursor_workhorse",
+                "cursor-cycle-1",
+            )
+            retry = plugin.supervisor_progress_message(
+                "opus_auditor",
+                "audit-retry-1-1",
+            )
+            self.assertIn('"status":"retrying_after_infrastructure_failure"', retry)
+            self.assertEqual(
+                contract(
+                    {
+                        "type": "response",
+                        "data": progress,
+                        "context": context,
+                    }
+                ),
+                {"result": "ALLOW"},
+            )
+            runtime_state.append_dispatch(
+                {
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                    "parent_session_id": parent,
+                    "child_session_id": "cursor-progress-child",
+                    "work_id": "cursor-progress-work",
+                }
+            )
+            self.assertEqual(
+                contract(
+                    {
+                        "type": "response",
+                        "data": progress,
+                        "context": context,
+                    }
+                ),
+                {"result": "ALLOW"},
+            )
+            for denied in (
+                "Cursor found the answer in official documentation.",
+                "Recommendation: ship the candidate answer.",
+                progress + "\nEvidence: secret worker excerpt",
+                plugin.supervisor_progress_message(
+                    "opus_auditor",
+                    "audit-cycle-1",
+                ),
+            ):
+                decision = contract(
+                    {
+                        "type": "response",
+                        "data": denied,
+                        "context": context,
+                    }
+                )
+                self.assertEqual(decision["result"], "DENY")
+
+            route_state: dict[str, object] = {}
+            limiter = plugin.supervisor_route_call_limit(limit=1)
+            self.assertEqual(
+                limiter(
+                    {
+                        "type": "response",
+                        "data": progress,
+                        "context": context,
+                        "session_state": route_state,
+                    }
+                ),
+                {"result": "ALLOW"},
+            )
+            self.assertEqual(route_state, {})
+            self.assertEqual(runtime_state.read_attested_answer(parent), "")
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+
     def test_exact_stamp_relay_writes_byte_audit(self) -> None:
         answer = "Verified answer.\n\nSource: https://example.test/\n"
         digest = "ab" * 32
@@ -5785,6 +6028,16 @@ print("exact temp boundary: PASS")
 
             altered = contract({"type": "response", "data": answer + "\n"})
             self.assertEqual(altered["result"], "DENY")
+            progress_after_stamp = contract(
+                {
+                    "type": "response",
+                    "data": plugin.supervisor_progress_message(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                    ),
+                }
+            )
+            self.assertEqual(progress_after_stamp["result"], "DENY")
 
     def test_stamp_without_live_voice_digest_is_denied(self) -> None:
         payload = {
@@ -7857,7 +8110,8 @@ print("exact temp boundary: PASS")
             self.assertNotIn("status prose after dispatch", streamed)
             self.assertNotIn("ordinary final response", streamed)
             self.assertIn("judge-convergence-2", streamed)
-            self.assertIn("final judgment", streamed)
+            self.assertIn("TRIPLE_STAMP_PROGRESS", streamed)
+            self.assertIn('"stage":"codex_judgment"', streamed)
             completions = [
                 event for event in events if isinstance(event, TurnComplete)
             ]
@@ -10177,15 +10431,20 @@ print("exact temp boundary: PASS")
                     set(),
                     parent_session_id=parent_lakebase,
                 )
-                self.assertIn(
-                    f"judge-cycle-1, {len(stamp.encode('utf-8')):,} bytes",
+                self.assertEqual(
                     math_note,
+                    plugin.supervisor_progress_message(
+                        "cursor_workhorse",
+                        "cursor-cycle-2",
+                    ),
                 )
                 self.assertNotIn("cursor-web-codex-1-1", math_note)
-                self.assertIn(
-                    "cursor-web-codex-1-1, "
-                    f"{len(b'LAKEBASE-WEB-EVIDENCE'):,} bytes",
+                self.assertEqual(
                     lakebase_note,
+                    plugin.supervisor_progress_message(
+                        "codex_judge",
+                        "judge-cycle-1",
+                    ),
                 )
                 self.assertNotIn(
                     f"{len(stamp.encode('utf-8')):,} bytes",
@@ -11671,6 +11930,149 @@ print("exact temp boundary: PASS")
             answer,
         )
         self.assertFalse(any(isinstance(event, TextChunk) for event in stale))
+        self.assertEqual(actions.count("terminal_stamp_delivered"), 1)
+        self.assertIn("terminal_stamp_suppressed", actions)
+
+    def test_delivered_stamp_suppresses_even_when_attested_artifact_unreadable(
+        self,
+    ) -> None:
+        """Reconnect wake must not re-emit STAMP if the artifact path flaps.
+
+        Live incident 2049177badb646a29eefe99ee6a8b0d1 / attempt 77e007c8:
+        STAMP was relayed once, then an MCP reconnect turn re-read the judge
+        inbox and emitted the same assistant message again. Suppress was nested
+        under read_attested_answer, so an unreadable artifact reopened the model.
+        """
+
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        parent = "stamp-unreadable-after-deliver-parent"
+        answer = "2 + 2 = 4."
+        stamp = json.dumps(
+            {
+                "verdict": "STAMP",
+                "needs_web": False,
+                "needs_internal": False,
+                "why": "complete",
+                "gap_materiality": "none",
+                "limitations": [],
+                "citations_that_hold": ["evidence"],
+                "voice_profile_check": {
+                    "source_path": "",
+                    "sha256": "",
+                },
+                "shippable_answer": answer,
+            }
+        )
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+
+        async def byte_exact_echo(*_args: object, **_kwargs: object):
+            nonlocal model_turns
+            model_turns += 1
+            yield TextChunk(text=answer)
+            yield TurnComplete(response=answer)
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        messages = [
+            {
+                "role": "user",
+                "content": "2+2=?",
+                "session_id": parent,
+            }
+        ]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    messages,
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            records = (
+                {
+                    **_route_packet(
+                        "cursor_workhorse",
+                        "cursor-cycle-1",
+                        "cursor evidence",
+                    ),
+                    "parent_session_id": parent,
+                },
+                {
+                    **_route_packet(
+                        "opus_auditor",
+                        "audit-cycle-1",
+                        _audit("PASS"),
+                    ),
+                    "parent_session_id": parent,
+                },
+                {
+                    **_route_packet(
+                        "codex_judge",
+                        "judge-cycle-1",
+                        stamp,
+                    ),
+                    "parent_session_id": parent,
+                },
+            )
+            for record in records:
+                runtime_state.append_collection(record)
+            self.assertTrue(runtime_state.attest_codex_stamp(records[-1]))
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = byte_exact_echo
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                first = asyncio.run(collect())
+                # Simulate artifact-path flap after the UI already consumed the
+                # stamped answer (generation alias missing, digest mismatch, …).
+                run_dir = Path(value)
+                for path in run_dir.rglob("stamped-answer.bin"):
+                    path.unlink()
+                for path in run_dir.rglob("stamp-attestation.json"):
+                    path.unlink()
+                self.assertEqual(runtime_state.read_attested_answer(parent), "")
+                stale = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+
+        self.assertEqual(
+            "".join(
+                event.text for event in first if isinstance(event, TextChunk)
+            ),
+            answer,
+        )
+        self.assertEqual(model_turns, 0)
+        self.assertFalse(any(isinstance(event, TextChunk) for event in stale))
+        self.assertEqual(
+            [
+                event.response
+                for event in stale
+                if isinstance(event, TurnComplete)
+            ],
+            [""],
+        )
         self.assertEqual(actions.count("terminal_stamp_delivered"), 1)
         self.assertIn("terminal_stamp_suppressed", actions)
 

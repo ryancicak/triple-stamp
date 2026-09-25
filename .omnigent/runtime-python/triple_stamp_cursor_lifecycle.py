@@ -1938,19 +1938,29 @@ def install_parent_inbox_guard() -> None:
                         )
                     ]
                     recovered = None
+                    active_dispatch = False
                     for pending in uncollected:
                         child = str(pending.get("child_session_id") or "")
                         work_id = str(pending.get("work_id") or "")
                         if not child:
                             continue
                         entry = runner_app.get_subagent_work(child)
-                        if (
+                        entry_matches = (
                             entry is not None
                             and (
                                 not work_id
                                 or str(getattr(entry, "work_id", "") or "")
                                 == work_id
                             )
+                        )
+                        if (
+                            entry_matches
+                            and str(getattr(entry, "status", "") or "")
+                            in {"launching", "running", "waiting"}
+                        ):
+                            active_dispatch = True
+                        if (
+                            entry_matches
                             and str(getattr(entry, "status", "") or "")
                             in {"completed", "failed", "cancelled"}
                             and str(getattr(entry, "output", "") or "").strip()
@@ -1999,7 +2009,18 @@ def install_parent_inbox_guard() -> None:
                             "output": recovered.get("output"),
                         }
                         return dispatch._format_async_task_item(payload)
-                return "Inbox is empty — no completed tasks."
+                    if active_dispatch:
+                        # Omnigent's 0.12 and 0.14 async inbox drains both return
+                        # immediately when the queue is empty. A routing-only
+                        # supervisor can then spin on sys_read_inbox and consume
+                        # its verified route cap before the worker is terminal.
+                        # One read for a durably registered live dispatch must
+                        # instead remain parked until the worker's terminal
+                        # delivery wakes this parent inbox.
+                        payload = await inbox.get()
+                        inbox.put_nowait(payload)
+                    else:
+                        return "Inbox is empty — no completed tasks."
 
             leased: list[dict[str, object]] = []
             while not inbox.empty():

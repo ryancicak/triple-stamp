@@ -57,6 +57,14 @@ def is_supported_omnigent_version(value: str | None) -> bool:
 # plugin import that moved between 0.12 and 0.14. Every other imported surface
 # kept its 0.12 path in 0.14 (verified by the capability probe below).
 MODULE_RELOCATIONS: dict[str, str] = {
+    "omnigent.native_policy_hook": "omnigent.native.native_policy_hook",
+    "omnigent._native_post_delivery": "omnigent.native._native_post_delivery",
+    "omnigent.claude_native_hook": "omnigent.harnesses.claude_native.hook",
+    "omnigent.codex_native_hook": "omnigent.harnesses.codex_native.hook",
+    "omnigent.kimi_native_hook": "omnigent.harnesses.kimi_native.hook",
+    "omnigent.codex_native_app_server": (
+        "omnigent.harnesses.codex_native.app_server"
+    ),
     "omnigent.claude_native_bridge": "omnigent.harnesses.claude_native.bridge",
     "omnigent.cursor_native_permissions": "omnigent.harnesses.cursor_native.permissions",
     "omnigent.cursor_native_usage": "omnigent.harnesses.cursor_native.usage",
@@ -111,6 +119,18 @@ REQUIRED_SURFACES: dict[str, tuple[list[str], list[str]]] = {
         ["TextChunk", "ToolCallComplete", "ToolCallRequest", "TurnComplete"]),
     "policies_function": (
         ["omnigent.policies.function"], ["_build_event", "FunctionPolicy"]),
+    "native_policy_hook": (
+        ["omnigent.native_policy_hook",
+         "omnigent.native.native_policy_hook"],
+        ["hook_payload_to_evaluation_request"]),
+    "native_post_delivery": (
+        ["omnigent._native_post_delivery",
+         "omnigent.native._native_post_delivery"],
+        ["post_external_session_status", "post_session_event_with_retry"]),
+    "codex_native_app_server": (
+        ["omnigent.codex_native_app_server",
+         "omnigent.harnesses.codex_native.app_server"],
+        ["build_codex_native_server", "codex_terminal_env"]),
     "policy_engine": (["omnigent.runtime.policies.engine"], ["PolicyEngine"]),
     "runtime_telemetry": (["omnigent.runtime.telemetry"], ["current_session_id"]),
     "chat": (["omnigent.chat"], []),

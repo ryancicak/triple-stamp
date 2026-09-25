@@ -16,6 +16,11 @@ displayed as GPT-5.6 Sol Extra High.
   issuing another. Do not batch or parallelize tool calls in this repository.
 - Return the complete evidence packet inline in the same Cursor session. Do not
   return a workflow announcement, delegation stub, or "still researching" text.
+- By default, use the runtime current date and prioritize current authoritative
+  sources. Record publication/last-updated dates and version applicability;
+  when an older source appears, search specifically for a newer official
+  replacement. Use older evidence only when verified still current or clearly
+  labeled as historical. Authority and applicability outrank recency alone.
 - Never invoke `triple-stamp`, `--self-test`, Omnigent, or
   another recursive triple-stamp run. The outer pipeline already owns the
   workspace lock.

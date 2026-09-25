@@ -110,6 +110,20 @@ Ask your question in either one. Type `/quit` to stop the run and clean up.
 
 <sub>A real run takes about 15 minutes to an hour. Opus's internal audit is slow on purpose. Each stage prints as it starts.</sub>
 
+## Current-source research by default
+
+Triple-stamp treats the run date as part of every research request. Cursor
+records source publication or last-updated dates, checks the active
+product/API/version, and searches specifically for a newer official replacement
+when an older page surfaces. Opus applies the same rule to internal documents,
+and Codex will not stamp a current claim that rests on unexplained stale or
+superseded evidence.
+
+This is quality-aware, not a newest-date-wins rule. Current official guidance
+outranks a newer low-quality post. Older sources remain valid when they are
+verified as still current or are needed for history, but the evidence packet
+must label that use explicitly.
+
 ## Make it sound like you
 
 The answer does not have to sound like generic AI prose. Triple-stamp can render it in your saved voice profile: your cadence, level of detail, and preferred phrasing.

@@ -538,6 +538,12 @@ def validate_spec(
             "judge-convergence-N",
             f"This run permits exactly {prompt_cycles} complete cycles",
             "every runtime-appended `opus_effort_observation`",
+            "canonical `TRIPLE_STAMP_PROGRESS` JSON envelope",
+            "Progress never completes the request",
+            "never expose worker output, evidence, claims",
+            "Apply the source-freshness contract by default",
+            "publication/last-updated dates",
+            "applicability outrank recency alone",
             "byte-for-byte value",
             _VOICE_PROFILE_TEXT,
         ):
@@ -563,6 +569,8 @@ def validate_spec(
             "Never invoke a Skill, workflow, Subagent, Task, nested agent",
             "Emit at most one tool call per assistant turn",
             "Return the complete evidence packet inline",
+            "prioritize current authoritative",
+            "Authority and applicability outrank recency alone",
             "For this Stage 1 `cursor_workhorse` runtime only",
             "cursor-grok-4.6-xhigh",
         ):
@@ -587,6 +595,9 @@ def validate_spec(
             "SUBSTANCE VS FORM",
             "gap_materiality",
             "Never put",
+            "runtime-supplied current date",
+            "newer low-quality source",
+            "Do not downgrade stale-evidence gaps",
         ):
             if marker not in codex_prompt:
                 fail(f"Codex voice/factual contract is missing {marker!r}")
@@ -606,9 +617,22 @@ def validate_spec(
             "exact Opus child",
             "select:mcp__slack__slack_read_api_call",
             'type:"conversation"',
+            "FRESHNESS AUDIT",
+            "targeted newer-version check",
+            "`older_but_current`",
         ):
             if marker not in opus_prompt:
                 fail(f"Opus audit contract is missing {marker!r}")
+        cursor_prompt = agents["cursor_workhorse"].instructions
+        for marker in (
+            "SOURCE FRESHNESS",
+            "current date supplied by the runtime",
+            "newer low-quality post",
+            "published_or_updated",
+            "newer_version_check",
+        ):
+            if marker not in cursor_prompt:
+                fail(f"Cursor research contract is missing {marker!r}")
         if "If Isaac lands you on the wrong model" in opus_prompt:
             fail("Opus audit prompt still induces local harness self-checks")
 
@@ -733,9 +757,18 @@ def validate_launchers(
         "continuation_exhausted_abstained",
         "dispatch_observer_failure_abstained",
         "ledger observer failure=",
+        "supervisor_progress_message",
     ):
         if marker not in supervisor_runtime_source:
             fail(f"supervisor continuation marker missing: {marker}")
+    for marker in (
+        "def supervisor_progress_message(",
+        "def _validated_supervisor_progress(",
+        '"kind": "pipeline_status"',
+        "retrying_after_infrastructure_failure",
+    ):
+        if marker not in isaac_launcher_source:
+            fail(f"supervisor progress policy marker missing: {marker}")
     # Accept the pinned stable line (0.12.x) or the released native line
     # (0.14.x). The compatibility module owns the version policy and the
     # per-version schema (migration-head) expectation; this is a version gate,
