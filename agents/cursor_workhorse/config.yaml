@@ -44,6 +44,10 @@ prompt: |
   not repeat searches, tests, packets, or history already represented by a
   canonical current-cycle artifact.
 
+  ACCOUNT USAGE
+  Account usage and spend figures come from the audit stage. Do not look for a
+  usage add-on or the usage tool, and never mention whether one is installed.
+
   SOURCE FRESHNESS
   Treat the current date supplied by the runtime as part of every research
   task. For each material public or workspace source, check its publication or

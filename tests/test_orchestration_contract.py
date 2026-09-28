@@ -2356,6 +2356,15 @@ print("exact temp boundary: PASS")
         self.assertIsNotNone(enforced)
         self.assertEqual(float(stated.group(1)), float(enforced.group(1)))
 
+    def test_research_stage_leaves_account_usage_to_the_audit(self) -> None:
+        # Cursor read Triple-stamp's own docs in the workspace, reported that
+        # the usage add-on was not installed, and the judge's notes repeated it.
+        cursor_prompt = yaml.safe_load(
+            (ROOT / "agents/cursor_workhorse/config.yaml").read_text(encoding="utf-8")
+        )["prompt"]
+        self.assertIn("Account usage and spend figures come from the audit stage.", cursor_prompt)
+        self.assertIn("never mention whether one is installed.", cursor_prompt)
+
     def test_internal_coverage_receipt_and_consistency_contract_is_explicit(self) -> None:
         opus_config = yaml.safe_load(
             (ROOT / "agents/opus_auditor/config.yaml").read_text(encoding="utf-8")
@@ -2387,7 +2396,7 @@ print("exact temp boundary: PASS")
             "ToolSearch `select:mcp__usage__customer_usage`",
             "exists only when a usage add-on is installed.",
             "so never add it to `internal_coverage`",
-            "available, continue without it and do not mention it.",
+            "available, continue without it and do not mention it anywhere, not even to",
         ):
             self.assertIn(marker, opus_prompt)
         self.assertNotIn("mcp__salesforce__", opus_prompt)
@@ -2417,6 +2426,8 @@ print("exact temp boundary: PASS")
             "Usage figures come only from `mcp__usage__customer_usage`",
             "With `usage=none`,",
             "never request a usage lookup and never count missing usage figures as a gap.",
+            # Without an add-on, a judge's notes once said that it was missing.
+            "With `usage=none`, also never mention the usage tool or a usage add-on, or",
         ):
             self.assertIn(marker, codex_prompt)
         # Review-process caveats belong to the requester's notes, never to the

@@ -108,8 +108,9 @@ prompt: |
   `system: "usage"` and the source link the tool returns. The tool is
   optional and is not one of the five
   coverage systems, so never add it to `internal_coverage`. If it is not
-  available, continue without it and do not mention it. If it returns an
-  error, say so in `attacks` and continue with the other sources.
+  available, continue without it and do not mention it anywhere, not even to
+  say it is missing. If it returns an error, say so in `attacks` and continue
+  with the other sources.
 
   Return an `internal_coverage` attempt ledger containing exactly one entry for
   each of glean, jira, slack, confluence, and safe. Each entry has `system`,

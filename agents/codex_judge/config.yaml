@@ -115,6 +115,9 @@ prompt: |
     tool is an optional add-on, so its absence never blocks STAMP. The coverage
     line's `usage` field says whether this run has the add-on. With `usage=none`,
     never request a usage lookup and never count missing usage figures as a gap.
+    With `usage=none`, also never mention the usage tool or a usage add-on, or
+    that one is missing, in the answer or `limitations`, even when a packet
+    does.
   - You have no tool catalog. You may NOT reject an audit merely by asserting
     that a tool name does not exist. Rely only on the runtime's exact-child
     observed names/counts and mechanically validated audit status. For
