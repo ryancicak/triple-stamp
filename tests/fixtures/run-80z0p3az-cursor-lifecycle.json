@@ -1,0 +1,37 @@
+{
+  "retained_run": "/tmp/omnigent-triple-stamp-502-aecbbf931f556ffc/run-80z0p3az",
+  "parent_session_id": "39c1c9c5266b479c81e4dbe9772b7e0e",
+  "child_session_id": "7a4363509a3042d1988d2c5fb7438c8b",
+  "work_id": "subagent_049a7919ca2e",
+  "title": "cursor-cycle-1",
+  "cursor_session_id": "7aedee40-edb7-4bb1-8c1d-4dbfbe62fef1",
+  "bridge_id": "973fc722ae3ff8d395f23addaecadce2",
+  "model": "gpt-5.6-sol-xhigh",
+  "started_at": "2026-09-09T14:37:42-05:00",
+  "intermediate_stop_at": "2026-09-09T14:38:42-05:00",
+  "parent_read_at": "2026-09-09T14:38:45-05:00",
+  "transport_cancel_at": "2026-09-09T14:45:45-05:00",
+  "final_turn_ended_at": "2026-09-09T14:48:57-05:00",
+  "duration_seconds": 677,
+  "stop_markers": [
+    ["bccc1912-1801-40f1-95f6-fa7abf8d9b0a", 1788982722.2659898],
+    ["d96a5e87-ca95-4d7c-97d0-bb58c971e962", 1788982856.090936],
+    ["5a65bcb9-e78f-4dfc-87f4-4471ae527a22", 1788983291.415704],
+    ["1179cf64-56df-48fd-bd4c-0f9ca028e7d6", 1788983338.0266502],
+    ["dfb42982-fd06-43a4-ae77-1591eb963d9a", 1788983877.586284],
+    ["1e9ecb24-b88c-4272-83c5-9ac105adfd69", 1788983976.70572],
+    ["836dd01a-0c12-4b8f-9ce0-53591d42f429", 1788984911.4771168],
+    ["c7d01b30-0068-4ed1-8fc4-d315a5257f18", 1788985219.411836]
+  ],
+  "native_packet": {
+    "type": "sub_agent",
+    "work_id": "subagent_049a7919ca2e",
+    "conversation_id": "7a4363509a3042d1988d2c5fb7438c8b",
+    "agent": "cursor_workhorse",
+    "title": "cursor-cycle-1",
+    "status": "completed",
+    "output": ""
+  },
+  "final_output_sha256": "757e2ff5471a32d23fa3c2e77fbd80dc81bbfa6719424baad5c2e1be5762eab3",
+  "collected_output_bytes": 16588
+}

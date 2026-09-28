@@ -1,0 +1,33 @@
+{
+  "source": "sanitized retained-run snapshot",
+  "snapshot_point": "cycle 4 start",
+  "configured_legacy_limit": 188,
+  "observed_tool_calls": 174,
+  "supervisor_route_calls": {
+    "total": 26,
+    "tool_names": [
+      "sys_session_send",
+      "sys_read_inbox",
+      "sys_agent_start"
+    ]
+  },
+  "child_work_calls": {
+    "total": 148,
+    "opus_internal_mcp_calls": 82,
+    "opus_toolsearch_calls": 25,
+    "other_child_internal_or_related_calls": 41,
+    "mcp_families": [
+      "glean",
+      "jira",
+      "slack",
+      "confluence",
+      "safe"
+    ]
+  },
+  "sanitization": {
+    "conversation_ids_removed": true,
+    "tool_arguments_removed": true,
+    "tool_results_removed": true,
+    "customer_content_removed": true
+  }
+}

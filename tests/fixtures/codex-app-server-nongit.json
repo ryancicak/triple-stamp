@@ -1,0 +1,9 @@
+{
+  "codex_cli_version": "0.154.0",
+  "entry_path": "app-server thread/start",
+  "working_directory_was_git_repository": false,
+  "skip_git_repo_check_passed": false,
+  "thread_start_has_result": true,
+  "error": null,
+  "conclusion": "The codex-native app-server path does not need --skip-git-repo-check."
+}

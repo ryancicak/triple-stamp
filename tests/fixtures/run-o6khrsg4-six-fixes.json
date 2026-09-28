@@ -1,0 +1,129 @@
+{
+  "source_run": "run-o6khrsg4",
+  "captured_at": "2026-09-11T13:32:00-05:00",
+  "elapsed": "2h13m",
+  "terminal_status": "PIPELINE_VALIDATION_FAILED",
+  "cycles_completed": 4,
+  "retained_generated_route_call_cap": 188,
+  "pre_fix_checked_in_route_call_cap": 160,
+  "post_fix_default_route_call_cap": 84,
+  "post_fix_deep_route_call_cap": 160,
+  "parent_session_id": "retained-parent",
+  "audit_packets": 6,
+  "audit_tools_called_entries": 53,
+  "fabricated_names_asserted_by_judge": [
+    "mcp__slack__search_messages",
+    "mcp__confluence__search",
+    "mcp__safe__list_flags"
+  ],
+  "fabricated_names_present_in_audits": [],
+  "real_tool_names": {
+    "glean": [
+      "mcp__glean__search",
+      "mcp__glean__glean_chat",
+      "mcp__glean__get_document_content",
+      "mcp__glean__summarize_document",
+      "mcp__glean__resolve_go_link"
+    ],
+    "safe": [
+      "mcp__safe__safe_get_service_info",
+      "mcp__safe__safe_read_api_call"
+    ],
+    "confluence": [
+      "mcp__confluence__search_confluence_pages",
+      "mcp__confluence__get_confluence_page_content"
+    ],
+    "jira": [
+      "mcp__jira__jira_read_api_call"
+    ],
+    "slack": [
+      "mcp__slack__slack_read_api_call",
+      "mcp__slack__slack_batch_read_api_call"
+    ]
+  },
+  "reported_aggregate_by_system": {
+    "glean": 34,
+    "safe": 16,
+    "confluence": 13,
+    "jira": 12,
+    "slack": 7
+  },
+  "expected_aggregate_by_system": {
+    "glean": 53,
+    "safe": 23,
+    "confluence": 17,
+    "jira": 25,
+    "slack": 11
+  },
+  "opus_children": [
+    {
+      "title": "audit-cycle-1",
+      "child_session_id": "retained-opus-1",
+      "work_id": "retained-work-1",
+      "assistant_rows": 39,
+      "audit_status": "mechanically_validated",
+      "by_system": {"glean": 6, "safe": 3, "confluence": 3, "jira": 3, "slack": 2}
+    },
+    {
+      "title": "audit-cycle-2",
+      "child_session_id": "retained-opus-2",
+      "work_id": "retained-work-2",
+      "assistant_rows": 57,
+      "audit_status": "form_imperfect",
+      "by_system": {"glean": 14, "safe": 5, "confluence": 3, "jira": 2, "slack": 2}
+    },
+    {
+      "title": "audit-cycle-3",
+      "child_session_id": "retained-opus-3",
+      "work_id": "retained-work-3",
+      "assistant_rows": 43,
+      "audit_status": "mechanically_validated",
+      "by_system": {"glean": 7, "safe": 4, "confluence": 4, "jira": 3, "slack": 1}
+    },
+    {
+      "title": "audit-cycle-3-web-1",
+      "child_session_id": "retained-opus-4",
+      "work_id": "retained-work-4",
+      "assistant_rows": 35,
+      "audit_status": "mechanically_validated",
+      "by_system": {"glean": 7, "safe": 4, "confluence": 3, "jira": 4, "slack": 2}
+    },
+    {
+      "title": "audit-cycle-3-web-2",
+      "child_session_id": "retained-opus-5",
+      "work_id": "retained-work-5",
+      "assistant_rows": 52,
+      "audit_status": "form_imperfect",
+      "by_system": {"glean": 13, "safe": 4, "confluence": 2, "jira": 5, "slack": 3}
+    },
+    {
+      "title": "audit-cycle-4",
+      "child_session_id": "retained-opus-6",
+      "work_id": "retained-work-6",
+      "assistant_rows": 37,
+      "audit_status": "form_imperfect",
+      "by_system": {"glean": 6, "safe": 3, "confluence": 2, "jira": 8, "slack": 1}
+    }
+  ],
+  "observer_bug": {
+    "routing_collection_child_populated": true,
+    "internal_mcp_observation_child_session_id": "",
+    "internal_mcp_observation_status": "not_observed",
+    "internal_mcp_observation_count": null,
+    "opus_effort_observation_child_session_id": "",
+    "opus_effort_observation_status": "not_observed"
+  },
+  "substantive_evidence": {
+    "all_five_families_called": true,
+    "direct_go_links_read": true,
+    "faq_contradiction_found_by_opus": true,
+    "judge_admitted_evidence_well_established": true
+  },
+  "repeated_judgment_gap": {
+    "gap_type": "form",
+    "claim": "internal coverage receipt uses nonexistent tool names",
+    "required_capability": "audit_receipt",
+    "required_source": "observer",
+    "requested_proof": "mechanically validate exact-child tool names"
+  }
+}

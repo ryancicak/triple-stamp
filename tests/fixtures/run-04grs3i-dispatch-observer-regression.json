@@ -1,0 +1,102 @@
+{
+  "sanitized": true,
+  "retained_stage": {
+    "last_collection_title": "judge-cycle-1",
+    "judge_verdict": "NEEDS_INTERNAL",
+    "expected_next_title": "audit-internal-1-1",
+    "expected_next_agent": "opus_auditor"
+  },
+  "internal_mcp_observation": {
+    "available": true,
+    "status": "observed",
+    "count": 19,
+    "by_system": {
+      "glean": 8,
+      "safe": 6,
+      "confluence": 2,
+      "jira": 2,
+      "slack": 1
+    },
+    "call_ids": [
+      "toolu_bdrk_01EE37wLJiFkVZRq5N2SbWvH",
+      "toolu_bdrk_01WnmTEKCjs92U7gH9Tt6E9A",
+      "toolu_bdrk_019kWWbkDXNt4H6goJek4m5q",
+      "toolu_bdrk_01UUXf2LQGUg26MGTh1o79cF",
+      "toolu_bdrk_01LVnVAx1kcNqmqqAxzHiFVU",
+      "toolu_bdrk_019wzZ5eBeiFaEko4aPopddh",
+      "toolu_bdrk_017PQeiPs354QMhXkRTKqngy",
+      "toolu_bdrk_01DxqLKsPKZR3pCUQ5sq4J5z",
+      "toolu_bdrk_01EE2R2YEgdLh9sXPo9Yvkpf",
+      "toolu_bdrk_01XFYEV2UrFR2xfCEEyyz4nx",
+      "toolu_bdrk_01Y5PvEDKkyLz9NbxVmGDSdm",
+      "toolu_bdrk_015fUdwv3pnPLNV9ZLK6Bjk6",
+      "toolu_bdrk_01CJG1tFw6C11L547KjM9mgX",
+      "toolu_bdrk_01DQTetSwvZKi56JfVRdCnwk",
+      "toolu_bdrk_01R48SX5GZv8M9Dcg3KcNTjq",
+      "toolu_bdrk_01AWhS6fgGfb3Sqmy76h8XRU",
+      "toolu_bdrk_01TzJCcHiW89ikPZpWiR2Tbc",
+      "toolu_bdrk_01E6rcmkx5LiMjkEYdo8AGZM",
+      "toolu_bdrk_015GQTfEdJXdTzts9QVtFKiv"
+    ]
+  },
+  "opus_effort_observation": {
+    "status": "observed",
+    "outcome": "all_max",
+    "expected": "max",
+    "values": [
+      "max"
+    ],
+    "compliant": true,
+    "assistant_rows": 43
+  },
+  "audit": {
+    "verdict": "FAIL",
+    "needs_web": true,
+    "audit_status": "mechanically_validated",
+    "tool_claims_validated": true,
+    "internal_sources_count": 11,
+    "internal_coverage": {
+      "glean": {
+        "status": "evidence_found",
+        "routes": [
+          "native",
+          "glean_facet"
+        ]
+      },
+      "jira": {
+        "status": "evidence_found",
+        "routes": [
+          "native"
+        ]
+      },
+      "slack": {
+        "status": "evidence_found",
+        "routes": [
+          "native",
+          "glean_facet"
+        ]
+      },
+      "confluence": {
+        "status": "evidence_found",
+        "routes": [
+          "native",
+          "glean_facet"
+        ]
+      },
+      "safe": {
+        "status": "evidence_found",
+        "routes": [
+          "native"
+        ]
+      }
+    }
+  },
+  "ledger_failure": {
+    "pattern_before": "audit-internal-([1-4])-[1-2]",
+    "pattern_after": "audit-internal-([1-4])-([1-2])",
+    "exception": "IndexError",
+    "dispatch_was_native": true,
+    "durable_dispatch_recorded": false,
+    "terminal_reason": "supervisor attempted sys_session_send but no matching durable dispatch exists for audit-internal-1-1"
+  }
+}

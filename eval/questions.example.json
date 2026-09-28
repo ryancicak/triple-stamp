@@ -1,0 +1,10 @@
+[
+  {
+    "label": "lakebase-limits",
+    "question": "A customer is sizing Databricks Lakebase. What are the current documented limits for a Lakebase database: maximum storage, maximum connections, supported PostgreSQL versions, and the largest compute size? Cite the current official Databricks documentation, and call out anything that differs between the Provisioned and Autoscaling offerings."
+  },
+  {
+    "label": "lakebase-replicas",
+    "question": "What is the current status of cross-region read replicas for Databricks Lakebase? Separate what is publicly documented today from anything Databricks has shared internally about plans or timing, and cite both."
+  }
+]
