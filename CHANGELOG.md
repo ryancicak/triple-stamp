@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.2.1 (2026-09-28)
+
+A run without a usage add-on no longer mentions one.
+
+### Fixes
+
+- **No add-on, no mention.** In a run without a usage add-on, the research stage read Triple-stamp's own docs in the workspace and reported that the add-on was not installed, Opus sometimes listed the missing tool in its audit, and once the judge repeated it in the answer's notes. Cursor now leaves account usage to the audit stage, Opus never mentions a missing usage tool, and without an add-on the judge never mentions the tool or an add-on in the answer or its notes. v1.2.0 has this bug. Runs with an add-on work as before.
+
+### Verification
+
+- **v1.2.0 as published:** from fresh clones of this repository, 12 account usage questions in four rounds, with and without the add-on, each with and without a voice profile. With the add-on, 6 of 6 stamped and passed every check. Without it, 5 of 6 stamped, and the sixth hit the 15-minute research limit. One stamped answer's notes said the add-on was missing, and three of the six questions mentioned it in their stage packets.
+- **This fix:** without the add-on, with and without a voice profile, 6 of 6 stamped and passed every check, and no dossier mentions the usage tool or an add-on anywhere, stage packets included. One question whose judge failed to start was asked again. With the add-on and a voice profile, 3 of 3 stamped, and the usage figures came from observed calls. On one question the usage query ran past its time limit, and Opus answered from the other sources and said so.
+- **Regression suite:** 480 tests pass on Omnigent 0.14.0 and 0.12.0.
+- **Fresh install:** `./triple-stamp --self-test` passes on a new clone, normally and public-only.
+
+### Known limitations
+
+- With a short-lived model login, a session left open for more than about an hour can lose it, and the question in progress then stops. Type `/quit` and start `./triple-stamp` again. The usage login has the same limit: after about an hour, Opus answers from the other sources.
+- A question whose web research is still running after 15 minutes, or whose judge fails to start, ends without an answer instead of retrying. Ask it again.
+
+### For maintainers
+
+- The contract tests require the three new rules, so a prompt edit cannot drop them silently.
+
 ## v1.2.0 (2026-09-28)
 
 Account answers can now start from what the customer actually runs, through a usage add-on that stays on your Mac, and Opus is read-only again on Omnigent 0.14.
