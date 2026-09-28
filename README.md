@@ -114,6 +114,21 @@ Ask your question in either one. Type `/quit` to stop the run and clean up.
 
 <sub>A real run takes about 15 minutes to an hour. Opus's internal audit is slow on purpose. Each stage shows one plain progress line as it starts, such as `Step 2 of 3: auditing the research against internal sources (audit-cycle-1)`.</sub>
 
+## Make it sound like you
+
+The answer does not have to sound like generic AI prose. Triple-stamp can render it in your saved voice profile: your cadence, level of detail, and preferred phrasing.
+
+```bash
+export TRIPLE_STAMP_VOICE_PROFILE="$HOME/path/to/your-voice-profile.md"
+./triple-stamp
+```
+
+Set the variable to an absolute path to a non-empty UTF-8 Markdown file. Codex reads that exact file on every run. Leave the variable unset for plain professional prose.
+
+The profile changes how the supported answer is written, not what counts as evidence. Codex re-checks the wording against the packets before it can stamp the answer.
+
+Use [`tests/fixtures/example-voice-profile.md`](tests/fixtures/example-voice-profile.md) as a starting point.
+
 ## Current-source research by default
 
 Triple-stamp treats the run date as part of every research request. Cursor
@@ -160,21 +175,6 @@ only the add-on's SELECT queries, with the account name bound as a parameter.
 The add-on folder sits outside every checkout, so an add-on never lands in a
 commit. Without one, and in public-only runs, everything works as before. To
 write an add-on, see [docs/usage-add-on.md](docs/usage-add-on.md).
-
-## Make it sound like you
-
-The answer does not have to sound like generic AI prose. Triple-stamp can render it in your saved voice profile: your cadence, level of detail, and preferred phrasing.
-
-```bash
-export TRIPLE_STAMP_VOICE_PROFILE="$HOME/path/to/your-voice-profile.md"
-./triple-stamp
-```
-
-Set the variable to an absolute path to a non-empty UTF-8 Markdown file. Codex reads that exact file on every run. Leave the variable unset for plain professional prose.
-
-The profile changes how the supported answer is written, not what counts as evidence. Codex re-checks the wording against the packets before it can stamp the answer.
-
-Use [`tests/fixtures/example-voice-profile.md`](tests/fixtures/example-voice-profile.md) as a starting point.
 
 ## Your answers are kept
 
