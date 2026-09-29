@@ -74,9 +74,9 @@ It never uses `sudo`, replaces another Omnigent installation, or silently
 substitutes a cheaper model. Setup is idempotent, so every later run quickly
 re-verifies the same invariants and starts.
 
-On a Databricks SA laptop, existing managed Claude/Codex routing and credentials
-are detected and preserved. On a vanilla Mac, the three public account logins
-are used. Either way, the command is still just `./triple-stamp`.
+If your Claude and Codex already use a managed setup, it is detected and kept.
+Otherwise the three public account logins are used. Either way, the command is
+still just `./triple-stamp`.
 
 The account must actually include Cursor Grok 4.6 Extra High, Claude Opus 5, and
 the configured Codex model. A script can install software and open login pages;
