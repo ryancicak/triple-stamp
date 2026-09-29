@@ -23,7 +23,7 @@ from urllib.parse import unquote
 
 _CURSOR_COMPLETION_STABLE_S = 2.0
 _CURSOR_STAGE_INACTIVITY_S = 5 * 60
-_CURSOR_STAGE_ABSOLUTE_S = 15 * 60
+_CURSOR_STAGE_ABSOLUTE_S = 20 * 60
 _CURSOR_POST_CLAIM_S = 30.0
 _INBOX_TIME_CONTRACT_S = 5.0
 # Longest a read may park on a live dispatch; must stay below the client's

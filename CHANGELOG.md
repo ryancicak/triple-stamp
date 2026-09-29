@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Web research gets 20 minutes instead of 15.** Research usually finishes within 9 minutes, but with several runs at once a few stages took 14 to 15 minutes and two hit the limit, which ended their questions. Research that goes quiet is still stopped after 5 minutes without output.
+
 ## v1.2.1 (2026-09-28)
 
 A run without a usage add-on no longer mentions one.

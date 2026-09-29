@@ -715,7 +715,8 @@ class CursorLifecycleTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            old_ns = time.time_ns() - 16 * 60 * 1_000_000_000
+            # One minute past the absolute limit, whatever it is set to.
+            old_ns = time.time_ns() - (lifecycle._CURSOR_STAGE_ABSOLUTE_S + 60) * 1_000_000_000
 
             def age(
                 generation: dict[str, object],
@@ -1374,7 +1375,7 @@ class CursorLifecycleTests(unittest.TestCase):
 
     def test_inbox_time_contract_is_far_below_transport_timeout(self) -> None:
         self.assertEqual(lifecycle._CURSOR_STAGE_INACTIVITY_S, 5 * 60)
-        self.assertEqual(lifecycle._CURSOR_STAGE_ABSOLUTE_S, 15 * 60)
+        self.assertEqual(lifecycle._CURSOR_STAGE_ABSOLUTE_S, 20 * 60)
         contract_seconds = (
             tool_dispatch._drain_inbox.__triple_stamp_inbox_time_contract_s__
         )

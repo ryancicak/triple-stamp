@@ -350,7 +350,7 @@ assert (
     < 420
 )
 assert sitecustomize._CURSOR_STAGE_INACTIVITY_S == 5 * 60
-assert sitecustomize._CURSOR_STAGE_ABSOLUTE_S == 15 * 60
+assert sitecustomize._CURSOR_STAGE_ABSOLUTE_S == 20 * 60
 assert callable(append_dispatch)
 assert callable(read_dispatches)
 assert callable(append_collection)
@@ -838,7 +838,7 @@ def validate_launchers(
         "_cursor_data_root",
         "forwarder-required-after-prior-dispatch",
         "turn_ended_success",
-        "_CURSOR_STAGE_ABSOLUTE_S = 15 * 60",
+        "_CURSOR_STAGE_ABSOLUTE_S = 20 * 60",
         "_CURSOR_PARENT_WAKE_MAX_ATTEMPTS = 5",
         "_CURSOR_PARENT_WAKE_DEADLINE_S = 180.0",
         "await asyncio.wait_for(",
