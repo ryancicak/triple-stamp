@@ -4,10 +4,10 @@
 namespaces:
   public_anthropic:
     supervisor: claude-sonnet-4-6
-    opus_auditor: claude-opus-5
+    opus_auditor: claude-opus-5-5
   databricks_gateway:
     supervisor: "system.ai.claude-sonnet-4-6[1m]"
-    opus_auditor: "system.ai.claude-opus-5[1m]"
+    opus_auditor: "system.ai.claude-opus-5-5[1m]"
 
 profiles:
   # Plain launchers may still be externally routed through the Databricks
@@ -17,5 +17,5 @@ profiles:
   # Preserve the existing Isaac/Databricks launch profile exactly.
   databricks:
     supervisor: "system.ai.claude-sonnet-4-6[1m]"
-    opus_auditor: "system.ai.claude-opus-5[1m]"
+    opus_auditor: "system.ai.claude-opus-5-5[1m]"
     codex_judge: gpt-5.6-sol

@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-OPUS_MODEL = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5")
+OPUS_MODEL = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5-5")
 OPUS_MCP_NAMES = ("glean", "slack", "confluence", "jira", "safe")
 OPUS_STARTUP_ENV = {
     # Claude Code 2.1.263 documents these controls. They disable background

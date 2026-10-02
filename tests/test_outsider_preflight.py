@@ -105,8 +105,8 @@ class MessageContentTests(unittest.TestCase):
         block = preflight.format_block(self.by_key["claude"])
         self.assertIn("curl -fsSL https://claude.ai/install.sh | bash", block)
         self.assertIn("claude", block)
-        self.assertIn("Claude Opus 5", block)
-        self.assertIn("claude-opus-5", block)
+        self.assertIn("Claude Opus 5.5", block)
+        self.assertIn("claude-opus-5-5", block)
 
     def test_codex_block_names_install_login_and_model(self) -> None:
         block = preflight.format_block(self.by_key["codex"])

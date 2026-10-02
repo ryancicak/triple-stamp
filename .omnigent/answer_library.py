@@ -31,7 +31,7 @@ _TERMINALS = (
 )
 _WORKERS = {
     "cursor_workhorse": "Cursor (Grok 4.6 Extra High)",
-    "opus_auditor": "Opus 5 (max effort)",
+    "opus_auditor": "Opus 5.5 (max effort)",
     "codex_judge": "Codex (GPT-5.6 Sol, ultra)",
 }
 _VERDICT_LINES = {

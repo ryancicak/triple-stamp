@@ -249,7 +249,7 @@ class CursorStartupTests(unittest.TestCase):
                             "system.ai.claude-sonnet-4-6[1m]"
                         ),
                         "TRIPLE_STAMP_OPUS_MODEL": (
-                            "system.ai.claude-opus-5[1m]"
+                            "system.ai.claude-opus-5-5[1m]"
                         ),
                         "TRIPLE_STAMP_CODEX_MODEL": "gpt-5.6-sol",
                     },

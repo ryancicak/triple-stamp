@@ -150,7 +150,7 @@ class ModelResolutionTests(unittest.TestCase):
         self.assertEqual(
             models["supervisor"], "system.ai.claude-sonnet-4-6[1m]"
         )
-        self.assertEqual(models["opus_auditor"], "system.ai.claude-opus-5[1m]")
+        self.assertEqual(models["opus_auditor"], "system.ai.claude-opus-5-5[1m]")
         self.assertEqual(namespace, "databricks_gateway")
         self.assertEqual(reason, "configured mapping")
 
@@ -172,7 +172,7 @@ class ModelResolutionTests(unittest.TestCase):
                     "system.ai.claude-sonnet-4-6[1m]",
                 )
                 self.assertEqual(
-                    models["opus_auditor"], "system.ai.claude-opus-5[1m]"
+                    models["opus_auditor"], "system.ai.claude-opus-5-5[1m]"
                 )
                 self.assertEqual(namespace, "databricks_gateway")
                 self.assertNotIn("redacted", reason)
@@ -186,7 +186,7 @@ class ModelResolutionTests(unittest.TestCase):
             managed_environment={},
         )
         self.assertEqual(models["supervisor"], "claude-sonnet-4-6")
-        self.assertEqual(models["opus_auditor"], "claude-opus-5")
+        self.assertEqual(models["opus_auditor"], "claude-opus-5-5")
         self.assertEqual(namespace, "public_anthropic")
         self.assertIn("no gateway routing signal", reason)
 
@@ -246,7 +246,7 @@ class ModelResolutionTests(unittest.TestCase):
         self.assertNotIn("OMNIGENT_CLAUDE_LAUNCHER", runtime)
         self.assertEqual(
             runtime["TRIPLE_STAMP_OPUS_MODEL"],
-            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5-5[1m]",
         )
         self.assertEqual(
             runtime["TRIPLE_STAMP_CLAUDE_NAMESPACE"], "databricks_gateway"
@@ -346,7 +346,7 @@ class ModelResolutionTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["profiles"]["databricks"]["opus_auditor"],
-            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5-5[1m]",
         )
         text = (ROOT / ".omnigent/provider-models.yaml").read_text(
             encoding="utf-8"

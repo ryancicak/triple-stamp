@@ -78,7 +78,7 @@ If your Claude and Codex already use a managed setup, it is detected and kept.
 Otherwise the three public account logins are used. Either way, the command is
 still just `./triple-stamp`.
 
-The account must actually include Cursor Grok 4.6 Extra High, Claude Opus 5, and
+The account must actually include Cursor Grok 4.6 Extra High, Claude Opus 5.5, and
 the configured Codex model. A script can install software and open login pages;
 it cannot grant model entitlements. Missing entitlement therefore fails closed
 with the exact account/model that needs attention.

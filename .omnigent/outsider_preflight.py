@@ -13,7 +13,7 @@ Scope and non-goals:
 - No Databricks host, proxy, Isaac, or gateway is referenced anywhere here; this
   is the public, outsider path only.
 - It never weakens a model pin. A CLI that is installed but whose account lacks
-  the pinned entitlement (Cursor Grok 4.6 Extra High, Claude Opus 5, the Codex
+  the pinned entitlement (Cursor Grok 4.6 Extra High, Claude Opus 5.5, the Codex
   model) still fails closed later in ``auth_preflight``, which names the model
   and the login command. This module only covers the earlier "you have not
   installed / logged in this CLI yet" case.
@@ -60,7 +60,7 @@ LOGIN_ARGV = {
 
 
 def _opus_model() -> str:
-    return os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5")
+    return os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5-5")
 
 
 def _codex_model() -> str:
@@ -119,7 +119,7 @@ def tools(home: Path | None = None) -> list[Tool]:
                 Path("/opt/homebrew/bin/claude"),
                 Path("/usr/local/bin/claude"),
             ),
-            model_display="Claude Opus 5",
+            model_display="Claude Opus 5.5",
             model_id=_opus_model(),
             entitlement=(
                 "your Claude account must be entitled to it "

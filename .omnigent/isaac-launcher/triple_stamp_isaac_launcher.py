@@ -52,7 +52,7 @@ _OPUS_AUDITOR_PROMPT_MARKER = "You are the auditor. You do not trust the workhor
 _SUPERVISOR_MODEL = os.environ.get(
     "TRIPLE_STAMP_SUPERVISOR_MODEL", "claude-sonnet-4-6"
 )
-_OPUS_MODEL = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5")
+_OPUS_MODEL = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5-5")
 _CODEX_MODEL = os.environ.get("TRIPLE_STAMP_CODEX_MODEL", "gpt-5.6-sol")
 _OPUS_ALLOWED_TOOLS = READ_ONLY_ALLOWED_TOOLS
 _OPUS_MCP_NAMES = OPUS_MCP_NAMES
@@ -237,6 +237,21 @@ def _has_incomplete_stream_marker(text: object) -> bool:
     return any(marker in lowered for marker in _TRANSIENT_OPUS_STREAM_MARKERS)
 
 
+def _has_gateway_timeout_cancel_marker(text: object) -> bool:
+    """Recognize the gateway's provider-timeout cancellation envelope."""
+
+    if not isinstance(text, str) or not text:
+        return False
+    match = re.fullmatch(r"\s*API Error:\s*499\s+(\{.*\})\s*", text, re.I | re.S)
+    if match is None:
+        return False
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return False
+    return payload == {"error_code": "CANCELLED", "message": ""}
+
+
 def _is_transient_opus_stream_error(record: dict[str, Any]) -> bool:
     """Classify one Opus record as a recoverable, transient stream death.
 
@@ -248,9 +263,20 @@ def _is_transient_opus_stream_error(record: dict[str, Any]) -> bool:
     output) is a genuine worker failure and stays terminal.
     """
 
+    if record.get("status") == "cancelled":
+        return False
     fields = ("error", "launch_error", "stream_error")
     if record.get("status") != "completed":
         fields = ("output", *fields)
+    # The Databricks gateway returns this failed-provider envelope when a long
+    # native completion is cancelled at its upstream time limit. Do not apply
+    # it to an explicitly cancelled task: that would relaunch paid work the
+    # user asked to stop.
+    if record.get("status") == "failed" and any(
+        _has_gateway_timeout_cancel_marker(record.get(field))
+        for field in fields
+    ):
+        return True
     return any(
         _has_incomplete_stream_marker(record.get(field))
         for field in fields
@@ -2529,7 +2555,13 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
                 parsed is not None
                 and parsed.kind in _OPUS_AUDIT_KINDS
                 and _is_transient_opus_stream_error(record)
-                and _opus_transient_retry_available(records, parsed.cycle)
+                and (
+                    _opus_transient_retry_available(records, parsed.cycle)
+                    or (
+                        parsed.kind != "audit_retry"
+                        and _opus_transient_retries_used(records, parsed.cycle) > 0
+                    )
+                )
             ):
                 continue
             return True

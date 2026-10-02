@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Opus 5.5 does the audit.** The audit stage now runs Claude Opus 5.5 at max effort instead of Opus 5, so your Claude account must include Claude Opus 5.5. When the model service cancels an Opus 5.5 audit (`API Error: 499`), the question used to end there. That audit now gets one fresh retry, the same as an audit whose response broke off mid-stream.
 - **Web research gets 20 minutes instead of 15.** Research usually finishes within 9 minutes, but with several runs at once a few stages took 14 to 15 minutes and two hit the limit, which ended their questions. Research that goes quiet is still stopped after 5 minutes without output.
 
 ## v1.2.1 (2026-09-28)

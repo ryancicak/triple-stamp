@@ -54,7 +54,7 @@ with mock.patch.dict(
     {
         "TRIPLE_STAMP_PROVIDER": "direct",
         "TRIPLE_STAMP_SUPERVISOR_MODEL": "claude-sonnet-4-6",
-        "TRIPLE_STAMP_OPUS_MODEL": "claude-opus-5",
+        "TRIPLE_STAMP_OPUS_MODEL": "claude-opus-5-5",
         "TRIPLE_STAMP_CODEX_MODEL": "gpt-5.6-sol",
     },
     clear=False,
@@ -388,11 +388,11 @@ class OrchestrationContractTests(unittest.TestCase):
             ROOT / ".omnigent/validate_bundle.py",
         )
         for provider, supervisor, opus in (
-            ("direct", "claude-sonnet-4-6", "claude-opus-5"),
+            ("direct", "claude-sonnet-4-6", "claude-opus-5-5"),
             (
                 "databricks",
                 "system.ai.claude-sonnet-4-6[1m]",
-                "system.ai.claude-opus-5[1m]",
+                "system.ai.claude-opus-5-5[1m]",
             ),
         ):
             with self.subTest(provider=provider):
@@ -418,7 +418,7 @@ class OrchestrationContractTests(unittest.TestCase):
         self.assertNotEqual(cursor_rate, plugin._COST_CEILINGS["unknown"])
         for model, ceiling in (
             ("gpt-5.6-sol", "gpt-5.6-sol"),
-            ("system.ai.claude-opus-5[1m]", "opus"),
+            ("system.ai.claude-opus-5-5[1m]", "opus"),
             ("unrecognized", "unknown"),
         ):
             self.assertEqual(
@@ -2002,7 +2002,7 @@ print("exact temp boundary: PASS")
     def test_generated_cycle_policy_is_table_driven_for_two_and_four(self) -> None:
         models = {
             "supervisor": "claude-sonnet-4-6",
-            "opus_auditor": "claude-opus-5",
+            "opus_auditor": "claude-opus-5-5",
             "codex_judge": "gpt-5.6-sol",
         }
         for cycles, cap, denied_cycle in ((2, 84, 3), (4, 160, 5)):
@@ -3844,7 +3844,7 @@ print("exact temp boundary: PASS")
                     "context": {
                         "usage": {
                             "by_model": {
-                                "system.ai.claude-opus-5[1m]": {
+                                "system.ai.claude-opus-5-5[1m]": {
                                     "input_tokens": 2_000_000,
                                     "output_tokens": 0,
                                 }
@@ -7885,6 +7885,68 @@ print("exact temp boundary: PASS")
             ("dispatch", "opus_auditor", "audit-retry-1-1"),
         )
 
+    def test_gateway_499_timeout_retries_but_user_cancel_does_not(self) -> None:
+        """A failed upstream timeout is recoverable; an explicit cancel is final."""
+
+        base = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1")
+        ]
+        marker = 'API Error: 499 {"error_code":"CANCELLED","message":""}'
+        provider_timeout = {
+            **_route_packet(
+                "opus_auditor",
+                "audit-cycle-1",
+                marker,
+            ),
+            "status": "failed",
+        }
+        route = plugin._next_route([*base, provider_timeout])
+        self.assertEqual(
+            (route.status, route.agent, route.title),
+            ("dispatch", "opus_auditor", "audit-retry-1-1"),
+        )
+        self.assertTrue(
+            plugin._is_transient_opus_stream_error(provider_timeout)
+        )
+
+        user_cancel = {**provider_timeout, "status": "cancelled"}
+        self.assertFalse(plugin._is_transient_opus_stream_error(user_cancel))
+        cancelled = plugin._next_route([*base, user_cancel])
+        self.assertEqual(cancelled.status, "infrastructure_failed")
+        self.assertEqual(cancelled.agent, "")
+
+        # A mid-stream marker that would retry a failed audit does not
+        # relaunch a cancelled one either.
+        stream_cancel = {
+            **user_cancel,
+            "stream_error": (
+                "API Error: Server error mid-response. The response above "
+                "may be incomplete."
+            ),
+        }
+        self.assertTrue(
+            plugin._is_transient_opus_stream_error(
+                {**stream_cancel, "status": "failed"}
+            )
+        )
+        self.assertFalse(plugin._is_transient_opus_stream_error(stream_cancel))
+        self.assertEqual(
+            plugin._next_route([*base, stream_cancel]).status,
+            "infrastructure_failed",
+        )
+
+        failed_retry = {
+            **provider_timeout,
+            "title": "audit-retry-1-1",
+            "child_session_id": "child-audit-retry-1-1",
+            "work_id": "work-audit-retry-1-1",
+        }
+        exhausted = plugin._next_route(
+            [*base, provider_timeout, failed_retry]
+        )
+        self.assertEqual(exhausted.status, "infrastructure_failed")
+        self.assertIn("retries exhausted", exhausted.reason)
+
     def test_completed_retry_audit_routes_like_normal_audit(self) -> None:
         """A completed retry audit judges normally and completes the stage chain."""
 
@@ -7903,6 +7965,12 @@ print("exact temp boundary: PASS")
             (route.agent, route.title), ("codex_judge", "judge-cycle-1")
         )
         self.assertTrue(plugin._has_required_stage_chain(records, 1))
+        with mock.patch.object(
+            plugin, "_completion_records", return_value=records
+        ), mock.patch.object(
+            plugin, "read_attempt_collections", return_value=records
+        ):
+            self.assertFalse(plugin._has_terminal_worker_failure())
         self.assertIsNone(
             runtime_state.parse_dispatch_title("audit-retry-1-2")
         )

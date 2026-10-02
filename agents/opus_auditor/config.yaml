@@ -1,12 +1,12 @@
 spec_version: 1
 name: opus_auditor
 description: >
-  Hostile audit of the Cursor packet. Claude Opus 5 at max effort, launched
+  Hostile audit of the Cursor packet. Claude Opus 5.5 at max effort, launched
   through the active provider profile.
 
 executor:
   type: omnigent
-  model: "claude-opus-5"
+  model: "claude-opus-5-5"
   reasoning_effort: max
   config:
     harness: claude-native

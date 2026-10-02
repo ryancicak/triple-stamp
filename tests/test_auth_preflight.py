@@ -382,13 +382,13 @@ class AuthPreflightTests(unittest.TestCase):
         ):
             error = preflight._claude_model_failure(
                 stage="Claude",
-                model="claude-opus-5",
+                model="claude-opus-5-5",
                 detail="model may not exist",
                 default_remediation="authenticate Claude Code",
             )
-        self.assertIn("attempted 'claude-opus-5'", error.detail)
+        self.assertIn("attempted 'claude-opus-5-5'", error.detail)
         self.assertIn("databricks_gateway", error.detail)
-        self.assertIn("system.ai.claude-opus-5[1m]", error.remediation)
+        self.assertIn("system.ai.claude-opus-5-5[1m]", error.remediation)
         self.assertIn("reauthentication will not fix", error.remediation)
 
     def test_matching_gateway_namespace_retains_access_remediation(self) -> None:
@@ -399,14 +399,14 @@ class AuthPreflightTests(unittest.TestCase):
         ):
             error = preflight._claude_model_failure(
                 stage="Claude",
-                model="system.ai.claude-opus-5[1m]",
+                model="system.ai.claude-opus-5-5[1m]",
                 detail="access denied",
                 default_remediation="verify gateway authentication and access",
             )
         self.assertEqual(
             error.remediation, "verify gateway authentication and access"
         )
-        self.assertIn("system.ai.claude-opus-5[1m]", error.detail)
+        self.assertIn("system.ai.claude-opus-5-5[1m]", error.detail)
 
 
 if __name__ == "__main__":

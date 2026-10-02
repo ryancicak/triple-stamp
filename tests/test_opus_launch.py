@@ -25,9 +25,9 @@ def _load_opus_module(provider: str):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     model = (
-        "system.ai.claude-opus-5[1m]"
+        "system.ai.claude-opus-5-5[1m]"
         if provider == "databricks"
-        else "claude-opus-5"
+        else "claude-opus-5-5"
     )
     with mock.patch.dict(
         os.environ,
@@ -157,10 +157,10 @@ class OpusLaunchTests(unittest.TestCase):
     def test_startup_environment_is_explicit_for_both_profiles(self) -> None:
         direct = _load_opus_module("direct")
         databricks = _load_opus_module("databricks")
-        self.assertEqual(direct.OPUS_MODEL, "claude-opus-5")
+        self.assertEqual(direct.OPUS_MODEL, "claude-opus-5-5")
         self.assertEqual(
             databricks.OPUS_MODEL,
-            "system.ai.claude-opus-5[1m]",
+            "system.ai.claude-opus-5-5[1m]",
         )
         isaac_settings = {
             "ISAAC_DEFAULT_UCODE": "0",

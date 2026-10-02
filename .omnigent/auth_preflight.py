@@ -17,7 +17,7 @@ EXPECTED_CURSOR = "cursor-grok-4.6-xhigh - Grok 4.6 Extra High"
 EXPECTED_SUPERVISOR = os.environ.get(
     "TRIPLE_STAMP_SUPERVISOR_MODEL", "claude-sonnet-4-6"
 )
-EXPECTED_OPUS = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5")
+EXPECTED_OPUS = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5-5")
 EXPECTED_CODEX = os.environ.get("TRIPLE_STAMP_CODEX_MODEL", "gpt-5.6-sol")
 EXPECTED_OPUS_STARTUP_ENV = {
     "DISABLE_AUTOUPDATER": "1",
@@ -75,7 +75,7 @@ def _claude_model_failure(
     namespace = _claude_namespace()
     gateway_forms = {
         "claude-sonnet-4-6": "system.ai.claude-sonnet-4-6[1m]",
-        "claude-opus-5": "system.ai.claude-opus-5[1m]",
+        "claude-opus-5-5": "system.ai.claude-opus-5-5[1m]",
     }
     public_forms = {value: key for key, value in gateway_forms.items()}
     if namespace == "databricks_gateway" and model in gateway_forms:

@@ -1142,6 +1142,54 @@ def validate_launchers(
         "audit-retry-1-1",
     ):
         fail("transient Opus stream death did not resolve to a fresh retry child")
+    gateway_cancel_retry = _next_route(
+        [
+            {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "completed",
+                "output": "cursor packet",
+            },
+            {
+                "agent": "opus_auditor",
+                "title": "audit-cycle-1",
+                "status": "failed",
+                "output": (
+                    'API Error: 499 {"error_code":"CANCELLED",'
+                    '"message":""}'
+                ),
+                "child_session_id": "gateway-cancelled-opus-child",
+            },
+        ]
+    )
+    if (
+        gateway_cancel_retry.status,
+        gateway_cancel_retry.agent,
+        gateway_cancel_retry.title,
+    ) != ("dispatch", "opus_auditor", "audit-retry-1-1"):
+        fail("gateway-cancelled Opus completion did not get one fresh retry")
+    explicit_cancel = _next_route(
+        [
+            {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "completed",
+                "output": "cursor packet",
+            },
+            {
+                "agent": "opus_auditor",
+                "title": "audit-cycle-1",
+                "status": "cancelled",
+                "output": (
+                    'API Error: 499 {"error_code":"CANCELLED",'
+                    '"message":""}'
+                ),
+                "child_session_id": "explicitly-cancelled-opus-child",
+            },
+        ]
+    )
+    if explicit_cancel.status != "infrastructure_failed":
+        fail("explicitly cancelled Opus work was incorrectly relaunched")
     cursor_retry = _next_route(
         [
             {
