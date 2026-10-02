@@ -1,9 +1,35 @@
 # Changelog
 
-## Unreleased
+## v1.2.2 (2026-10-02)
 
-- **Opus 5.5 does the audit.** The audit stage now runs Claude Opus 5.5 at max effort instead of Opus 5, so your Claude account must include Claude Opus 5.5. When the model service cancels an Opus 5.5 audit (`API Error: 499`), the question used to end there. That audit now gets one fresh retry, the same as an audit whose response broke off mid-stream.
+Opus 5.5 does the audit, and an audit the model service cancels gets a second try.
+
+### Changes
+
+- **Opus 5.5 does the audit.** The audit stage now runs Claude Opus 5.5 at max effort instead of Opus 5, so your Claude account must include Claude Opus 5.5. Opus 5.5 thinks longer before it writes: on research questions its final write took 7 to 10 minutes, where Opus 5 took about 3, and a whole audit took 10 to 24 minutes.
 - **Web research gets 20 minutes instead of 15.** Research usually finishes within 9 minutes, but with several runs at once a few stages took 14 to 15 minutes and two hit the limit, which ended their questions. Research that goes quiet is still stopped after 5 minutes without output.
+
+### Fixes
+
+- **A cancelled audit gets one more try.** When the model service cancels an Opus 5.5 audit (`API Error: 499`), the question used to end there. That audit now gets one fresh retry, the same as an audit whose response broke off mid-stream. A question you stop yourself is never retried.
+
+### Verification
+
+- **Live runs:** 6 real questions in three rounds: with a voice profile and without, with a usage add-on and without, and in public-only mode. 5 stamped. The sixth, a public-only question, finished its first cycle and was stopped during its second when the test machine ran low on disk space. The account question that had ended with the 499 stamped in both rounds that asked it, and no audit needed the retry.
+- **Checks:** 3 of the 5 stamped answers passed every check. One account answer had no Salesforce link, named an internal Jira or Slack item without its link, and did not cite the usage lookup Opus ran; Opus 5 also left that lookup uncited on the same question. An arithmetic answer missed the eval's word-overlap topic check.
+- **Regression suite:** 481 tests pass on Omnigent 0.14.0 and 0.12.0.
+- **Fresh install:** `./triple-stamp --self-test` passes on new clones, one of them in a folder whose path has a space and one cloned from this repository, normally and public-only.
+
+### Known limitations
+
+- With a short-lived model login, a session left open for more than about an hour can lose it, and the question in progress then stops. Type `/quit` and start `./triple-stamp` again. The usage login has the same limit: after about an hour, Opus answers from the other sources.
+- A question whose web research is still running after 20 minutes, or whose judge fails to start, ends without an answer instead of retrying. Ask it again.
+- An audit gets one retry per cycle. If the model service cancels it twice, the question ends. Ask it again.
+- In a folder whose path contains a space, setup installs the newest compatible packages instead of the tested set. The self-test still passed that way.
+
+### For maintainers
+
+- The retry matches only a failed audit whose output or error is exactly the 499 cancellation envelope. A task the user cancelled is never relaunched, and an audit recovered by its retry no longer counts as a failed worker. The contract tests pin all three, and the bundle validator also checks the first two at startup.
 
 ## v1.2.1 (2026-09-28)
 

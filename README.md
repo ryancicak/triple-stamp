@@ -9,7 +9,7 @@
   Add a saved voice profile and Codex can make it sound like you, then re-check the claims against the packets.
 </p>
 
-<p align="center"><sub><b>v1.2.1</b> · <a href="CHANGELOG.md">What's new</a></sub></p>
+<p align="center"><sub><b>v1.2.2</b> · <a href="CHANGELOG.md">What's new</a></sub></p>
 
 <br>
 
