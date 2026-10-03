@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.2.3 (2026-10-02)
+
+`./triple-stamp` starts again after Claude Code's managed login changed, and a new install in a folder with a space gets the tested packages.
+
+### Fixes
+
+- **Starts with any Claude Code login command.** After Claude Code's managed login command changed, `./triple-stamp` stopped at startup with `managed Claude apiKeyHelper is unavailable or has an unexpected shape`, because it accepted only the old command. It now runs whatever login command Claude Code is set to use, the way Claude Code runs it, and a real Claude call inside the run's sandbox still proves the login before any question. If the command fails, Triple-stamp tries one silent token refresh where the login tool has one and never opens a browser. If that does not help, it stops with the command's own reason and the one command that signs you in. A command that hangs is not run again. v1.2.2 has this bug.
+- **`--self-test` passes with a voice profile set.** With `TRIPLE_STAMP_VOICE_PROFILE` set, `./triple-stamp --self-test` failed three regression tests that did not expect a voice profile. Only those tests changed; questions were never affected. v1.2.2 has this bug.
+- **A folder with a space gets the tested packages.** uv splits a constraint file's path at spaces, so a new install in a folder like `My Projects` got the newest compatible packages instead of the tested set. It now gets the tested set, like every other folder. v1.2.2 has this bug.
+
+### Verification
+
+- **Live runs:** Two rounds of two real questions each, one with a voice profile from a plain Terminal and one without. Both rounds started with the new login command, passed the sandbox's Claude and Codex checks, and finished web research on all four questions. The first answer to finish stamped, in the saved voice; the other three were still in their audits at release time. An existing install updated in place also started with a voice profile.
+- **Regression suite:** 486 tests pass on Omnigent 0.14.0 and 0.12.0, with and without a voice profile set, and public-only.
+- **Fresh install:** `./triple-stamp --self-test` passes on new clones with and without a voice profile and public-only, both in a folder whose path has a space, now with exactly the tested packages, and from a plain Terminal environment, which finds the model gateway in Claude Code's managed settings. A new Omnigent 0.12.0 install in a folder with a space also gets exactly its tested packages and passes with a voice profile.
+
+### Known limitations
+
+- With a short-lived model login, a session left open for more than about an hour can lose it, and the question in progress then stops. Type `/quit` and start `./triple-stamp` again. The usage login has the same limit: after about an hour, Opus answers from the other sources.
+- If the model login has less than 45 minutes left at startup and its login tool does not renew it yet, the run starts with a warning, and a long question may stop when the login expires.
+- A question whose web research is still running after 20 minutes, or whose judge fails to start, ends without an answer instead of retrying. Ask it again.
+- An audit gets one retry per cycle. If the model service cancels it twice, the question ends. Ask it again.
+
+### For maintainers
+
+- The launcher no longer parses Claude Code's managed `apiKeyHelper`. It runs the command with `/bin/sh -c` and your real home, as Claude Code does, and keeps only a printed token of at least 20 characters. Stand-in login commands in the unit tests cover the managed command of 2026-10-02 character for character, the earlier command in any argument order or found on `PATH`, a path with a space, a pipeline, and commands that fail, hang, or return a nearly expired token.
+- `--self-test` runs the suite in your own environment, so the tests that build voice-dependent handoffs now turn the voice profile off for themselves.
+- The bootstrap tests' stand-in uv splits a `--constraint` path at spaces, as uv 0.11 does, so the tested-set install is checked from a folder with a space.
+
 ## v1.2.2 (2026-10-02)
 
 Opus 5.5 does the audit, and an audit the model service cancels gets a second try.
