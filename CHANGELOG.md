@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.2.4 (2026-10-03)
+
+A public-only run stays public: Opus no longer reaches for internal tools it does not have, a question that needs internal evidence ends without an extra audit, and the judge's Codex starts no MCP servers.
+
+### Fixes
+
+- **Public-only audits stop reaching for internal tools.** With `TRIPLE_STAMP_INTERNAL_SOURCES=off`, Opus was still told to try ToolSearch twice for each of Glean, Jira, Slack, Confluence, and SAFE. A public-only run has no such tools, so Opus wrote the calls out as text instead, and two audits kept repeating them for about 19 minutes until they hit the output limit. Opus is now told that the run has no internal system. It makes no tool call and records each system as not configured. v1.2.3 has this bug.
+- **A public-only question that needs internal evidence ends without an extra audit.** When the judge asked for internal evidence in a public-only run, the supervisor started one more Opus audit anyway. That audit had nothing to search. It added about 10 minutes, and in one run it went silent for 10 minutes and failed. That audit is now refused, and the answer arrives right after the judge with a single gap line: it uses public sources only, so it could not check internal plans or records. v1.2.3 has this bug.
+- **The judge's Codex starts no MCP servers in a public-only run.** Public-only mode removed the MCP servers only from Opus's settings, so the judge's Codex still started every MCP server in your Codex settings. The run's private copy of those settings now has none. Your own settings are not changed. v1.2.3 has this bug.
+- **An answer without the stamp ends with its gap list.** Such an answer used to close with "These gaps are explicit because the completed evidence did not support final quality approval." It now ends with its list of remaining evidence gaps. v1.2.3 has this bug.
+
+### Verification
+
+- **Live runs:** 5 real questions in two rounds from new clones, with a voice profile and without. Public-only, a question the public documentation answers stamped in 16 minutes. A question about internal plans, asked with a voice profile and without, ended in 14 and 15 minutes with the single public-only gap line and cost at most $18.24; in v1.2.3 the same question took up to 49 minutes and $32.52. In every public-only audit, Opus made no tool call and recorded each internal system as not configured, and the judge's Codex had no MCP servers. With internal systems, two account questions stamped and passed every check, one with a voice profile and the usage add-on and one with neither. Their audits searched every configured internal system, and when a judge asked for more internal evidence, a second audit still ran, as before.
+- **Regression suite:** 492 tests pass on Omnigent 0.14.0 and 0.12.0, with and without a voice profile set, and public-only.
+- **Fresh install:** `./triple-stamp --self-test` passes from a plain Terminal environment on three new clones, one in a folder whose path has a space and one cloned from this repository over HTTPS, each with and without a voice profile and public-only. Each new install got exactly the tested packages.
+
+### Known limitations
+
+- With a short-lived model login, a session left open for more than about an hour can lose it, and the question in progress then stops. Type `/quit` and start `./triple-stamp` again. The usage login has the same limit: after about an hour, Opus answers from the other sources.
+- If the model login has less than 45 minutes left at startup and its login tool does not renew it yet, the run starts with a warning, and a long question may stop when the login expires.
+- A question whose web research is still running after 20 minutes, or whose judge fails to start, ends without an answer instead of retrying. Ask it again.
+- An audit gets one retry per cycle. If the model service cancels it twice, the question ends. Ask it again.
+
+### For maintainers
+
+- In a public-only run, every Opus audit except a format repair gets a `[System-authoritative Opus launch context]` block in its handoff. Coverage receipts accept the new status `not_configured`, with empty `routes`, `tools_called`, and `queries`, only for a system missing from the run's configured list. The judge reads that status the same way, and it never by itself requires NEEDS_INTERNAL.
+- `supervisor_contract` denies an `audit-internal-*` dispatch when the run is public-only and `_next_route` already ends the question best-effort with the reason `no internal system is configured for this run`. The supervisor prompt says the same, the refused stage shows no progress line, and the continuation guard then returns the bounded answer instead of an infrastructure error. A fresh audit that repairs an Opus ledger naming tools it never called still runs.
+- `_drop_codex_mcp_servers` removes the `mcp_servers` tables and root-level `mcp_servers` keys from the run's copy of `.codex/config.toml`, keeps every other line as written, and stops the launch unless the result parses to the same settings minus `mcp_servers`.
+
 ## v1.2.3 (2026-10-02)
 
 `./triple-stamp` starts again after Claude Code's managed login changed, and a new install in a folder with a space gets the tested packages.

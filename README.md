@@ -9,7 +9,7 @@
   Add a saved voice profile and Codex can make it sound like you, then re-check the claims against the packets.
 </p>
 
-<p align="center"><sub><b>v1.2.3</b> · <a href="CHANGELOG.md">What's new</a></sub></p>
+<p align="center"><sub><b>v1.2.4</b> · <a href="CHANGELOG.md">What's new</a></sub></p>
 
 <br>
 
@@ -198,7 +198,7 @@ Opus searches the internal systems in your Claude Code MCP settings: Glean, Jira
 claude mcp add --scope user safe -- dbexec repo run mcp start-single safe
 ```
 
-For a public-only run, the same view someone outside Databricks gets, start it with `TRIPLE_STAMP_INTERNAL_SOURCES=off ./triple-stamp`. Your own Claude settings are not changed.
+For a public-only run, the same view someone outside Databricks gets, start it with `TRIPLE_STAMP_INTERNAL_SOURCES=off ./triple-stamp`. Your own Claude and Codex settings are not changed.
 
 You do not need Glean to run Triple-stamp. There is one catch, and it is on purpose. If a question needs internal evidence and Glean is set up but never answers, the run ends unstamped instead of guessing. You still get the best answer the evidence supports, with the missing pieces named, but it does not carry the stamp.
 
