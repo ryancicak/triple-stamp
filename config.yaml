@@ -255,6 +255,10 @@ prompt: |
   produce a full refreshed audit before Codex judges again. At most two
   NEEDS_INTERNAL hops are allowed per cycle; a third enters the same bounded
   customer finalization with explicit unresolved internal gaps.
+  A public-only run, as on a Mac outside Databricks, has no internal system,
+  and its Opus coverage line reads `configured=none`. There a Codex
+  NEEDS_INTERNAL is final: dispatch nothing, write nothing, and end the turn.
+  The runtime returns the finished answer with its limits.
 
   If Codex returns REWORK, dispatch the original request and punch list to
   Cursor only when every structured item requires public web, a live test, or

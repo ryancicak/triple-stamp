@@ -502,9 +502,15 @@ def _progress_note(
 ) -> str:
     """Return the canonical content-free status for a stage starting now."""
 
-    del announced, parent_session_id
-    from triple_stamp_isaac_launcher import supervisor_progress_message
+    del announced
+    from triple_stamp_isaac_launcher import (
+        _public_only_reaudit,
+        supervisor_progress_message,
+    )
 
+    if _public_only_reaudit(title, parent_session_id):
+        # The supervisor contract refuses this dispatch; the stage never starts.
+        return ""
     return supervisor_progress_message(agent, title)
 
 
@@ -735,6 +741,7 @@ def install_supervisor_continuation_guard() -> None:
     )
     from triple_stamp_isaac_launcher import (
         _INFRA_PREFIX,
+        _NO_INTERNAL_SYSTEMS_REASON,
         _Route,
         _failure_metrics,
         _best_effort_answer,
@@ -1138,6 +1145,13 @@ def install_supervisor_continuation_guard() -> None:
                         # stale for this one mechanically retryable transport
                         # failure. Continue into the bounded deterministic
                         # dispatch path instead of accepting or surfacing it.
+                        response = ""
+                    elif (
+                        str(getattr(route, "reason", "") or "")
+                        == _NO_INTERNAL_SYSTEMS_REASON
+                    ):
+                        # A public-only run's refused internal re-audit is not
+                        # a failure: the run ends with its bounded answer below.
                         response = ""
                     else:
                         _record(

@@ -318,6 +318,81 @@ class InstallPortabilityTests(unittest.TestCase):
                     catalog,
                 )
 
+    def test_public_only_run_gives_codex_no_mcp_servers(self) -> None:
+        """2026-10-03: public-only judges still started Glean, Slack, and Jira."""
+
+        tables = (
+            'model_provider = "example"\n'
+            "# the judge's provider\n"
+            "[model_providers.example]\n"
+            'base_url = "https://example.invalid/v1"\n'
+            "\n"
+            "[mcp_servers.glean]\n"
+            'command = "dbexec"\n'
+            "args = [\n"
+            '  "glean",\n'
+            "]\n"
+            "[mcp_servers.glean.env]\n"
+            'TOKEN = "x"\n'
+            "[ \"mcp_servers\" . 'slack' ]  # quoted\n"
+            'command = "dbexec"\n'
+            "[[mcp_servers.extra]]\n"
+            'name = "x"\n'
+            "[tui]\n"
+            'theme = "dark"\n'
+        )
+        dotted = 'mcp_servers.glean.command = "dbexec"\nmodel = "m"\n[tui]\nx = 1\n'
+        for value, text, kept in (
+            (
+                "off",
+                tables,
+                {
+                    "model_provider": "example",
+                    "model_providers": {
+                        "example": {"base_url": "https://example.invalid/v1"}
+                    },
+                    "tui": {"theme": "dark"},
+                },
+            ),
+            ("off", dotted, {"model": "m", "tui": {"x": 1}}),
+            ("", tables, None),
+        ):
+            with self.subTest(value=value, text=text[:20]), tempfile.TemporaryDirectory() as root:
+                base = Path(root)
+                real_home = base / "real-home"
+                (real_home / ".codex").mkdir(parents=True)
+                (real_home / ".codex/config.toml").write_text(text, encoding="utf-8")
+                with mock.patch.dict(
+                    os.environ, {launcher.INTERNAL_SOURCES_ENV: value}
+                ), mock.patch.object(launcher, "_eprint"):
+                    launcher._seed_isolated_home(
+                        ROOT, real_home, base / "isolated", base / "python"
+                    )
+                seeded = (base / "isolated/.codex/config.toml").read_text(encoding="utf-8")
+                if kept is None:
+                    self.assertEqual(seeded, text)
+                else:
+                    self.assertEqual(launcher.tomllib.loads(seeded), kept)
+                    self.assertNotIn("mcp_servers", seeded)
+                if text is tables and kept is not None:
+                    # Every kept line is the user's own line, comments included.
+                    self.assertIn("# the judge's provider\n", seeded)
+                self.assertEqual(
+                    (real_home / ".codex/config.toml").read_text(encoding="utf-8"), text
+                )
+
+        # A header-like line inside a string cannot be removed safely: fail closed.
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "config.toml"
+            config.write_text(
+                '[mcp_servers.glean]\nnote = """\n[tui]\n"""\ncommand = "dbexec"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {launcher.INTERNAL_SOURCES_ENV: "off"}):
+                with self.assertRaises(launcher.LaunchError) as raised:
+                    launcher._drop_codex_mcp_servers(config)
+            self.assertIn("could not remove the MCP servers", str(raised.exception))
+
     def test_shell_launcher_uses_bootstrapped_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)

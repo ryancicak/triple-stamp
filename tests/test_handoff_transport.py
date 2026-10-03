@@ -214,6 +214,45 @@ class HandoffInputTests(unittest.TestCase):
 
         self.assertEqual(result["args"], {"input": "judge"})
 
+    def test_public_only_opus_audit_is_told_it_has_no_tools(self) -> None:
+        """2026-10-03: public-only audits wrote ToolSearch calls out as text.
+
+        Two of three repeated them until the 128,000-token output cap.
+        """
+
+        def handoff(agent: str, title: str, servers: dict[str, object] | None) -> str:
+            with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+                os.environ, {"TRIPLE_STAMP_RUN_DIR": value}
+            ):
+                if servers is not None:
+                    (Path(value) / "opus-mcp.json").write_text(
+                        json.dumps({"mcpServers": servers}), encoding="utf-8"
+                    )
+                args = lifecycle._runtime_handoff(
+                    {"agent": agent, "title": title, "args": "audit this"},
+                    agent=agent,
+                    title=title,
+                    parent_session_id=PARENT,
+                    read_attempt_collections=lambda **_kwargs: [],
+                )["args"]
+            return args["input"] if isinstance(args, dict) else args
+
+        notice = lifecycle._PUBLIC_ONLY_OPUS_CONTEXT
+        for title in ("audit-cycle-1", "audit-retry-1-1", "audit-internal-1-1"):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    handoff("opus_auditor", title, {}), f"audit this\n\n{notice}"
+                )
+        for agent, title, servers in (
+            ("opus_auditor", "audit-cycle-1", None),
+            ("opus_auditor", "audit-cycle-1", {"glean": {}}),
+            ("opus_auditor", "audit-format-repair-1", {}),
+            ("cursor_workhorse", "cursor-cycle-1", {}),
+            ("codex_judge", "judge-cycle-1", {}),
+        ):
+            with self.subTest(agent=agent, title=title, servers=servers):
+                self.assertNotIn(notice, handoff(agent, title, servers))
+
 
 class StagePacketTests(unittest.TestCase):
     def test_first_audit_receives_only_the_exact_stage1_packet(self) -> None:

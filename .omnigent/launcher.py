@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,8 +46,8 @@ OPUS_READINESS_SMOKE_ENV = "TRIPLE_STAMP_RUN_OPUS_READINESS_SMOKE"
 PROFILE_MATRIX_ENV = "TRIPLE_STAMP_PROFILE_MATRIX"
 MAX_CYCLES_ENV = "TRIPLE_STAMP_MAX_CYCLES"
 VOICE_PROFILE_ENV = "TRIPLE_STAMP_VOICE_PROFILE"
-# `off` runs public-only: Opus gets no internal systems, as on a Mac outside
-# Databricks.
+# `off` runs public-only: Opus gets no internal systems and the judge's Codex
+# starts no MCP servers, as on a Mac outside Databricks.
 INTERNAL_SOURCES_ENV = "TRIPLE_STAMP_INTERNAL_SOURCES"
 # Add-ons live outside every checkout, in the per-user Triple-stamp folder, so
 # no commit can ever carry one. This names another folder, or `off` for none.
@@ -1665,6 +1666,64 @@ def _drop_mcp_servers(claude_json: Path) -> None:
     claude_json.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
+# One TOML key part: bare, "basic", or 'literal'. A table header such as
+# `[mcp_servers.glean]` or `[[a."b.c"]]` is a dotted run of them.
+_TOML_KEY_PART = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')"""
+_TOML_HEADER = re.compile(
+    rf"^\s*\[\[?\s*({_TOML_KEY_PART}(?:\s*\.\s*{_TOML_KEY_PART})*)\s*\]\]?\s*(?:#.*)?$"
+)
+_TOML_ROOT_MCP_KEY = re.compile(r"""^\s*(?:mcp_servers|"mcp_servers"|'mcp_servers')\s*[.=]""")
+
+
+def _drop_codex_mcp_servers(config_toml: Path) -> None:
+    """Remove every MCP server from a run's copy of Codex ``config.toml``.
+
+    The user's own file is never touched. Only the run's private copy loses its
+    ``mcp_servers``, so the judge's Codex starts none of them, as on a Mac
+    outside Databricks. Every other line is kept as written, and the result
+    must parse to the same settings minus ``mcp_servers`` before it is saved.
+    """
+
+    try:
+        text = config_toml.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _die(f"{INTERNAL_SOURCES_ENV}=off could not read {config_toml.name}: {exc}")
+    try:
+        settings = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        _die(f"{INTERNAL_SOURCES_ENV}=off found a malformed {config_toml.name}: {exc}")
+    if "mcp_servers" not in settings:
+        return
+    kept: list[str] = []
+    in_root = True
+    in_servers = False
+    for line in text.splitlines(keepends=True):
+        header = _TOML_HEADER.match(line)
+        if header:
+            in_root = False
+            first = re.match(_TOML_KEY_PART, header.group(1))
+            in_servers = first is not None and first.group(0).strip("\"'") == "mcp_servers"
+        elif in_root and _TOML_ROOT_MCP_KEY.match(line):
+            continue
+        if not in_servers:
+            kept.append(line)
+    stripped = "".join(kept)
+    try:
+        matches = tomllib.loads(stripped) == {
+            key: value for key, value in settings.items() if key != "mcp_servers"
+        }
+    except tomllib.TOMLDecodeError:
+        matches = False
+    if not matches:
+        _die(
+            f"{INTERNAL_SOURCES_ENV}=off could not remove the MCP servers from "
+            f"the run's copy of {config_toml.name}"
+        )
+    config_toml.write_text(stripped, encoding="utf-8")
+
+
 def _seed_isolated_home(
     root: Path,
     real_home: Path,
@@ -1697,9 +1756,10 @@ def _seed_isolated_home(
         _copy_tree(real_home / relative, isolated_home / relative)
     if _public_only():
         _drop_mcp_servers(isolated_home / ".claude.json")
+        _drop_codex_mcp_servers(isolated_home / ".codex/config.toml")
         _eprint(
             f"triple-stamp: {INTERNAL_SOURCES_ENV}=off; this run is public-only "
-            "and Opus gets no internal systems"
+            "and neither Opus nor Codex gets internal systems"
         )
 
     for relative in (".claude/plugins", ".omnigent", ".cursor", ".local/bin"):

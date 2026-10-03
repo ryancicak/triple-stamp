@@ -2377,8 +2377,11 @@ print("exact temp boundary: PASS")
         for marker in (
             "`routes` contains `native`, `glean_facet`, or both",
             "`tools_called` contains exact `mcp__*` names that",
-            "Only `unavailable_after_retry` may have no tool calls",
+            "`unavailable_after_retry` and `not_configured` may have no tool calls",
             "requires two genuine ToolSearch attempts",
+            # 2026-10-03: public-only audits wrote their ToolSearch calls as text.
+            "and the runtime says so in a `[System-authoritative Opus launch context]`",
+            "never write one out as text, and record every system as `not_configured`.",
             # 2026-09-26 answers cited Slack threads as bare channel/ts IDs.
             "Begin every `url_or_record_id` with a clickable `https://` link",
             # Salesforce reaches Opus only through Glean's index; the direct
@@ -9241,6 +9244,277 @@ print("exact temp boundary: PASS")
             )
             self.assertEqual(runtime_state.configured_internal_systems(), ["glean", "slack"])
             self.assertEqual(plugin._next_route(records).title, "audit-internal-1-1")
+
+    def test_public_only_answer_states_one_plain_gap(self) -> None:
+        """2026-10-03: a public-only answer listed eight pipeline-worded gaps."""
+
+        judgment = json.loads(_judgment("NEEDS_INTERNAL"))
+        judgment["limitations"] = ["Glean and SAFE were not configured."]
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("PASS")),
+            _route_packet("codex_judge", "judge-cycle-1", json.dumps(judgment)),
+        ]
+        with mock.patch.object(plugin, "configured_internal_systems", return_value=[]):
+            route = plugin._next_route(records)
+            answer = plugin._best_effort_answer(records, route)
+        self.assertEqual(
+            answer,
+            f"{judgment['best_supported_answer']}\n\n"
+            "Remaining evidence gaps:\n"
+            "- This answer uses public sources only, so it could not check "
+            "internal plans or records.",
+        )
+
+    def test_public_only_run_refuses_the_extra_internal_audit(self) -> None:
+        """2026-10-03: a public-only supervisor still sent ``audit-internal-1-1``.
+
+        Opus had no tool to call, ran for ten minutes, and the run ended
+        best-effort anyway. A run with internal systems still re-audits, and a
+        fresh audit that repairs a ledger naming unobserved tools still runs.
+        """
+
+        claimed = json.loads(_audit("PASS"))
+        claimed["internal_coverage"]["glean"].update(
+            status="evidence_found",
+            routes=["native"],
+            tools_called=["mcp__glean__search"],
+            results_seen=1,
+        )
+        nothing_observed = {
+            "available": True,
+            "status": "observed_zero",
+            "calls": [],
+            "by_system": {system: 0 for system in claimed["internal_coverage"]},
+        }
+        judged = (
+            ("cursor_workhorse", "cursor-cycle-1", "CURSOR PACKET", None),
+            ("opus_auditor", "audit-cycle-1", _audit("PASS"), None),
+            ("codex_judge", "judge-cycle-1", _judgment("NEEDS_INTERNAL"), None),
+        )
+        repair = (
+            ("cursor_workhorse", "cursor-cycle-1", "CURSOR PACKET", None),
+            ("opus_auditor", "audit-cycle-1", json.dumps(claimed), nothing_observed),
+        )
+
+        def decision(
+            packets: tuple[tuple[str, str, str, dict | None], ...],
+            configured: list[str] | None,
+        ) -> tuple[str, str, str, str]:
+            parent = "public-only-reaudit"
+            with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+                os.environ, {"TRIPLE_STAMP_RUN_DIR": value}, clear=False
+            ), mock.patch.object(
+                plugin,
+                "configured_internal_systems",
+                runtime_state.configured_internal_systems,
+            ):
+                if configured is not None:
+                    (Path(value) / "opus-mcp.json").write_text(
+                        json.dumps({"mcpServers": {name: {} for name in configured}}),
+                        encoding="utf-8",
+                    )
+                runtime_state.activate_parent_attempt(parent, "request")
+                for agent, title, output, observation in packets:
+                    record = {
+                        **_route_packet(agent, title, output),
+                        "parent_session_id": parent,
+                    }
+                    if observation is not None:
+                        record["internal_mcp_observation"] = observation
+                    runtime_state.append_collection(record)
+                route = plugin._next_route(
+                    runtime_state.read_attempt_collections(parent_session_id=parent),
+                    parent_session_id=parent,
+                )
+                result = plugin.supervisor_contract(enabled=True)(
+                    {
+                        "type": "tool_call",
+                        "context": {
+                            "conversation_id": parent,
+                            "root_conversation_id": parent,
+                        },
+                        "data": {
+                            "name": "mcp__omnigent__sys_session_send",
+                            "arguments": {
+                                "agent": "opus_auditor",
+                                "title": "audit-internal-1-1",
+                                "args": "handoff",
+                            },
+                        },
+                    }
+                )
+                # The refused stage is never announced as starting.
+                progress = supervisor_runtime._progress_note(
+                    "opus_auditor",
+                    "audit-internal-1-1",
+                    set(),
+                    parent_session_id=parent,
+                )
+            return route.title, result["result"], str(result.get("reason") or ""), progress
+
+        route, result, reason, progress = decision(judged, [])
+        self.assertEqual((route, result, progress), ("", "DENY", ""))
+        self.assertIn("no internal system is configured", reason)
+        self.assertIn("Do not report PIPELINE_INFRASTRUCTURE_ERROR", reason)
+        for packets, configured in (
+            (judged, None),
+            (judged, ["glean", "slack"]),
+            (repair, []),
+        ):
+            with self.subTest(stages=len(packets), configured=configured):
+                route, result, _reason, progress = decision(packets, configured)
+                self.assertEqual((route, result), ("audit-internal-1-1", "ALLOW"))
+                self.assertIn("(audit-internal-1-1)", progress)
+
+    def test_refused_public_only_reaudit_still_returns_the_answer(self) -> None:
+        """A failure claim after the refusal must not leave the chat empty."""
+
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        parent = "parent-public-only-refusal"
+        records = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("PASS")),
+            _route_packet("codex_judge", "judge-cycle-1", _judgment("NEEDS_INTERNAL")),
+        ]
+        original = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        claim = "PIPELINE_INFRASTRUCTURE_ERROR: audit-internal-1-1 was denied"
+
+        async def scripted(*_args: object, **_kwargs: object):
+            yield TextChunk(claim)
+            yield TurnComplete(response=claim)
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    [{"role": "user", "content": "finish", "session_id": parent}],
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            (Path(value) / "opus-mcp.json").write_text(
+                json.dumps({"mcpServers": {}}), encoding="utf-8"
+            )
+            for packet in records:
+                runtime_state.append_collection({**packet, "parent_session_id": parent})
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original
+            persisted = runtime_state.read_best_effort_answer(parent)
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+
+        rendered = "".join(event.text for event in events if isinstance(event, TextChunk))
+        self.assertEqual(rendered, persisted)
+        self.assertTrue(rendered.endswith(f"- {plugin._PUBLIC_ONLY_GAP}"))
+        self.assertNotIn("PIPELINE_", rendered)
+        self.assertEqual(
+            [event.response for event in events if isinstance(event, TurnComplete)],
+            [persisted],
+        )
+        self.assertEqual(actions, ["deterministic_best_effort_relay"])
+
+    def test_public_only_audit_records_each_system_as_not_configured(self) -> None:
+        """2026-10-03: told to try a ToolSearch it did not have, Opus wrote the
+        calls out as text, and two audits ran to the 128,000-token output cap.
+        """
+
+        ledger = json.loads(_audit("PASS"))
+        for entry in ledger["internal_coverage"].values():
+            entry.update(
+                status="not_configured",
+                routes=[],
+                tools_called=[],
+                queries=[],
+                results_seen=0,
+                note="this run has no such system",
+            )
+        nothing_observed = {
+            "available": True,
+            "status": "observed_zero",
+            "calls": [],
+            "by_system": {system: 0 for system in ledger["internal_coverage"]},
+        }
+
+        def validation(
+            configured: list[str] | None,
+            payload: dict[str, object] = ledger,
+            observation: dict[str, object] | None = nothing_observed,
+        ) -> dict[str, object]:
+            with mock.patch.object(
+                plugin, "configured_internal_systems", return_value=configured
+            ):
+                return plugin._audit_coverage_validation(payload, observation)
+
+        valid = validation([])
+        self.assertEqual(valid["status"], "mechanically_validated")
+        self.assertEqual(valid["form_issues"], [])
+        self.assertEqual(validation([], observation=None)["status"], "advisory_unobserved")
+        audit = {
+            **_route_packet("opus_auditor", "audit-cycle-1", json.dumps(ledger)),
+            "internal_mcp_observation": nothing_observed,
+        }
+        with mock.patch.object(plugin, "configured_internal_systems", return_value=[]):
+            self.assertIsNotNone(plugin._valid_audit(json.dumps(ledger), nothing_observed))
+            route = plugin._next_route(
+                [_route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR"), audit]
+            )
+        self.assertEqual((route.agent, route.title), ("codex_judge", "judge-cycle-1"))
+
+        # Only a system the run lacks may be recorded as not configured.
+        for configured, systems in (
+            (None, ["glean", "jira", "slack", "confluence", "safe"]),
+            (["glean", "slack"], ["glean", "slack"]),
+        ):
+            with self.subTest(configured=configured):
+                result = validation(configured)
+                self.assertEqual(result["status"], "form_imperfect")
+                self.assertEqual(
+                    result["form_issues"],
+                    [f"{system} is configured but recorded not_configured" for system in systems],
+                )
+
+        # The receipt is empty, and no call for the system was observed.
+        observed_call = {
+            **nothing_observed,
+            "status": "observed",
+            "calls": [{"name": "mcp__glean__search", "system": "glean"}],
+            "by_system": {**nothing_observed["by_system"], "glean": 1},
+        }
+        for changes, observation, issue in (
+            ({"routes": ["native"]}, nothing_observed, "glean has invalid routes"),
+            (
+                {"tools_called": ["mcp__glean__search"]},
+                observed_call,
+                "glean not_configured receipt names tools",
+            ),
+            ({}, observed_call, "glean not_configured receipt contradicts exact-child calls"),
+        ):
+            with self.subTest(issue=issue):
+                payload = json.loads(json.dumps(ledger))
+                payload["internal_coverage"]["glean"].update(changes)
+                result = validation([], payload, observation)
+                self.assertEqual(result["status"], "form_imperfect")
+                self.assertIn(issue, result["form_issues"])
 
     def test_coverage_line_names_the_configured_internal_systems(self) -> None:
         class Client:

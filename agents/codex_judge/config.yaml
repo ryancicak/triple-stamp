@@ -92,9 +92,12 @@ prompt: |
     `form_imperfect` identifies schema or consistency defects separately from
     answer substance.
   - `routes` contains only `native` and/or `glean_facet`, and may be empty
-    only for `unavailable_after_retry`. Only `unavailable_after_retry` may
-    have empty `tools_called`, and it must document two genuine ToolSearch
-    attempts. `searched_no_hits` requires a real tool call and zero results.
+    only for `unavailable_after_retry` or `not_configured`. Only those two may
+    have empty `tools_called`, and `unavailable_after_retry` must document two
+    genuine ToolSearch attempts. `not_configured` is valid only for a system
+    missing from the coverage line's `configured` field, where it replaces the
+    attempt, and it never by itself requires NEEDS_INTERNAL.
+    `searched_no_hits` requires a real tool call and zero results.
     `evidence_found` requires a real tool call and positive results. A
     glean-facet-only Jira, Slack, or Confluence receipt must call Glean and
     explain in `note` why the native family was unreachable.

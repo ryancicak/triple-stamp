@@ -182,6 +182,13 @@ _NO_OUTPUT = re.compile(
 )
 _INFRA_PREFIX = "PIPELINE_INFRASTRUCTURE_ERROR:"
 _VALIDATION_PREFIX = "PIPELINE_VALIDATION_FAILED:"
+# A public-only run, as on a Mac outside Databricks, ends a Codex
+# NEEDS_INTERNAL with this route reason and this one gap line.
+_NO_INTERNAL_SYSTEMS_REASON = "no internal system is configured for this run"
+_PUBLIC_ONLY_GAP = (
+    "This answer uses public sources only, so it could not check internal "
+    "plans or records."
+)
 
 # Every Opus audit-stage kind. A transient platform stream death on any of
 # these can be recovered by a fresh child under a unique title, exactly the way
@@ -638,20 +645,34 @@ def _audit_coverage_validation(
     claimed_tools: dict[str, list[str]] = {}
     for system, entry in entries.items():
         status = entry.get("status")
-        if status not in _COVERAGE_STATUSES:
+        # A public-only run has no internal system to search. Its receipts say
+        # so; on 2026-10-03 Opus, told to make two ToolSearch attempts it had no
+        # tool for, wrote the calls as text until its output hit the cap.
+        absent = status == "not_configured"
+        if absent:
+            configured = configured_internal_systems()
+            if configured is None or system in configured:
+                form_issues.append(
+                    f"{system} is configured but recorded not_configured"
+                )
+        elif status not in _COVERAGE_STATUSES:
             form_issues.append(f"{system} has invalid status")
         routes = entry.get("routes")
         if (
             not isinstance(routes, list)
             or any(route not in _COVERAGE_ROUTES for route in routes)
-            or (not routes and status != "unavailable_after_retry")
+            or (absent and routes)
+            or (
+                not routes
+                and status not in {"unavailable_after_retry", "not_configured"}
+            )
         ):
             form_issues.append(f"{system} has invalid routes")
             routes = []
         queries = entry.get("queries")
         if not (
             isinstance(queries, list)
-            and queries
+            and (queries or absent)
             and all(isinstance(query, str) and query.strip() for query in queries)
         ):
             form_issues.append(f"{system} lacks verbatim queries")
@@ -670,6 +691,9 @@ def _audit_coverage_validation(
                 form_issues.append(
                     f"{system} unavailable receipt lacks two-attempt note"
                 )
+        elif absent:
+            if tools:
+                form_issues.append(f"{system} not_configured receipt names tools")
         elif not tools:
             form_issues.append(f"{system} {status or 'unknown'} receipt has no tool")
         results = entry.get("results_seen")
@@ -748,6 +772,10 @@ def _audit_coverage_validation(
             if status == "unavailable_after_retry" and relevant_count > 0:
                 form_issues.append(
                     f"{system} unavailable receipt contradicts exact-child calls"
+                )
+            if status == "not_configured" and relevant_count > 0:
+                form_issues.append(
+                    f"{system} not_configured receipt contradicts exact-child calls"
                 )
 
     if not _valid_internal_source_contract(payload):
@@ -1424,7 +1452,7 @@ def _verdict_route(
                 "best_effort",
                 cycle,
                 requester="codex",
-                reason="no internal system is configured for this run",
+                reason=_NO_INTERNAL_SYSTEMS_REASON,
             )
         return _internal_reaudit_route(
             records,
@@ -1895,6 +1923,29 @@ def _route_dispatch_pending(
     return sum(matches(record) for record in sent) > sum(
         matches(record) for record in collected
     )
+
+
+def _public_only_reaudit(title: object, parent_session_id: str) -> bool:
+    """Whether ``title`` is an internal re-audit after a public-only run ended.
+
+    With no internal system configured, a Codex NEEDS_INTERNAL ends the run
+    best-effort, because a fresh audit would have nothing to search. A fresh
+    child that repairs an Opus ledger naming unobserved tools still runs.
+    """
+
+    parsed = _stage(title)
+    if (
+        parsed is None
+        or parsed.kind != "audit_internal"
+        or not parent_session_id
+        or configured_internal_systems() != []
+    ):
+        return False
+    route = _next_route(
+        read_attempt_collections(parent_session_id=parent_session_id),
+        parent_session_id=parent_session_id,
+    )
+    return route.status == "best_effort" and route.reason == _NO_INTERNAL_SYSTEMS_REASON
 
 
 def _observed_nonmax_opus_effort(
@@ -2506,17 +2557,18 @@ def _best_effort_answer(
             f"is: {why}"
         )
 
-    gaps = _judgment_gaps(review)
+    if route.reason == _NO_INTERNAL_SYSTEMS_REASON:
+        # On 2026-10-03 a public-only answer listed eight gaps: Codex's
+        # lookups for systems the run did not have and its receipt notes.
+        gaps = [_PUBLIC_ONLY_GAP]
+    else:
+        gaps = _judgment_gaps(review)
     gap_lines = "\n".join(f"- {gap}" for gap in gaps)
     if not gap_lines:
-        gap_lines = "- Final quality approval was not granted."
-    return (
-        f"{conclusion}\n\n"
-        "Remaining evidence gaps:\n"
-        f"{gap_lines}\n\n"
-        "These gaps are explicit because the completed evidence did not support "
-        "final quality approval."
-    )
+        gap_lines = (
+            "- The completed evidence could not confirm every part of this answer."
+        )
+    return f"{conclusion}\n\nRemaining evidence gaps:\n{gap_lines}"
 
 
 def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
@@ -2787,6 +2839,20 @@ def supervisor_contract(
                             f"title {pending.title}."
                         ),
                     }
+            if _public_only_reaudit(title, parent_session_id):
+                # On 2026-10-03 a public-only supervisor followed NEEDS_INTERNAL
+                # to audit-internal-1-1. Opus had no tool to call, ran for ten
+                # minutes, and the run still ended best-effort.
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        f"{title} cannot run: no internal system is configured "
+                        "for this run, so Codex's NEEDS_INTERNAL is final. "
+                        "Dispatch nothing, write nothing, and end this turn. Do "
+                        "not report PIPELINE_INFRASTRUCTURE_ERROR; the runtime "
+                        "returns the finished answer with its limits."
+                    ),
+                }
             if title.startswith("cursor-retry-"):
                 retry = re.fullmatch(r"cursor-retry-([1-4])-([1-9][0-9]*)", title)
                 if retry is None or int(retry.group(2)) != 1:

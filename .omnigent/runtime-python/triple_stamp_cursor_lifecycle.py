@@ -75,6 +75,24 @@ _SUPERVISOR_RESTATEMENT = (
     "[Supervisor restatement; the runtime's exact packets below supersede it]"
 )
 _ATTACHED_PACKET_MAX_CHARS = 60_000
+# A public-only run gives Opus no MCP server, and Claude Code then offers no
+# ToolSearch either. On 2026-10-03 three public-only audits, told to try
+# ToolSearch twice for each internal system, wrote the calls out as text; two
+# of them repeated until they hit the 128,000-token output cap.
+_PUBLIC_ONLY_OPUS_CONTEXT = (
+    "[System-authoritative Opus launch context]\n"
+    "No internal system is configured for this run, as on a Mac outside "
+    "Databricks. You have no ToolSearch and no MCP tools, so the TOOLS YOU HAVE "
+    "steps do not apply: make no tool call, and never write a tool call, its "
+    "markup, or its result as text. Audit the attached packets on their own "
+    "evidence, and name any claim only internal evidence could support in "
+    "`attacks`. In `internal_coverage`, record each of glean, jira, slack, "
+    "confluence, and safe with status `not_configured`, empty `routes`, "
+    "`tools_called`, and `queries`, `results_seen` 0, and a `note` saying this "
+    "run has no such system. Leave `internal_sources_consulted` empty and set "
+    "`internal_sources_not_required_reason` to say that no internal system is "
+    "configured."
+)
 _SUBAGENT_OVERRIDE_KEYS = frozenset(
     {"cost_budget", "file_ids", "harness", "model", "reasoning_effort"}
 )
@@ -672,6 +690,20 @@ def _attached_packets_block(
     )
 
 
+def _configured_internal_systems() -> list[str] | None:
+    """This run's internal systems: ``[]`` when public-only, ``None`` if unknown."""
+
+    try:
+        from triple_stamp_runtime_state import configured_internal_systems
+
+        return configured_internal_systems()
+    except Exception as exc:  # noqa: BLE001 - enrichment never blocks dispatch
+        logging.getLogger(__name__).warning(
+            "configured internal systems unreadable; error=%s", type(exc).__name__
+        )
+        return None
+
+
 def _runtime_handoff(
     args: object,
     *,
@@ -687,6 +719,8 @@ def _runtime_handoff(
     the runner has a validated profile configured.  Codex receives the actual
     environment through :func:`_install_codex_voice_environment`; this suffix
     makes the same fact explicit in the turn that tells the judge what to do.
+    In the same way, an Opus audit in a public-only run is told that it has no
+    internal tools to try.
 
     Format-repair dispatches also receive the actual collected raw judgment.
     Asking the supervisor to reproduce a near-10KB packet proved lossy in a live
@@ -732,6 +766,12 @@ def _runtime_handoff(
             "A STAMP must not report voice rendering disabled; it must apply "
             "the profile and return its path and computed SHA-256."
         )
+    if (
+        agent == "opus_auditor"
+        and not stage_title.startswith("audit-format-repair-")
+        and _configured_internal_systems() == []
+    ):
+        additions.append(_PUBLIC_ONLY_OPUS_CONTEXT)
 
     match = re.fullmatch(r"judge-format-repair-([1-4])", stage_title)
     if agent == "codex_judge" and match is not None:

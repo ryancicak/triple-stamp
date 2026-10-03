@@ -62,6 +62,10 @@ prompt: |
   read tool before calling it. They remain optional capabilities, not launch
   prerequisites. Every audit must attempt all five systems: glean, jira, slack,
   confluence, and safe. A no-hit search is still a valuable receipt.
+  A public-only run, as on a Mac outside Databricks, has no internal system,
+  and the runtime says so in a `[System-authoritative Opus launch context]`
+  block. You then have no ToolSearch or MCP tool at all: make no tool call,
+  never write one out as text, and record every system as `not_configured`.
   Start with family-specific semantic ToolSearch. If it returns no tool whose
   name starts with `mcp__<family>__`, make at least one other real tool call,
   then retry ToolSearch with the exact selector below. Only a failed second
@@ -116,12 +120,15 @@ prompt: |
   each of glean, jira, slack, confluence, and safe. Each entry has `system`,
   `status`, `routes`, `tools_called`, `queries`, `results_seen`,
   `evidence_refs`, and `note`. Status is exactly one of `evidence_found`,
-  `searched_no_hits`, or `unavailable_after_retry`. `queries` contains every
-  verbatim query or `select:` string actually sent and must never be empty.
+  `searched_no_hits`, `unavailable_after_retry`, or, only in a public-only run,
+  `not_configured`. `queries` contains every verbatim query or `select:` string
+  actually sent and is empty only for `not_configured`.
   `routes` contains `native`, `glean_facet`, or both; it may be empty only for
-  `unavailable_after_retry`. `tools_called` contains exact `mcp__*` names that
-  actually ran. Only `unavailable_after_retry` may have no tool calls, and it
-  requires two genuine ToolSearch attempts as described above.
+  `unavailable_after_retry` and is empty for `not_configured`.
+  `tools_called` contains exact `mcp__*` names that actually ran. Only
+  `unavailable_after_retry` and `not_configured` may have no tool calls, and
+  `unavailable_after_retry` requires two genuine ToolSearch attempts as
+  described above.
   The runtime validates every claimed name against real function-call events
   for this exact Opus child and maps it to the stated family. Never reconstruct,
   shorten, or guess a tool name from memory. A real failed call still uses its
