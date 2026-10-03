@@ -418,8 +418,10 @@ class BootstrapContractTests(unittest.TestCase):
         base: Path,
         *,
         reject_constraints: bool,
+        root: Path = ROOT,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         log = base / "uv.log"
+        seen = base / "constraints-seen.txt"
         fake_uv = base / "uv"
         fake_uv.write_text(
             "#!/bin/sh\n"
@@ -444,6 +446,17 @@ class BootstrapContractTests(unittest.TestCase):
             "  exit 0\n"
             "fi\n"
             "if [ \"$1\" = pip ] && [ \"$2\" = install ]; then\n"
+            # Like uv 0.11, split a --constraint path at spaces.
+            "  previous=\n"
+            "  for arg in \"$@\"; do\n"
+            "    if [ \"$previous\" = --constraint ]; then\n"
+            "      case \"$arg\" in\n"
+            "        *' '*) echo \"error: File not found: ${arg%% *}\" >&2; exit 2 ;;\n"
+            "      esac\n"
+            f"      cp \"$arg\" '{seen}'\n"
+            "    fi\n"
+            "    previous=$arg\n"
+            "  done\n"
             + (
                 "  case \"$*\" in *--constraint*) exit 1 ;; esac\n"
                 if reject_constraints
@@ -456,7 +469,7 @@ class BootstrapContractTests(unittest.TestCase):
         )
         fake_uv.chmod(0o755)
         result = self._shell(
-            f'TRIPLE_STAMP_ROOT="{ROOT}"\n'
+            f'TRIPLE_STAMP_ROOT="{root}"\n'
             f'TRIPLE_STAMP_UV="{fake_uv}"\n'
             f'TRIPLE_STAMP_MANAGED_RUNTIME="{base / "state/runtime"}"\n'
             "TRIPLE_STAMP_BOOTSTRAP_OMNIGENT_VERSION=0.14.0\n"
@@ -487,12 +500,42 @@ class BootstrapContractTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(calls), 1)
-            self.assertIn(f"--constraint {package_lock}", calls[0])
+            self.assertIn("--constraint ", calls[0])
             self.assertIn("omnigent==0.14.0 claude-agent-sdk==0.2.152", calls[0])
+            self.assertEqual(
+                (base / "constraints-seen.txt").read_text(encoding="utf-8"),
+                package_lock.read_text(encoding="utf-8"),
+            )
+            self.assertFalse((base / "state/runtime/tested-packages.txt").exists())
             # The shared `lock` variable still names the bootstrap lock, so
             # its cleanup can never remove the checked-in package lock.
             self.assertIn(f"lock-after={base / 'bootstrap.lock'}", result.stdout)
             self.assertTrue(package_lock.is_file())
+
+    def test_a_checkout_whose_path_has_a_space_gets_the_tested_package_set(
+        self,
+    ) -> None:
+        # uv splits a --constraint path at spaces, and until 2026-10-02 a
+        # checkout in a folder like "My Projects" fell back to the newest
+        # packages instead of the tested set.
+        package_lock = ROOT / ".omnigent/runtime-lock/omnigent-0.14.0.txt"
+        with tempfile.TemporaryDirectory() as value:
+            base = Path(value)
+            root = base / "My Projects/triple-stamp"
+            root.parent.mkdir()
+            root.symlink_to(ROOT)
+            result, calls = self._install_with_fake_uv(
+                base,
+                reject_constraints=False,
+                root=root,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("tested package set", result.stderr)
+            self.assertEqual(
+                (base / "constraints-seen.txt").read_text(encoding="utf-8"),
+                package_lock.read_text(encoding="utf-8"),
+            )
 
     def test_untestable_package_set_falls_back_to_newest_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as value:

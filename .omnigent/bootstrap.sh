@@ -216,13 +216,16 @@ triple_stamp_install_runtime() {
   # Install the exact package set that passed this version's checks, so a new
   # install matches the tested one. If that set cannot install here, fall back
   # to the newest packages Omnigent's own requirements allow, as before. These
-  # names are unique because sh variables are global and `lock` is taken.
+  # names are unique because sh variables are global and `lock` is taken. uv
+  # splits a --constraint path at spaces, so it reads a copy inside the new
+  # runtime; a checkout in a folder like "My Projects" gets the tested set too.
   package_lock="$TRIPLE_STAMP_ROOT/.omnigent/runtime-lock/omnigent-$version.txt"
+  package_constraints="$staging/tested-packages.txt"
   locked_install=0
-  if [ -f "$package_lock" ]; then
+  if [ -f "$package_lock" ] && cp "$package_lock" "$package_constraints"; then
     if triple_stamp_run_retry 3 5 600 \
       "$TRIPLE_STAMP_UV" pip install --python "$staging/bin/python" \
-      --constraint "$package_lock" \
+      --constraint "$package_constraints" \
       "omnigent==$version" 'claude-agent-sdk==0.2.152'
     then
       locked_install=1
@@ -230,6 +233,7 @@ triple_stamp_install_runtime() {
       triple_stamp_bootstrap_log \
         "the tested package set for Omnigent $version did not install; using the newest compatible packages instead"
     fi
+    rm -f "$package_constraints"
   fi
   if [ "$locked_install" = 0 ] && ! triple_stamp_run_retry 3 5 600 \
     "$TRIPLE_STAMP_UV" pip install --python "$staging/bin/python" \
