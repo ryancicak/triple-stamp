@@ -4,7 +4,7 @@ import base64
 import importlib.util
 import json
 import os
-import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -25,97 +25,227 @@ sys.modules[SPEC.name] = launcher
 SPEC.loader.exec_module(launcher)
 
 
-class ModelResolutionTests(unittest.TestCase):
-    def test_managed_claude_bearer_is_minted_before_home_isolation(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            home = Path(value)
-            helper = home / ".local/bin/ug"
-            helper.parent.mkdir(parents=True)
-            helper.write_text("", encoding="utf-8")
-            settings = home / "managed-settings.json"
-            settings.write_text(
-                json.dumps(
-                    {
-                        "apiKeyHelper": (
-                            f"{helper} auth-token --host https://example.test "
-                            "--profile managed-oauth"
-                        )
-                    }
-                ),
-                encoding="utf-8",
-            )
-            minted = subprocess.CompletedProcess(
-                [], 0, "gateway-bearer-value-long-enough\n", ""
-            )
-            with mock.patch.object(launcher, "_run", return_value=minted) as run:
-                token = launcher._managed_claude_bearer(
-                    home,
-                    {"HOME": str(home)},
-                    (settings,),
+JQ = shutil.which("jq")
+# Claude Code's managed apiKeyHelper on 2026-10-02, character for character.
+MANAGED_ISAAC_HELPER = "jq -r '.access_token' ~/.databricks/model-serving-token.json"
+UG_ARGS = "auth-token --host https://example.test --profile managed-oauth"
+# Stand-ins for the real login tools. Each logs its arguments and hands back
+# whatever token the test staged in the temporary HOME.
+FAKE_UG = (
+    'echo "$*" >> "$HOME/ug-calls"\n'
+    'case " $* " in *" --force-refresh "*) exec cat "$HOME/ug-fresh" ;; esac\n'
+    'exec cat "$HOME/ug-token"\n'
+)
+FAKE_ISAAC = (
+    'echo "$*" >> "$HOME/isaac-calls"\n'
+    'mkdir -p "$HOME/.databricks"\n'
+    'if [ -f "$HOME/isaac-fresh" ]; then\n'
+    '  cp "$HOME/isaac-fresh" "$HOME/.databricks/model-serving-token.json"\n'
+    "fi\n"
+)
+
+
+def _jwt(minutes: float) -> str:
+    claims = json.dumps({"exp": time.time() + minutes * 60}).encode()
+    body = base64.urlsafe_b64encode(claims).decode().rstrip("=")
+    return f"eyJhbGciOiJub25lIn0.{body}.signature"
+
+
+def _script(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _token_file(path: Path, token: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"access_token": token}), encoding="utf-8")
+
+
+def _managed(home: Path, helper: object) -> tuple[Path, ...]:
+    settings = home / "managed-settings.json"
+    settings.write_text(json.dumps({"apiKeyHelper": helper}), encoding="utf-8")
+    return (settings,)
+
+
+def _host(home: Path) -> dict[str, str]:
+    jq_dir = Path(JQ).parent if JQ else Path("/usr/bin")
+    return {"HOME": str(home), "PATH": f"{home}/.local/bin:{jq_dir}:/usr/bin:/bin"}
+
+
+def _lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+class ManagedLoginHelperTests(unittest.TestCase):
+    """The run's gateway token comes from whatever helper Claude Code is managed to run."""
+
+    def setUp(self) -> None:
+        isaac = mock.patch.object(launcher, "ISAAC", Path("/nonexistent/isaac"))
+        isaac.start()
+        self.addCleanup(isaac.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name) / "Home Folder"
+        self.home.mkdir()
+
+    def mint(self, helper: object, home: Path | None = None) -> str:
+        home = home or self.home
+        return launcher._managed_claude_bearer(_host(home), _managed(home, helper))
+
+    def test_any_helper_command_mints_the_run_token(self) -> None:
+        """2026-10-02: the managed helper changed shape and every launch stopped."""
+
+        token = _jwt(600)
+        _script(self.home / ".local/bin/ug", FAKE_UG)
+        (self.home / "ug-token").write_text(f"{token}\n", encoding="utf-8")
+        _token_file(self.home / ".databricks/model-serving-token.json", token)
+        _script(self.home / "My Tools/print token", f"printf '%s' '{token}'\n")
+        helpers = {
+            "the Isaac token file, as managed today": MANAGED_ISAAC_HELPER,
+            "ug by absolute path, as managed before": (
+                f"'{self.home}/.local/bin/ug' {UG_ARGS}"
+            ),
+            "ug through ~ with its flags reordered": (
+                "~/.local/bin/ug auth-token --profile managed-oauth "
+                "--host https://example.test"
+            ),
+            "ug found on PATH": f"ug {UG_ARGS}",
+            "a quoted script path with spaces": '"$HOME/My Tools/print token"',
+            "a pipeline": "cat ~/ug-token | tr -d ' '",
+        }
+        for label, helper in helpers.items():
+            with self.subTest(label), mock.patch.object(launcher, "_eprint") as printed:
+                if helper == MANAGED_ISAAC_HELPER and not JQ:
+                    self.skipTest("jq is not installed")
+                self.assertEqual(self.mint(helper), token)
+                self.assertFalse(printed.called)
+
+    def test_without_a_helper_the_sandboxed_round_trip_decides(self) -> None:
+        settings = self.home / "managed-settings.json"
+        contents = {
+            "no managed settings": None,
+            "malformed JSON": "{",
+            "a JSON list": "[]",
+            "no helper": json.dumps({"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}),
+            "a blank helper": json.dumps({"apiKeyHelper": "  "}),
+            "a helper that is not text": json.dumps({"apiKeyHelper": ["ug"]}),
+        }
+        for label, text in contents.items():
+            settings.unlink(missing_ok=True)
+            if text is not None:
+                settings.write_text(text, encoding="utf-8")
+            with self.subTest(label), mock.patch.object(launcher, "_run_quietly") as run:
+                self.assertEqual(
+                    launcher._managed_claude_bearer(_host(self.home), (settings,)), ""
                 )
-        self.assertEqual(token, "gateway-bearer-value-long-enough")
-        run.assert_called_once_with(
-            [
-                str(helper),
-                "auth-token",
-                "--host",
-                "https://example.test",
-                "--profile",
-                "managed-oauth",
-            ],
-            env={"HOME": str(home)},
-            timeout=30,
+                run.assert_not_called()
+
+    def test_a_failing_helper_names_its_reason_and_the_sign_in(self) -> None:
+        _script(self.home / ".local/bin/ug", FAKE_UG)  # no token staged, so it fails
+        noisy = _script(
+            self.home / "noisy",
+            "echo 'first line' >&2\n"
+            "echo 'login expired at https://example.test/x; Bearer abc.def.ghi' >&2\n"
+            "exit 3\n",
         )
+        cases = {
+            "ug": (f"ug {UG_ARGS}", "it exited 1: cat: "),
+            "a helper that explains": (
+                f"'{noisy}'",
+                "it exited 3: login expired at [REDACTED_URL] Bearer [REDACTED].",
+            ),
+            "a helper that prints no token": ("echo null", "it printed no token."),
+        }
+        for label, (helper, reason) in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(launcher.LaunchError) as raised:
+                    self.mint(helper)
+                message = str(raised.exception)
+                self.assertEqual(raised.exception.code, launcher.EXIT_AUTH)
+                self.assertIn(reason, message)
+                self.assertNotIn("abc.def.ghi", message)
+                self.assertTrue(
+                    message.endswith(
+                        "\nSign in once by running: claude"
+                        "\nThen run ./triple-stamp again."
+                    )
+                )
+        # A failed ug is never forced to refresh, which may open a browser.
+        self.assertEqual(_lines(self.home / "ug-calls"), [UG_ARGS])
+
+    @unittest.skipUnless(JQ, "jq is not installed")
+    def test_an_expired_isaac_login_is_refreshed_once_without_a_browser(self) -> None:
+        token = _jwt(600)
+        isaac = _script(self.home / "isaac", FAKE_ISAAC)
+        _token_file(self.home / "isaac-fresh", token)
+        with mock.patch.object(launcher, "ISAAC", isaac):
+            self.assertEqual(self.mint(MANAGED_ISAAC_HELPER), token)
+            (self.home / "isaac-fresh").unlink()
+            (self.home / ".databricks/model-serving-token.json").unlink()
+            with self.assertRaises(launcher.LaunchError) as raised:
+                self.mint(MANAGED_ISAAC_HELPER)
+        self.assertEqual(_lines(self.home / "isaac-calls"), ["auth refresh"] * 2)
+        self.assertEqual(raised.exception.code, launcher.EXIT_AUTH)
+        self.assertIn(
+            f"\nSign in once by running: {isaac} --claude\n", str(raised.exception)
+        )
+
+    def test_a_hung_helper_is_not_run_again(self) -> None:
+        """A sign-in that waits on a browser must not be started a second time."""
+
+        self.assertIsNone(launcher._run_helper("sleep 5", _host(self.home), timeout=0.2))
+        isaac = _script(self.home / "isaac", FAKE_ISAAC)
+        for helper in (MANAGED_ISAAC_HELPER, f"ug {UG_ARGS}"):
+            with (
+                self.subTest(helper),
+                mock.patch.object(launcher, "ISAAC", isaac),
+                mock.patch.object(launcher, "_run_quietly", return_value=None) as run,
+            ):
+                with self.assertRaises(launcher.LaunchError) as raised:
+                    self.mint(helper)
+                run.assert_called_once()
+                self.assertIn("it did not finish within 30 s.", str(raised.exception))
 
     def test_a_nearly_expired_gateway_token_is_renewed_at_startup(self) -> None:
         """2026-09-27: a run started on a cached token 16 minutes from expiry."""
 
-        def jwt(minutes: float) -> str:
-            claims = json.dumps({"exp": time.time() + minutes * 60}).encode()
-            body = base64.urlsafe_b64encode(claims).decode().rstrip("=")
-            return f"eyJhbGciOiJub25lIn0.{body}.signature"
+        stale, fresh, ample = _jwt(16), _jwt(60), _jwt(55)
+        ug = f"~/.local/bin/ug {UG_ARGS}"
+        cases = {
+            "ug renewed": (ug, stale, fresh, fresh),
+            "ug could not renew": (ug, stale, None, stale),
+            "ug had plenty left": (ug, ample, fresh, ample),
+            "Isaac renewed": (MANAGED_ISAAC_HELPER, stale, fresh, fresh),
+            "Isaac could not renew": (MANAGED_ISAAC_HELPER, stale, None, stale),
+        }
+        for label, (helper, first, renewed, expected) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as value:
+                if helper == MANAGED_ISAAC_HELPER and not JQ:
+                    self.skipTest("jq is not installed")
+                home = Path(value)
+                isaac = _script(home / "isaac", FAKE_ISAAC)
+                _script(home / ".local/bin/ug", FAKE_UG)
+                (home / "ug-token").write_text(first, encoding="utf-8")
+                _token_file(home / ".databricks/model-serving-token.json", first)
+                if renewed:
+                    (home / "ug-fresh").write_text(renewed, encoding="utf-8")
+                    _token_file(home / "isaac-fresh", renewed)
+                with (
+                    mock.patch.object(launcher, "ISAAC", isaac),
+                    mock.patch.object(launcher, "_eprint") as printed,
+                ):
+                    self.assertEqual(self.mint(helper, home), expected)
+                self.assertEqual(printed.called, expected == stale)
+                if helper == ug:
+                    renewal = [] if expected == ample else [f"{UG_ARGS} --force-refresh"]
+                    self.assertEqual(_lines(home / "ug-calls"), [UG_ARGS, *renewal])
+                else:
+                    self.assertEqual(_lines(home / "isaac-calls"), ["auth refresh"])
 
-        with tempfile.TemporaryDirectory() as value:
-            home = Path(value)
-            helper = home / ".local/bin/ug"
-            helper.parent.mkdir(parents=True)
-            helper.write_text("", encoding="utf-8")
-            settings = home / "managed-settings.json"
-            settings.write_text(
-                json.dumps(
-                    {
-                        "apiKeyHelper": (
-                            f"{helper} auth-token --host https://example.test "
-                            "--profile managed-oauth"
-                        )
-                    }
-                ),
-                encoding="utf-8",
-            )
-            stale, fresh, ample = jwt(16), jwt(60), jwt(55)
-            cases = {
-                "renewed": ([stale, fresh], fresh),
-                "renewal failed": ([stale, ""], stale),
-                "plenty left": ([ample], ample),
-            }
-            for label, (outputs, expected) in cases.items():
-                with self.subTest(label), mock.patch.object(
-                    launcher,
-                    "_run",
-                    side_effect=[
-                        subprocess.CompletedProcess([], 0, f"{out}\n", "")
-                        for out in outputs
-                    ],
-                ) as run, mock.patch.object(launcher, "_eprint") as printed:
-                    token = launcher._managed_claude_bearer(
-                        home, {"HOME": str(home)}, (settings,)
-                    )
-                self.assertEqual(token, expected)
-                self.assertEqual(run.call_count, len(outputs))
-                if len(outputs) == 2:
-                    self.assertEqual(run.call_args.args[0][-1], "--force-refresh")
-                self.assertEqual(printed.called, label == "renewal failed")
 
+class ModelResolutionTests(unittest.TestCase):
     def test_explicit_environment_wins_for_all_three_models(self) -> None:
         environment = {
             "TRIPLE_STAMP_SUPERVISOR_MODEL": "explicit-supervisor",

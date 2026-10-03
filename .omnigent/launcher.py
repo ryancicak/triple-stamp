@@ -264,54 +264,109 @@ def _jwt_seconds_left(token: str) -> float | None:
         return None
 
 
-def _managed_claude_bearer(
-    real_home: Path,
-    host_env: dict[str, str],
-    paths: tuple[Path, ...] = CLAUDE_MANAGED_SETTINGS,
-) -> str:
-    """Mint gateway auth before the isolated HOME loses secure-store access."""
+# The apiKeyHelper command belongs to whoever manages the Mac. On 2026-10-02 it
+# changed from `ug auth-token --host ... --profile ...` to reading Isaac's token
+# file with jq, and a launcher that accepted only the first shape refused to
+# start. So never judge the command by its text: run it the way Claude Code
+# does (with /bin/sh) and use what it prints. The run's own copy is then proven
+# by the sandboxed Claude round trip in auth_preflight.py before any question.
+ISAAC = Path("/usr/local/bin/isaac")
+MODEL_SERVING_TOKEN = "model-serving-token.json"
+
+
+def _managed_api_key_helper(paths: tuple[Path, ...] = CLAUDE_MANAGED_SETTINGS) -> str:
+    """The managed apiKeyHelper command, or "" when no settings file sets one."""
 
     helper = ""
     for path in paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            candidate = payload.get("apiKeyHelper", "")
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        except (OSError, ValueError):
             continue
+        candidate = payload.get("apiKeyHelper") if isinstance(payload, dict) else None
         if isinstance(candidate, str) and candidate.strip():
             helper = candidate.strip()
+    return helper
+
+
+def _run_helper(
+    helper: str, host_env: dict[str, str], timeout: float = 30
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a login helper the way Claude Code does: one /bin/sh command line."""
+
+    return _run_quietly(["/bin/sh", "-c", helper], env=host_env, timeout=timeout)
+
+
+def _helper_token(result: subprocess.CompletedProcess[str] | None) -> str:
+    token = result.stdout.strip() if result is not None and not result.returncode else ""
+    return token if len(token) >= 20 else ""
+
+
+def _helper_failure(result: subprocess.CompletedProcess[str] | None) -> str:
+    if result is None:
+        return "it did not finish within 30 s"
+    said = next(
+        (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+        "",
+    )
+    why = f"it exited {result.returncode}" if result.returncode else "it printed no token"
+    return f"{why}: {_sanitize_plugin_output(said)[:300]}" if said else why
+
+
+def _isaac_token_file(helper: str) -> bool:
+    return MODEL_SERVING_TOKEN in helper and os.access(ISAAC, os.X_OK)
+
+
+def _renewed_helper_token(
+    helper: str, host_env: dict[str, str], *, browser_free: bool
+) -> str:
+    """Ask the login tool behind a known helper for a fresh token, else "".
+
+    ``browser_free`` limits this to Isaac's refresh, which never opens a
+    browser; ``ug --force-refresh`` stays on the near-expiry path it was
+    proven on.
+    """
+
+    if _isaac_token_file(helper):
+        _run_quietly([str(ISAAC), "auth", "refresh"], env=host_env, timeout=60)
+        return _helper_token(_run_helper(helper, host_env))
     try:
-        argv = shlex.split(helper)
-        expected = (real_home / ".local/bin/ug").resolve()
-        executable = Path(argv[0]).expanduser().resolve()
-    except (IndexError, OSError, ValueError):
-        argv = []
-        executable = Path("/")
-    if (
-        len(argv) != 6
-        or executable != expected
-        or argv[1] != "auth-token"
-        or argv[2] != "--host"
-        or not argv[3].startswith("https://")
-        or argv[4] != "--profile"
-        or not argv[5]
-    ):
+        words = shlex.split(helper)
+    except ValueError:
+        words = []
+    if not browser_free and words and Path(words[0]).name == "ug" and "auth-token" in words:
+        return _helper_token(_run_helper(f"{helper} --force-refresh", host_env, 60))
+    return ""
+
+
+def _managed_claude_bearer(
+    host_env: dict[str, str],
+    paths: tuple[Path, ...] = CLAUDE_MANAGED_SETTINGS,
+) -> str:
+    """Mint gateway auth before the isolated HOME loses secure-store access."""
+
+    helper = _managed_api_key_helper(paths)
+    if not helper:
+        # Nothing to mint. The sandboxed round trip shows whether Claude Code
+        # signs in some other way.
+        return ""
+    first = _run_helper(helper, host_env)
+    token = _helper_token(first)
+    if not token and first is not None:
+        # A quick failure may be an expired login that renews silently. A hang
+        # may be a sign-in waiting on a browser, so it is not run again.
+        token = _renewed_helper_token(helper, host_env, browser_free=True)
+    if not token:
+        sign_in = f"{ISAAC} --claude" if _isaac_token_file(helper) else "claude"
         _die(
-            "managed Claude apiKeyHelper is unavailable or has an unexpected shape",
-            EXIT_AUTH,
-        )
-    result = _run(argv, env=host_env, timeout=30)
-    token = result.stdout.strip()
-    if result.returncode or len(token) < 20:
-        _die(
-            "managed Claude gateway token could not be minted before isolation",
+            f"Claude Code's login helper did not return a token; {_helper_failure(first)}."
+            f"\nSign in once by running: {sign_in}\nThen run ./triple-stamp again.",
             EXIT_AUTH,
         )
     left = _jwt_seconds_left(token)
     if left is not None and left < MIN_GATEWAY_TOKEN_SECONDS:
-        renewed = _run([*argv, "--force-refresh"], env=host_env, timeout=60)
-        fresh = renewed.stdout.strip()
-        fresh_left = None if renewed.returncode else _jwt_seconds_left(fresh)
+        fresh = _renewed_helper_token(helper, host_env, browser_free=False)
+        fresh_left = _jwt_seconds_left(fresh) if fresh else None
         if fresh_left is not None and fresh_left > left:
             return fresh
         _eprint(
@@ -4003,7 +4058,7 @@ def _outer_main(root: Path, args: list[str]) -> int:
     _ensure_plugin(root, tools, host_env)
     cursor_token = _cursor_token(tools, host_env)
     claude_bearer = (
-        _managed_claude_bearer(real_home, host_env)
+        _managed_claude_bearer(host_env)
         if provider == "direct" and model_namespace == "databricks_gateway"
         else ""
     )
