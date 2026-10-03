@@ -10766,6 +10766,7 @@ print("exact temp boundary: PASS")
         self.assertTrue(answer.startswith(second["best_supported_answer"]))
         self.assertIn("Remaining evidence gaps:", answer)
         self.assertIn("cycle two gap", answer)
+        self.assertNotIn("quality approval", answer)
         self.assertFalse(answer.startswith("PIPELINE_"))
 
         with tempfile.TemporaryDirectory() as value, mock.patch.dict(
