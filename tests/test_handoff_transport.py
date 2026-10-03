@@ -197,7 +197,13 @@ class HandoffInputTests(unittest.TestCase):
         def broken(**_kwargs: object) -> list[dict[str, str]]:
             raise OSError("ledger unavailable")
 
-        with self.assertLogs(lifecycle.__name__, level="WARNING"):
+        # --self-test runs this suite with the user's own voice profile set,
+        # which adds a voice note to every judge handoff.
+        voice_off = {"TRIPLE_STAMP_VOICE_PROFILE": "", "TRIPLE_STAMP_VOICE_PROFILE_SHA256": ""}
+        with (
+            mock.patch.dict(os.environ, voice_off),
+            self.assertLogs(lifecycle.__name__, level="WARNING"),
+        ):
             result = lifecycle._runtime_handoff(
                 {"agent": "codex_judge", "args": '{"input": "judge"}'},
                 agent="codex_judge",

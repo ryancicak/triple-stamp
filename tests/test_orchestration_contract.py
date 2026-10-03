@@ -3663,13 +3663,17 @@ print("exact temp boundary: PASS")
         # exactly why the router sent it on to Codex.
         self.assertIsNone(plugin._valid_audit(repaired_output, own))
         self.assertIsNotNone(plugin._valid_audit(repaired_output, source))
-        self.assertEqual(
-            plugin._next_route(records, parent_session_id=parent).status,
-            "success",
-        )
-        self.assertTrue(
-            plugin._has_required_stage_chain(records, 1, parent_session_id=parent)
-        )
+        # The stamp says voice rendering is off, which --self-test with the
+        # user's voice profile set would otherwise reject.
+        voice_off = {"TRIPLE_STAMP_VOICE_PROFILE": "", "TRIPLE_STAMP_VOICE_PROFILE_SHA256": ""}
+        with mock.patch.dict(os.environ, voice_off):
+            self.assertEqual(
+                plugin._next_route(records, parent_session_id=parent).status,
+                "success",
+            )
+            self.assertTrue(
+                plugin._has_required_stage_chain(records, 1, parent_session_id=parent)
+            )
         with tempfile.TemporaryDirectory() as value, mock.patch.dict(
             os.environ,
             {
@@ -7469,8 +7473,12 @@ print("exact temp boundary: PASS")
             },
         ]
 
-        route_a = plugin._next_route(records, parent_session_id=session_a)
-        route_b = plugin._next_route(records, parent_session_id=session_b)
+        # The stamp has no voice check, which --self-test with the user's voice
+        # profile set would otherwise reject.
+        voice_off = {"TRIPLE_STAMP_VOICE_PROFILE": "", "TRIPLE_STAMP_VOICE_PROFILE_SHA256": ""}
+        with mock.patch.dict(os.environ, voice_off):
+            route_a = plugin._next_route(records, parent_session_id=session_a)
+            route_b = plugin._next_route(records, parent_session_id=session_b)
 
         self.assertEqual(route_a.status, "success")
         self.assertEqual(route_b.title, "cursor-cycle-1")
