@@ -2,7 +2,7 @@
 """Run a question set through the real Triple-stamp pipeline and score it.
 
     python3 tools/triple_stamp_eval.py eval/questions.example.json \
-        [--voice ~/path/profile.md] [--out /tmp/triple-stamp-eval] [--timeout-min 90]
+        [--voice ~/path/profile.md] [--out /tmp/triple-stamp-eval] [--timeout-min 150]
 
 This makes paid model calls: it launches ``./triple-stamp`` exactly as a user
 would (browser mode, no TTY), submits every question through the same local
@@ -519,7 +519,7 @@ def main() -> int:
     parser.add_argument("questions")
     parser.add_argument("--voice", default="")
     parser.add_argument("--out", default="/tmp/triple-stamp-eval")
-    parser.add_argument("--timeout-min", type=int, default=90)
+    parser.add_argument("--timeout-min", type=int, default=150)
     options = parser.parse_args()
     out = Path(options.out)
     out.mkdir(parents=True, exist_ok=True)

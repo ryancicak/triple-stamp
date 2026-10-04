@@ -543,6 +543,7 @@ def validate_spec(
             "audit-retry-N-1",
             "FRESH `opus_auditor` child",
             "judge-cycle-N",
+            "judge-retry-N-1",
             "judge-format-repair-N",
             "judge-convergence-N",
             f"This run permits exactly {prompt_cycles} complete cycles",
@@ -757,6 +758,8 @@ def validate_launchers(
         'r"cursor-retry-([1-4])-(1)"',
         'r"audit-internal-([1-4])-([1-2])"',
         'r"audit-retry-([1-4])-(1)"',
+        'r"judge-retry-([1-4])-(1)"',
+        "def add_codex_start_retry_note(",
     ):
         if marker not in runtime_state_source:
             fail(f"runtime attestation marker missing: {marker}")
@@ -873,6 +876,14 @@ def validate_launchers(
     ):
         fail("direct Codex wrapper still depends on Isaac")
 
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    # A refused supervisor turn is repeated on a fresh Claude CLI, which the
+    # continuation guard gets by closing this session's live one.
+    if not callable(getattr(ClaudeSDKExecutor, "close_session", None)) or not callable(
+        getattr(ClaudeSDKExecutor, "_session_key", None)
+    ):
+        fail("supervisor executor can no longer restart a session's Claude CLI")
     sdk_env = _build_claude_sdk_spawn_env(parse(runtime_bundle), cwd=root)
     expected_sdk = {
         "HARNESS_CLAUDE_SDK_MODEL": expected_models["triple-stamp"][0],
@@ -1209,6 +1220,43 @@ def validate_launchers(
         "cursor-retry-1-1",
     ):
         fail("zero-output Cursor inactivity did not resolve to one fresh retry")
+    unstarted_judge = {
+        "agent": "codex_judge",
+        "title": "judge-cycle-1",
+        "status": "failed",
+        "output": (
+            "Error: sub-agent turn failed: inner executor error: Codex native "
+            "thread never started: Codex app-server never started a thread "
+            "(startup timed out: TimeoutError)."
+        ),
+    }
+    judge_restart = _next_route([unstarted_judge])
+    if (judge_restart.status, judge_restart.agent, judge_restart.title) != (
+        "dispatch",
+        "codex_judge",
+        "judge-retry-1-1",
+    ):
+        fail("a judge whose Codex never started did not get one fresh judge")
+    second_unstarted = _next_route(
+        [unstarted_judge, {**unstarted_judge, "title": "judge-retry-1-1"}]
+    )
+    signed_out = _next_route(
+        [
+            {
+                **unstarted_judge,
+                "output": (
+                    "Error: sub-agent turn failed: inner executor error: Codex "
+                    "native thread never started: Codex is not signed in and no "
+                    "Omnigent provider routes the codex harness"
+                ),
+            }
+        ]
+    )
+    if (
+        second_unstarted.status != "infrastructure_failed"
+        or signed_out.status != "infrastructure_failed"
+    ):
+        fail("a Codex restart was not bounded to one start failure per cycle")
 
     runner_env = _build_runner_env(
         os.environ,
@@ -1247,6 +1295,7 @@ def validate_launchers(
         "DISABLE_AUTOUPDATER",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "DISABLE_TELEMETRY",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
     ]
     if selected_provider == "databricks":
         runner_required.extend(
@@ -1327,6 +1376,19 @@ def validate_launchers(
     }
     if contract(forbidden_retry).get("result") != "DENY":
         fail("second paid Opus retry was not denied before dispatch")
+    forbidden_restart = {
+        "type": "tool_call",
+        "data": {
+            "name": "sys_session_send",
+            "arguments": {
+                "agent": "codex_judge",
+                "title": "judge-retry-1-2",
+                "args": {"input": "must not launch"},
+            },
+        },
+    }
+    if contract(forbidden_restart).get("result") != "DENY":
+        fail("second Codex restart was not denied before dispatch")
 
     if _SUPERVISOR_ROUTE_LIMIT != _route_call_cap():
         fail("supervisor route-call formula drifted")

@@ -10,8 +10,10 @@ of a bare ``127`` from deep inside the launcher.
 
 Scope and non-goals:
 
-- No Databricks host, proxy, Isaac, or gateway is referenced anywhere here; this
-  is the public, outsider path only.
+- No Databricks host, proxy, or gateway is referenced anywhere here. The one
+  managed setup it knows is Isaac's own ``isaac codex`` launcher, which writes
+  Codex's model provider; where Isaac is not installed this is the public,
+  outsider path only.
 - It never weakens a model pin. A CLI that is installed but whose account lacks
   the pinned entitlement (Cursor Grok 4.6 Extra High, Claude Opus 5.5, the Codex
   model) still fails closed later in ``auth_preflight``, which names the model
@@ -57,6 +59,13 @@ LOGIN_ARGV = {
     "claude": ("claude", "auth", "login"),
     "codex": ("codex", "login"),
 }
+# On a Mac with Isaac, Codex reaches its model through Isaac's gateway, not an
+# OpenAI account. `isaac codex` writes that provider into ~/.codex/config.toml
+# before it hands off to Codex, so a version-only launch sets Codex up without
+# opening Codex's own sign-in (a teammate got OpenAI's email page, 2026-10-02).
+ISAAC = Path("/usr/local/bin/isaac")
+ISAAC_CODEX_SETUP_ARGV = ("codex", "--no-omni", "--", "--version")
+STATUS_TIMEOUT_SECONDS = 30
 
 
 def _opus_model() -> str:
@@ -329,6 +338,39 @@ def _run_login(argv: list[str], home: Path | None = None) -> None:
         raise RuntimeError(f"login exited with status {result.returncode}")
 
 
+def _isaac_codex_setup(home: Path, stream=sys.stderr) -> bool:
+    """Let Isaac write its Codex model provider, as every `isaac codex` does."""
+
+    if not (ISAAC.is_file() and os.access(ISAAC, os.X_OK)):
+        return False
+    print(
+        "triple-stamp setup: setting up Codex through Isaac...",
+        file=stream,
+        flush=True,
+    )
+    env = _subprocess_env(home)
+    # Launch the Codex binary itself (not ucode) and leave macOS managed
+    # settings alone, as .omnigent/codex-via-isaac does.
+    env["ISAAC_DEFAULT_UCODE"] = "0"
+    env["ISAAC_DISABLE_MAC_MANAGED_SETTINGS_UPDATE"] = "1"
+    try:
+        result = _run_bounded(
+            [str(ISAAC), *ISAAC_CODEX_SETUP_ARGV],
+            env=env,
+            timeout=LOGIN_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"triple-stamp setup: Isaac could not set up Codex: {exc}", file=stream)
+        return False
+    if result.returncode:
+        print(
+            f"triple-stamp setup: Isaac could not set up Codex (exit {result.returncode})",
+            file=stream,
+        )
+        return False
+    return True
+
+
 def _login(
     tool: Tool,
     executable: Path,
@@ -337,6 +379,15 @@ def _login(
     home: Path | None = None,
 ) -> None:
     if os.environ.get("TRIPLE_STAMP_BOOTSTRAP_SKIP_LOGIN") == "1":
+        return
+    base = home or _real_home()
+    if (
+        tool.key == "codex"
+        and _isaac_codex_setup(base, stream)
+        and auth_ready(tool, executable, base)
+    ):
+        # Isaac's own warnings (such as a skipped sudo step) were not fatal.
+        print("triple-stamp setup: Codex is set up through Isaac.", file=stream)
         return
     argv = list(LOGIN_ARGV[tool.key])
     argv[0] = str(executable)
@@ -368,6 +419,13 @@ def _codex_external_auth(home: Path) -> bool:
 
 
 def auth_ready(tool: Tool, executable: Path, home: Path) -> bool:
+    """Whether a CLI can run without a new browser sign-in.
+
+    Only a definite "logged out" answer opens a sign-in. A status check that
+    times out is left to the launcher's own login checks, which name the exact
+    login command, so a slow status check never opens a surprise sign-in page.
+    """
+
     commands = {
         "cursor-agent": [str(executable), "status"],
         "claude": [str(executable), "auth", "status"],
@@ -382,13 +440,19 @@ def auth_ready(tool: Tool, executable: Path, home: Path) -> bool:
                 "PATH": f"{home}/.local/bin:{os.environ.get('PATH', '')}",
             },
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=STATUS_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        return True
+    except OSError:
         return False
+    if tool.key == "cursor-agent":
+        # `cursor-agent status` prints "Not logged in" and still exits 0.
+        return "not logged in" not in str(result.stdout or "").lower()
     if result.returncode == 0:
         return True
     return tool.key == "codex" and _codex_external_auth(home)

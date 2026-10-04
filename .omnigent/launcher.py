@@ -252,6 +252,11 @@ def _managed_claude_environment(
 # a cached token minutes from expiry, and on 2026-09-27 a supervisor turn failed
 # with 401 sixteen minutes into a question, stalling that chat.
 MIN_GATEWAY_TOKEN_SECONDS = 45 * 60
+# Omnigent's runner exits after an hour with no activity. On 2026-10-03 a
+# gateway left an Opus request unanswered for 68 minutes while the supervisor
+# waited, so the runner exited and the chat closed with no message. The
+# launcher already owns the run's lifetime; three hours outlasts any stall.
+RUNNER_IDLE_TIMEOUT_S = 3 * 60 * 60
 
 
 def _jwt_seconds_left(token: str) -> float | None:
@@ -1767,7 +1772,7 @@ def _seed_isolated_home(
     # Ephemeral HOME is always a first launch for Omnigent's TUI. Persist a
     # theme so the startup picker does not block the documented prompt.
     (isolated_home / ".omnigent/config.yaml").write_text(
-        "tui:\n  theme: dark\n",
+        f"tui:\n  theme: dark\nrunner:\n  idle_timeout_s: {RUNNER_IDLE_TIMEOUT_S}\n",
         encoding="utf-8",
     )
     (isolated_home / ".omnigent/config.yaml").chmod(0o600)
@@ -1826,6 +1831,7 @@ def _write_omnigent_auth(
         + yaml.safe_dump(
             {
                 "tui": {"theme": "light"},
+                "runner": {"idle_timeout_s": RUNNER_IDLE_TIMEOUT_S},
                 "providers": {SUPERVISOR_PROVIDER: supervisor_provider},
             },
             sort_keys=False,
@@ -1905,6 +1911,7 @@ def _runtime_env(
         "DISABLE_AUTOUPDATER",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "DISABLE_TELEMETRY",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
         "AGENT_CLI_CREDENTIAL_STORE",
         "TRIPLE_STAMP_VOICE_PROFILE",
         "TRIPLE_STAMP_VOICE_PROFILE_SHA256",
@@ -1980,6 +1987,12 @@ def _runtime_env(
         "DISABLE_AUTOUPDATER": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_TELEMETRY": "1",
+        # Claude Code keeps a login helper's token for five minutes. Re-reading
+        # it every minute lets the default provider's supervisor pick up a token
+        # the login renewer just wrote. Omnigent sets its own interval for
+        # gateway-mode and native Claude processes, which still renew well
+        # before the old token expires.
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "60000",
         "PYTHONWARNINGS": "ignore:resource_tracker:UserWarning",
         "PYTHONPATH": str(root / ".omnigent/runtime-python"),
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -3305,7 +3318,8 @@ def _validated_best_effort_exit(
             rf"format-repair-{cycle}(?:-web-[1-2])?)"
         ),
         "codex_judge": (
-            rf"judge-(?:cycle|convergence|format-repair)-{cycle}"
+            rf"judge-(?:(?:cycle|convergence|format-repair)-{cycle}"
+            rf"|retry-{cycle}-1)"
         ),
     }
     collection_sequences: list[int] = []
@@ -3803,7 +3817,10 @@ def _ensure_terminal_failure(
     last = collections[-1] if collections else {}
     pending = _pending_dispatch(collections, dispatches)
     title = str(pending.get("title") or last.get("title") or "")
-    cycle_match = re.search(r"(?:cycle-|-(?:opus|codex)-)([1-4])(?:-|$)", title)
+    cycle_match = re.search(
+        r"(?:cycle-|retry-|internal-|repair-|convergence-|-(?:opus|codex)-)([1-4])(?:-|$)",
+        title,
+    )
     cycle = int(cycle_match.group(1)) if cycle_match else 0
     if title.startswith("cursor-cycle-"):
         next_stage = f"audit-cycle-{cycle}"
@@ -4084,6 +4101,135 @@ def _start_answer_saver(run_dir: Path, real_home: Path) -> _LiveAnswerSaver | No
         return None
 
 
+# A run used to keep the logins it started with: the model gateway token (24 h,
+# often cached with little left) and the usage token (about 1 h). A long session
+# then lost them mid-question. The outer launcher still has the real home, so it
+# renews the run's copies while the run is live, without opening a browser.
+_LOGIN_RENEW_INTERVAL_S = 300.0
+_USAGE_RENEW_SECONDS = 15 * 60
+
+
+def _token_file_seconds_left(path: Path) -> float | None:
+    """Seconds left on an Isaac token file's access token, or None."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    return _jwt_seconds_left(token) if isinstance(token, str) else None
+
+
+def _note_renewal(run_dir: Path, what: str) -> None:
+    """Record a renewal in the run folder; the live terminal belongs to the UI."""
+
+    with (run_dir / "login-renewals.log").open("a", encoding="utf-8") as log:
+        log.write(f"{datetime.now().isoformat(timespec='seconds')} {what}\n")
+
+
+def _replace_private_file(path: Path, data: bytes) -> None:
+    """Swap a run file's contents in one rename, readable only by this user."""
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.renew")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, path)
+
+
+def _renew_gateway_login(run_dir: Path, real_home: Path, host_env: dict[str, str]) -> None:
+    """Keep the run's copy of Isaac's gateway token ahead of its expiry."""
+
+    run_copy = run_dir / "home/.databricks" / MODEL_SERVING_TOKEN
+    real = real_home / ".databricks" / MODEL_SERVING_TOKEN
+    left = _token_file_seconds_left(run_copy)
+    if left is None or not _isaac_token_file(_managed_api_key_helper()):
+        return
+    if left < MIN_GATEWAY_TOKEN_SECONDS and (
+        _token_file_seconds_left(real) or 0.0
+    ) < MIN_GATEWAY_TOKEN_SECONDS:
+        # Isaac renews a token with under 30 minutes left and never opens a
+        # browser; with more left it keeps the one it has.
+        _run_quietly([str(ISAAC), "auth", "refresh"], env=host_env, timeout=60)
+    fresh_left = _token_file_seconds_left(real)
+    if fresh_left is not None and fresh_left > left + 60:
+        _replace_private_file(run_copy, real.read_bytes())
+        _note_renewal(
+            run_dir, f"model gateway login renewed, {int(fresh_left // 60)} min left"
+        )
+
+
+def _renew_usage_login(run_dir: Path, host_env: dict[str, str]) -> None:
+    """Re-mint the usage add-on's login before the usage tool sees it expire."""
+
+    usage = run_dir / "usage.json"
+    try:
+        config = json.loads(usage.read_text(encoding="utf-8"))
+        expires_at = float(config.get("expires_at") or 0)
+        profile = str(config["addon"]["databricks_profile"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    if not expires_at or expires_at - time.time() > _USAGE_RENEW_SECONDS:
+        return
+    databricks = shutil.which("databricks", path=host_env.get("PATH"))
+    if databricks is None:
+        return
+    token, fresh_expiry = _databricks_token(databricks, profile, host_env)
+    if not token or fresh_expiry <= expires_at:
+        return
+    config.update(token=token, expires_at=fresh_expiry)
+    _replace_private_file(usage, (json.dumps(config) + "\n").encode("utf-8"))
+    _note_renewal(
+        run_dir,
+        f"usage login renewed, {int((fresh_expiry - time.time()) // 60)} min left",
+    )
+
+
+class _LoginRenewer:
+    """Renew the run's gateway and usage logins from outside the sandbox."""
+
+    def __init__(self, run_dir: Path, real_home: Path, host_env: dict[str, str]) -> None:
+        self._run_dir = run_dir
+        self._real_home = real_home
+        self._host_env = host_env
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="triple-stamp-login-renewer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(_LOGIN_RENEW_INTERVAL_S):
+            for renew in (
+                lambda: _renew_gateway_login(
+                    self._run_dir, self._real_home, self._host_env
+                ),
+                lambda: _renew_usage_login(self._run_dir, self._host_env),
+            ):
+                try:
+                    renew()
+                except Exception:  # noqa: BLE001 - a failed renewal never stops the run
+                    continue
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=90)
+
+
+def _start_login_renewer(
+    run_dir: Path, real_home: Path, host_env: dict[str, str]
+) -> _LoginRenewer | None:
+    try:
+        return _LoginRenewer(run_dir, real_home, host_env)
+    except Exception:  # noqa: BLE001 - the run still has the logins it started with
+        return None
+
+
 def _retain_runtime_diagnostics(
     *,
     models_started: bool,
@@ -4185,9 +4331,11 @@ def _outer_main(root: Path, args: list[str]) -> int:
             _remove_managed_cursor_files(root)
             hooks_snapshot = _snapshot_cursor_file(root, "hooks.json")
             mcp_snapshot = _snapshot_cursor_file(root, "mcp.json")
+            login_renewer: _LoginRenewer | None = None
             try:
                 models_started = True
                 answer_saver = _start_answer_saver(run_dir, real_home)
+                login_renewer = _start_login_renewer(run_dir, real_home, host_env)
                 child_code = _spawn_sandboxed(
                     root,
                     profile,
@@ -4206,6 +4354,8 @@ def _outer_main(root: Path, args: list[str]) -> int:
                     _emit_terminal_failure(run_dir, args)
                 return run_return_code
             finally:
+                if login_renewer is not None:
+                    login_renewer.stop()
                 survivors = _cleanup_runtime_services(
                     tools,
                     run_id,

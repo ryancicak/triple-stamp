@@ -43,6 +43,7 @@ from triple_stamp_runtime_state import (
     record_best_effort_answer,
     read_supervisor_tool_calls,
     record_terminal_failure,
+    reserve_codex_retry,
     reserve_cursor_retry,
     reserve_opus_retry,
     write_budget_state,
@@ -157,6 +158,7 @@ _PROGRESS_ACTION = {
     "audit_repair": "reformatting the audit",
     "audit_repair_web": "reformatting the audit",
     "judge": "fact-checking and writing the final answer",
+    "judge_retry": "restarting the final check after Codex did not start",
     "judge_convergence": "making the final call on the remaining gaps",
     "judge_repair": "reformatting the final judgment",
 }
@@ -172,7 +174,9 @@ _PROGRESS_STAGE_IDS = {
             "audit_repair_web",
         }
     ),
-    "codex_judge": frozenset({"judge", "judge_convergence", "judge_repair"}),
+    "codex_judge": frozenset(
+        {"judge", "judge_retry", "judge_convergence", "judge_repair"}
+    ),
 }
 _NO_OUTPUT = re.compile(
     r"^\[System: sub-agent task \S+ completed — "
@@ -222,6 +226,10 @@ _TRANSIENT_OPUS_STREAM_MARKERS = (
     "http 503",
     "http 504",
     "http 529",
+    # Claude Code's own envelope after the gateway left a request unanswered
+    # through every retry; on 2026-10-03 it ended an audit after 68 silent
+    # minutes.
+    "request timed out",
 )
 # One fresh retry per cycle. A transient death dispatches audit-retry-N-1; a
 # second transient death (on that retry) is terminal infrastructure failure.
@@ -233,6 +241,16 @@ _OPUS_TRANSIENT_RETRY_CAP = 1
 # timeout or an explicit provider-error turn. It is a transport recovery in
 # the same quality cycle, not a new research/rework cycle.
 _CURSOR_RETRY_CAP = 1
+# One fresh judge, judge-retry-N-1, may replace a judge-cycle-N whose Codex
+# app-server never started a thread. That judge did no work. On 2026-10-03 one
+# timed out at startup with swap nearly full and ended a question whose
+# research and audit had both finished. A "not signed in" startup error is
+# not on this list, because a fresh child would fail the same way.
+_CODEX_START_RETRY_CAP = 1
+_CODEX_START_FAILURE_MARKERS = (
+    "codex app-server never started a thread (",
+    "codex native bridge state is missing",
+)
 
 
 def _has_incomplete_stream_marker(text: object) -> bool:
@@ -1316,6 +1334,69 @@ def _cursor_retry_route(
     )
 
 
+def _is_codex_start_failure(record: dict[str, Any]) -> bool:
+    """Whether a judge failed only because Codex never started a thread."""
+
+    if record.get("agent") != "codex_judge" or record.get("status") != "failed":
+        return False
+    text = " ".join(
+        str(record.get(field) or "")
+        for field in ("output", "error", "launch_error")
+    ).lower()
+    return any(marker in text for marker in _CODEX_START_FAILURE_MARKERS)
+
+
+def _codex_start_retries_used(records: list[dict[str, Any]], cycle: int) -> int:
+    """Count fresh judges already spent on a Codex start failure this cycle."""
+
+    return sum(
+        1
+        for record in records
+        if (
+            (parsed := _stage(record.get("title"))) is not None
+            and parsed.kind == "judge_retry"
+            and parsed.cycle == cycle
+        )
+    )
+
+
+def _codex_start_retry_route(records: list[dict[str, Any]], cycle: int) -> _Route:
+    """Restart a judge whose Codex never started, once per cycle."""
+
+    if _codex_start_retries_used(records, cycle) >= _CODEX_START_RETRY_CAP:
+        return _Route(
+            "infrastructure_failed",
+            cycle,
+            reason=(
+                f"Codex did not start the judge in cycle {cycle}, and its one "
+                "restart did not start either"
+            ),
+        )
+    return _Route(
+        "dispatch",
+        cycle,
+        "codex_judge",
+        f"judge-retry-{cycle}-1",
+        requester="codex",
+        hop=1,
+        reason="Codex never started the judge; one fresh judge gets the same evidence",
+    )
+
+
+def _cycle_judge_title(records: list[dict[str, Any]], cycle: int) -> str:
+    """The cycle's live judge session, which is its restart once Codex restarted."""
+
+    restarted = f"judge-retry-{cycle}-1"
+    if any(
+        record.get("agent") == "codex_judge"
+        and record.get("title") == restarted
+        and record.get("status") == "completed"
+        for record in records
+    ):
+        return restarted
+    return f"judge-cycle-{cycle}"
+
+
 def _opus_transient_retries_used(
     records: list[dict[str, Any]],
     cycle: int,
@@ -1396,7 +1477,7 @@ def _prior_equivalent_rework(
         if (
             parsed is None
             or parsed.cycle != cycle - 1
-            or parsed.kind not in {"judge", "judge_repair"}
+            or parsed.kind not in {"judge", "judge_retry", "judge_repair"}
         ):
             continue
         previous = _valid_judgment(record.get("output"))
@@ -1462,7 +1543,9 @@ def _verdict_route(
     if requester == "opus":
         # FAIL still goes to Codex.  Opus is an adversarial auditor; Codex is
         # the contract's final adjudicator and may return the concrete REWORK.
-        return _Route("dispatch", cycle, "codex_judge", f"judge-cycle-{cycle}")
+        return _Route(
+            "dispatch", cycle, "codex_judge", _cycle_judge_title(records, cycle)
+        )
     if verdict == "REWORK":
         punch_list = json.dumps(
             payload.get("punch_list_for_cursor", []),
@@ -1594,6 +1677,8 @@ def _reduce_next_route(
             parsed.cycle,
             reason="Cursor produced no complete packet after a retryable transport failure",
         )
+    if parsed.kind in {"judge", "judge_retry"} and _is_codex_start_failure(last):
+        return _codex_start_retry_route(records, parsed.cycle)
     if last.get("status") != "completed" or not str(last.get("output", "")).strip():
         return _Route(
             "infrastructure_failed",
@@ -1616,7 +1701,7 @@ def _reduce_next_route(
                 requester="opus",
                 hop=parsed.hop,
             )
-        title = f"judge-cycle-{cycle}"
+        title = _cycle_judge_title(records, cycle)
         return _Route(
             "dispatch",
             cycle,
@@ -1734,7 +1819,7 @@ def _reduce_next_route(
                 )
             ),
         )
-    if parsed.kind in {"judge", "judge_repair"}:
+    if parsed.kind in {"judge", "judge_retry", "judge_repair"}:
         raw_judgment = next(
             iter(_mapping_candidates(str(last.get("output") or ""))),
             None,
@@ -2038,16 +2123,17 @@ def _latest_codex_stamp(
     for record in reversed(records):
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
-        match = re.fullmatch(
-            r"judge-(?:cycle|convergence)-([1-4])",
-            record["title"],
-        )
-        if match is None:
+        parsed = _stage(record["title"])
+        if parsed is None or parsed.kind not in {
+            "judge",
+            "judge_retry",
+            "judge_convergence",
+        }:
             continue
         for payload in _mapping_candidates(record["output"]):
             answer = _valid_stamp(payload)
             if answer is not None:
-                return answer, int(match.group(1))
+                return answer, parsed.cycle
     return None
 
 
@@ -2410,7 +2496,8 @@ def _best_effort_provenance(
             or record.get("status") != "completed"
             or parsed is None
             or parsed.cycle != cycle
-            or parsed.kind not in {"judge", "judge_repair", "judge_convergence"}
+            or parsed.kind
+            not in {"judge", "judge_retry", "judge_repair", "judge_convergence"}
         ):
             continue
         review = _valid_judgment(record.get("output"))
@@ -2616,6 +2703,14 @@ def _has_terminal_worker_failure(parent_session_id: str = "") -> bool:
                 )
             ):
                 continue
+            # A judge whose Codex never started did no work; its one fresh
+            # judge-retry-N-1 makes it recoverable, like an Opus stream death.
+            if (
+                parsed is not None
+                and parsed.kind == "judge"
+                and _is_codex_start_failure(record)
+            ):
+                continue
             return True
         lowered = output.lower()
         if any(marker in lowered for marker in pin_markers):
@@ -2641,9 +2736,8 @@ def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
     for record in records:
         if record["agent"] != "codex_judge" or record["status"] != "completed":
             continue
-        title = str(record.get("title") or "")
-        match = re.fullmatch(r"judge-cycle-([1-4])", title)
-        if match is None:
+        parsed = _stage(record.get("title"))
+        if parsed is None or parsed.kind not in {"judge", "judge_retry"}:
             continue
         payload = _valid_judgment(record["output"])
         if payload is not None and payload.get("verdict") in {
@@ -2651,7 +2745,7 @@ def _max_unstamped_judgments(parent_session_id: str = "") -> bool:
             "NEEDS_WEB",
             "NEEDS_INTERNAL",
         }:
-            cycles.add(int(match.group(1)))
+            cycles.add(parsed.cycle)
     return len(cycles) >= _MAX_CYCLES
 
 
@@ -2839,6 +2933,23 @@ def supervisor_contract(
                             f"title {pending.title}."
                         ),
                     }
+                if (
+                    pending.status == "dispatch"
+                    and pending.title.startswith("judge-retry-")
+                    and parsed.kind in {"judge", "judge_retry"}
+                    and title != pending.title
+                ):
+                    # The judge Codex never started keeps its startup error, so
+                    # sending its title again fails at once and ends the run.
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"{pending.title} must run next: Codex never started "
+                            "this cycle's judge, so the judge continues as that "
+                            "fresh child. Dispatch codex_judge with title "
+                            f"{pending.title}."
+                        ),
+                    }
             if _public_only_reaudit(title, parent_session_id):
                 # On 2026-10-03 a public-only supervisor followed NEEDS_INTERNAL
                 # to audit-internal-1-1. Opus had no tool to call, ran for ten
@@ -2895,6 +3006,56 @@ def supervisor_contract(
                         "reason": (
                             "Only one Cursor transport retry is allowed per "
                             "parent, attempt generation, and cycle; the retry "
+                            "reservation is already spent or unavailable."
+                        ),
+                    }
+            if title.startswith("judge-retry-"):
+                retry = re.fullmatch(r"judge-retry-([1-4])-([1-9][0-9]*)", title)
+                if retry is None or int(retry.group(2)) != 1:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one Codex restart is allowed per cycle; "
+                            "judge-retry-N-2 and higher are forbidden."
+                        ),
+                    }
+                if not parent_session_id:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Codex restart lacks an authoritative parent "
+                            "session; unscoped dispatch is forbidden."
+                        ),
+                    }
+                active_records = read_attempt_collections(
+                    parent_session_id=parent_session_id
+                )
+                route = _next_route(
+                    active_records,
+                    parent_session_id=parent_session_id,
+                )
+                if route.status != "dispatch" or route.title != title:
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            f"{title} is not the durable next route for this "
+                            "attempt; a speculative Codex restart is forbidden."
+                        ),
+                    }
+                # After a web hop the restarted judge resumes under its own
+                # title; only its first dispatch spends the reservation.
+                resumed = any(
+                    record.get("title") == title for record in active_records
+                )
+                if not resumed and not reserve_codex_retry(
+                    parent_session_id,
+                    int(retry.group(1)),
+                ):
+                    return {
+                        "result": "DENY",
+                        "reason": (
+                            "Only one Codex restart is allowed per parent, "
+                            "attempt generation, and cycle; the restart "
                             "reservation is already spent or unavailable."
                         ),
                     }

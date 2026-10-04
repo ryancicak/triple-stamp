@@ -233,7 +233,8 @@ prompt: |
   claim, exact query/command, where to look, break attempt, kill condition, and
   prove condition. For Opus hop H, dispatch Cursor under the canonical title
   `cursor-web-opus-N-H`; for Codex use `cursor-web-codex-N-H`. Continue Codex
-  with named mode by reusing `(codex_judge, judge-cycle-N)`. For Opus, launch a
+  with named mode by reusing `(codex_judge, judge-cycle-N)`, or its restart
+  `(codex_judge, judge-retry-N-1)` when Codex was restarted. For Opus, launch a
   FRESH `opus_auditor` child titled `audit-cycle-N-web-H`; do not reuse,
   continue, or resume the prior Claude terminal. Its handoff must be
   self-contained: original request, original current-cycle Cursor packet,
@@ -293,6 +294,13 @@ prompt: |
   that title. This is a new native Claude process and session, never a resume of
   the dead terminal, and it does not advance the cycle counter. At most one such
   retry per cycle is allowed; a second mid-stream death is terminal
+  `PIPELINE_INFRASTRUCTURE_ERROR`.
+  A Codex judge whose app-server never started a thread did no work, so it is
+  not a genuine launch failure either. The `[System-required next dispatch: ...]`
+  line names a fresh `judge-retry-N-1` child; dispatch exactly that title with
+  the same Codex handoff. It stays in cycle N, and after its NEEDS_WEB hop it
+  continues as `(codex_judge, judge-retry-N-1)`. At most one such restart per
+  cycle is allowed; a second start failure is terminal
   `PIPELINE_INFRASTRUCTURE_ERROR`.
 
   CURSOR DELIVERY

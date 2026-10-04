@@ -23,6 +23,7 @@ _DISPATCH_TITLE_PATTERNS = (
     (r"audit-retry-([1-4])-(1)", "audit_retry", "opus"),
     (r"audit-internal-([1-4])-([1-2])", "audit_internal", "codex"),
     (r"judge-cycle-([1-4])", "judge", "codex"),
+    (r"judge-retry-([1-4])-(1)", "judge_retry", "codex"),
     (r"judge-convergence-([1-4])", "judge_convergence", "codex"),
     (r"audit-format-repair-([1-4])", "audit_repair", "opus"),
     (
@@ -42,6 +43,7 @@ _HOP_STAGE_IDS = frozenset(
         "audit_repair_web",
         "cursor_retry",
         "cursor_web",
+        "judge_retry",
     }
 )
 _TOOL_DISPATCH_EXCEPTIONS = (
@@ -290,7 +292,7 @@ def _reserve_stage_retry(
         or not isinstance(cycle, int)
         or cycle < 1
         or cycle > 4
-        or stage not in {"cursor", "opus"}
+        or stage not in {"cursor", "opus", "codex"}
     ):
         return False
     activate_parent_attempt(parent_session_id, "")
@@ -369,7 +371,7 @@ def release_retry_reservation(
         or not isinstance(cycle, int)
         or cycle < 1
         or cycle > 4
-        or stage not in {"cursor", "opus"}
+        or stage not in {"cursor", "opus", "codex"}
         or native_send_status != "not_launched"
     ):
         return False
@@ -429,6 +431,19 @@ def reserve_cursor_retry(
         parent_session_id,
         cycle,
         stage="cursor",
+    )
+
+
+def reserve_codex_retry(
+    parent_session_id: str,
+    cycle: int,
+) -> bool:
+    """Reserve the one fresh judge for a Codex that never started."""
+
+    return _reserve_stage_retry(
+        parent_session_id,
+        cycle,
+        stage="codex",
     )
 
 
@@ -1817,6 +1832,60 @@ async def add_opus_internal_mcp_observation(
     return record
 
 
+def add_codex_start_retry_note(
+    payload: dict[str, Any],
+    *,
+    parent_session_id: str,
+) -> dict[str, Any]:
+    """Name the one fresh judge after Codex never started a thread.
+
+    Such a judge did no work, so the evidence it was handed is intact. The note
+    quotes ``_next_route`` over the ledger plus this record, as the audit note
+    does, so it cannot drift from the route the supervisor contract enforces.
+    """
+
+    record = dict(payload)
+    output = record.get("output")
+    # Inbox packets name their worker as `agent` or, on some paths, `tool_name`.
+    agent = record.get("agent") or record.get("tool_name")
+    if (
+        agent != "codex_judge"
+        or record.get("status") != "failed"
+        or not isinstance(output, str)
+        or not parent_session_id
+    ):
+        return record
+    candidate = {**record, "agent": agent, "parent_session_id": parent_session_id}
+    try:
+        from triple_stamp_isaac_launcher import _is_codex_start_failure, _next_route
+
+        if not _is_codex_start_failure(candidate):
+            return record
+        route = _next_route(
+            [
+                *read_attempt_collections(parent_session_id=parent_session_id),
+                candidate,
+            ],
+            parent_session_id=parent_session_id,
+        )
+    except (ImportError, TypeError, ValueError):
+        return record
+    target = str(getattr(route, "title", "") or "")
+    if (
+        str(getattr(route, "status", "") or "") != "dispatch"
+        or getattr(route, "agent", "") != "codex_judge"
+        or not target.startswith("judge-retry-")
+    ):
+        return record
+    record["output"] = output + (
+        "\n\n[System-required next dispatch: Codex never started this judge, so"
+        " it did no work and its evidence is intact. Dispatch codex_judge as one"
+        f" fresh child with title {target}. Do not resume the failed child, and"
+        " do not report PIPELINE_INFRASTRUCTURE_ERROR for this failure.]"
+    )
+    return record
+
+
 def _add_codex_punch_metadata(record: dict[str, Any]) -> dict[str, Any]:
     """Persist deterministic structured punch-list identities per cycle."""
 
@@ -1853,9 +1922,9 @@ def _add_codex_punch_metadata(record: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(record)
     signature = _punch_list_signature(normalized)
     title = str(enriched.get("title") or "")
-    match = re.search(r"([1-4])$", title)
+    parsed = parse_dispatch_title(title)
     metadata = {
-        "cycle": int(match.group(1)) if match else 0,
+        "cycle": int(parsed["cycle"]) if parsed else 0,
         "title": title,
         "child_session_id": str(enriched.get("child_session_id") or ""),
         "work_id": str(enriched.get("work_id") or ""),
@@ -2103,18 +2172,22 @@ def attest_codex_stamp(payload: dict[str, Any]) -> bool:
     answer_bytes = answer.encode("utf-8")
     evidence_bytes = output.encode("utf-8")
     title = str(payload.get("title") or "")
-    match = re.fullmatch(r"judge-(?:cycle|convergence)-([1-4])", title)
+    parsed = parse_dispatch_title(title)
     generation = current_attempt_generation(parent_session_id)
-    if match is None or not _has_required_stage_chain(
-        attempt_records,
-        int(match.group(1)),
-        parent_session_id=parent_session_id,
+    if (
+        parsed is None
+        or parsed["stage_id"] not in {"judge", "judge_retry", "judge_convergence"}
+        or not _has_required_stage_chain(
+            attempt_records,
+            int(parsed["cycle"]),
+            parent_session_id=parent_session_id,
+        )
     ):
         return False
     attestation = {
         "version": 1,
         "verdict": "STAMP",
-        "cycle": int(match.group(1)),
+        "cycle": int(parsed["cycle"]),
         "agent": "codex_judge",
         "title": title,
         "child_session_id": payload.get("child_session_id"),

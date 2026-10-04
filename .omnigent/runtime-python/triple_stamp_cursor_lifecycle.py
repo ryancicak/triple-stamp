@@ -107,7 +107,9 @@ _OPUS_PACKET_STAGES = frozenset(
         "audit_repair_web",
     }
 )
-_CODEX_PACKET_STAGES = frozenset({"judge", "judge_convergence", "judge_repair"})
+_CODEX_PACKET_STAGES = frozenset(
+    {"judge", "judge_retry", "judge_convergence", "judge_repair"}
+)
 _NEXT_DISPATCH_NOTE = re.compile(r"\n*\[System-required next dispatch: [^\]]*\]")
 _OPUS_EFFORT_LINE = re.compile(r"\[System-observed Opus runtime effort: [^\]]*\]")
 # Runtime-owned lines appended after a worker packet, in append order.
@@ -775,13 +777,18 @@ def _runtime_handoff(
 
     match = re.fullmatch(r"judge-format-repair-([1-4])", stage_title)
     if agent == "codex_judge" and match is not None:
-        source_title = f"judge-cycle-{match.group(1)}"
+        # The judgment to repair is the cycle's judge, or its restart when
+        # Codex never started the first one.
+        source_titles = {
+            f"judge-cycle-{match.group(1)}",
+            f"judge-retry-{match.group(1)}-1",
+        }
         source = next(
             (
                 str(record.get("output") or "")
                 for record in reversed(records)
                 if record.get("agent") == "codex_judge"
-                and record.get("title") == source_title
+                and record.get("title") in source_titles
                 and record.get("status") == "completed"
                 and str(record.get("output") or "").strip()
             ),
@@ -1806,6 +1813,7 @@ def install_parent_inbox_guard() -> None:
     from omnigent.runner import app as runner_app
     from omnigent.runner import tool_dispatch as dispatch
     from triple_stamp_runtime_state import (
+        add_codex_start_retry_note,
         add_opus_effort_observation,
         add_opus_internal_mcp_observation,
         append_collection,
@@ -2378,7 +2386,7 @@ def install_parent_inbox_guard() -> None:
                 and result.startswith("Error:")
                 and parent_session_id
                 and parsed is not None
-                and parsed["stage_id"] in {"cursor_retry", "audit_retry"}
+                and parsed["stage_id"] in {"cursor_retry", "audit_retry", "judge_retry"}
             ):
                 # Omnigent returns Error: text only on paths that did not post
                 # the child turn (including paths that created then tore down a
@@ -2387,11 +2395,11 @@ def install_parent_inbox_guard() -> None:
                 release_retry_reservation(
                     parent_session_id,
                     int(parsed["cycle"]),
-                    stage=(
-                        "cursor"
-                        if parsed["stage_id"] == "cursor_retry"
-                        else "opus"
-                    ),
+                    stage={
+                        "cursor_retry": "cursor",
+                        "audit_retry": "opus",
+                        "judge_retry": "codex",
+                    }[str(parsed["stage_id"])],
                     native_send_status="not_launched",
                 )
             if result == _MISSING_PARENT_INBOX and conversation_id:
@@ -2695,6 +2703,11 @@ def install_parent_inbox_guard() -> None:
                             )
                         )
                     )
+                    if not evaluation.retry_original:
+                        evaluated_payload = add_codex_start_retry_note(
+                            evaluated_payload,
+                            parent_session_id=str(conversation_id or ""),
+                        )
                     items.append(
                         dispatch._format_async_task_item(
                             _supervisor_inbox_view(evaluated_payload, inbox_limit)

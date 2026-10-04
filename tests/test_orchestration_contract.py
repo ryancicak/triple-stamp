@@ -966,6 +966,7 @@ class OrchestrationContractTests(unittest.TestCase):
             for stage, reserve in (
                 ("cursor", runtime_state.reserve_cursor_retry),
                 ("opus", runtime_state.reserve_opus_retry),
+                ("codex", runtime_state.reserve_codex_retry),
             ):
                 parent = f"{stage}-prelaunch-release-parent"
                 runtime_state.activate_parent_attempt(parent, "request")
@@ -1139,6 +1140,679 @@ class OrchestrationContractTests(unittest.TestCase):
             self.assertEqual(
                 runtime_state.read_dispatches(parent)[-1]["title"],
                 "cursor-retry-1-1",
+            )
+
+        self.assertEqual(model_turns, 2)
+        self.assertNotIn(
+            "PIPELINE_INFRASTRUCTURE_ERROR",
+            "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            ),
+        )
+
+    # The judge failure of 2026-10-03, verbatim apart from the provider name.
+    _UNSTARTED_JUDGE = (
+        "Error: sub-agent turn failed: inner executor error: Codex native thread "
+        "never started: Codex app-server never started a thread (startup timed "
+        "out: TimeoutError). Launch routing: provider 'codex-databricks' via "
+        "cli-config. (The runner log has the same near 'native-codex routing'.)"
+    )
+
+    def _judge_cycle_records(self) -> list[dict[str, str]]:
+        return [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "cursor evidence"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("PASS")),
+            {
+                **_route_packet(
+                    "codex_judge", "judge-cycle-1", self._UNSTARTED_JUDGE
+                ),
+                "status": "failed",
+            },
+        ]
+
+    def test_judge_whose_codex_never_started_gets_one_fresh_judge(self) -> None:
+        records = self._judge_cycle_records()
+        off = {
+            "TRIPLE_STAMP_VOICE_PROFILE": "",
+            "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+        }
+        with mock.patch.dict(os.environ, off, clear=False), mock.patch.object(
+            plugin, "configured_internal_systems", return_value=["glean"]
+        ):
+            route = plugin._next_route(records)
+            self.assertEqual(
+                (route.status, route.agent, route.title, route.cycle),
+                ("dispatch", "codex_judge", "judge-retry-1-1", 1),
+            )
+            for marker in (
+                "Codex native bridge state is missing",
+                "Codex app-server never started a thread (event stream ended "
+                "before a thread was created: RuntimeError)",
+            ):
+                with self.subTest(marker=marker):
+                    other = {**records[-1], "output": f"Error: {marker}"}
+                    self.assertEqual(
+                        plugin._next_route([*records[:-1], other]).title,
+                        "judge-retry-1-1",
+                    )
+            # A Codex that is not signed in fails the same way every time, and
+            # a judge the user cancelled is never started again.
+            for changed in (
+                {
+                    "output": (
+                        "Error: sub-agent turn failed: inner executor error: "
+                        "Codex native thread never started: Codex is not signed "
+                        "in and no Omnigent provider routes the codex harness"
+                    )
+                },
+                {"status": "cancelled"},
+            ):
+                with self.subTest(changed=changed):
+                    self.assertEqual(
+                        plugin._next_route(
+                            [*records[:-1], {**records[-1], **changed}]
+                        ).status,
+                        "infrastructure_failed",
+                    )
+
+            unstarted_retry = {
+                **records[-1],
+                "title": "judge-retry-1-1",
+                "child_session_id": "child-judge-retry-1-1",
+            }
+            exhausted = plugin._next_route([*records, unstarted_retry])
+            self.assertEqual(exhausted.status, "infrastructure_failed")
+            self.assertIn("restart did not start either", exhausted.reason)
+
+            def restarted(output: str) -> dict[str, str]:
+                return _route_packet("codex_judge", "judge-retry-1-1", output)
+
+            self.assertEqual(
+                plugin._next_route([*records, restarted(_judgment("REWORK"))]).title,
+                "cursor-cycle-2",
+            )
+            # After a web hop or an internal re-audit the restarted judge, not
+            # the one Codex never started, continues the cycle.
+            web = plugin._next_route(
+                [
+                    *records,
+                    restarted(_judgment("NEEDS_WEB")),
+                    _route_packet(
+                        "cursor_workhorse", "cursor-web-codex-1-1", "web evidence"
+                    ),
+                ]
+            )
+            self.assertEqual(
+                (web.agent, web.title, web.resume_child_session_id),
+                ("codex_judge", "judge-retry-1-1", "child-judge-retry-1-1"),
+            )
+            internal = plugin._next_route(
+                [
+                    *records,
+                    restarted(_judgment("NEEDS_INTERNAL")),
+                    _route_packet(
+                        "opus_auditor", "audit-internal-1-1", _audit("PASS")
+                    ),
+                ]
+            )
+            self.assertEqual(
+                (internal.agent, internal.title),
+                ("codex_judge", "judge-retry-1-1"),
+            )
+
+        for ledger, terminal in (
+            (records, False),
+            ([*records, restarted(_judgment("REWORK"))], False),
+            ([*records, unstarted_retry], True),
+        ):
+            with self.subTest(ledger=[row["title"] for row in ledger]):
+                with mock.patch.object(
+                    plugin, "read_attempt_collections", return_value=ledger
+                ):
+                    self.assertIs(
+                        plugin._has_terminal_worker_failure("judge-retry-parent"),
+                        terminal,
+                    )
+
+    def test_restarted_judge_stamp_is_attested_and_exits_cleanly(self) -> None:
+        answer = "Restarted judge's stamped answer."
+        stamp = json.dumps(
+            {
+                "verdict": "STAMP",
+                "needs_web": False,
+                "needs_internal": False,
+                "gap_materiality": "none",
+                "limitations": [],
+                "citations_that_hold": ["audit evidence"],
+                "voice_profile_check": {"source_path": "", "sha256": ""},
+                "shippable_answer": answer,
+            }
+        )
+        judge = _route_packet("codex_judge", "judge-retry-1-1", stamp)
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            ledger = [*self._judge_cycle_records(), judge]
+            for record in ledger:
+                runtime_state.append_collection(record)
+            with mock.patch.object(
+                plugin, "read_attempt_collections", return_value=ledger
+            ):
+                self.assertEqual(plugin._latest_codex_stamp("parent"), (answer, 1))
+            self.assertTrue(runtime_state.attest_codex_stamp(judge))
+            with mock.patch.object(launcher, "_eprint"):
+                self.assertEqual(
+                    launcher._validated_pipeline_exit(
+                        Path(value), 0, ["-p", "prompt"]
+                    ),
+                    0,
+                )
+
+        # A bounded answer whose judgment came from the restarted judge also
+        # passes the launcher's exit check, which names the judge's title.
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            ledger = [
+                _route_packet(
+                    "cursor_workhorse", "cursor-cycle-1", "bounded customer answer"
+                ),
+                _route_packet("opus_auditor", "audit-cycle-1", _audit("PASS_WITH_GAPS")),
+                self._judge_cycle_records()[-1],
+                _route_packet("codex_judge", "judge-retry-1-1", _judgment("REWORK")),
+            ]
+            for record in ledger:
+                runtime_state.append_collection(record)
+            supported = json.loads(_judgment("REWORK"))["best_supported_answer"]
+            self.assertEqual(
+                runtime_state.record_best_effort_answer(
+                    supported,
+                    ledger,
+                    cycle=1,
+                    reason="bounded answer from the restarted judge",
+                ),
+                supported,
+            )
+            with mock.patch.object(launcher, "_eprint"):
+                self.assertEqual(
+                    launcher._validated_pipeline_exit(
+                        Path(value), 0, ["-p", "prompt"]
+                    ),
+                    0,
+                )
+
+    def test_codex_restart_is_reserved_once_and_resumes_after_a_hop(self) -> None:
+        parent = "codex-restart-reservation-parent"
+
+        def send(title: str) -> dict[str, str]:
+            return {
+                "type": "tool_call",
+                "data": {
+                    "name": "sys_session_send",
+                    "arguments": {"agent": "codex_judge", "title": title},
+                },
+                "context": {
+                    "conversation_id": parent,
+                    "root_conversation_id": parent,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            for record in self._judge_cycle_records():
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": parent}
+                )
+            contract = plugin.supervisor_contract(enabled=True)
+            stale = contract(send("judge-cycle-1"))
+            self.assertEqual(stale["result"], "DENY")
+            self.assertIn("judge-retry-1-1 must run next", stale["reason"])
+            self.assertEqual(contract(send("judge-retry-1-2"))["result"], "DENY")
+            self.assertEqual(contract(send("judge-retry-1-1"))["result"], "ALLOW")
+            duplicate = contract(send("judge-retry-1-1"))
+            self.assertEqual(duplicate["result"], "DENY")
+            self.assertIn("reservation is already spent", duplicate["reason"])
+            for record in (
+                _route_packet(
+                    "codex_judge", "judge-retry-1-1", _judgment("NEEDS_WEB")
+                ),
+                _route_packet(
+                    "cursor_workhorse", "cursor-web-codex-1-1", "web evidence"
+                ),
+            ):
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": parent}
+                )
+            self.assertEqual(contract(send("judge-retry-1-1"))["result"], "ALLOW")
+            self.assertEqual(contract(send("judge-cycle-1"))["result"], "DENY")
+
+    def test_codex_start_failure_note_names_the_fresh_judge(self) -> None:
+        parent = "codex-start-note-parent"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            *earlier, failed = self._judge_cycle_records()
+            for record in earlier:
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": parent}
+                )
+            noted = runtime_state.add_codex_start_retry_note(
+                failed, parent_session_id=parent
+            )
+            self.assertTrue(noted["output"].startswith(self._UNSTARTED_JUDGE))
+            self.assertIn(
+                "[System-required next dispatch: Codex never started this judge",
+                noted["output"],
+            )
+            self.assertIn("title judge-retry-1-1.", noted["output"])
+            self.assertEqual(
+                plugin._next_route([*earlier, noted]).title, "judge-retry-1-1"
+            )
+            renamed = {key: value for key, value in failed.items() if key != "agent"}
+            renamed["tool_name"] = "codex_judge"
+            self.assertIn(
+                "title judge-retry-1-1.",
+                runtime_state.add_codex_start_retry_note(
+                    renamed, parent_session_id=parent
+                )["output"],
+            )
+            runtime_state.append_collection({**noted, "parent_session_id": parent})
+            second = {**failed, "title": "judge-retry-1-1"}
+            for unchanged in (
+                second,
+                {**failed, "status": "completed", "output": _judgment("REWORK")},
+                {**failed, "output": "Error: Codex is not signed in"},
+            ):
+                with self.subTest(unchanged=unchanged["output"][:40]):
+                    self.assertEqual(
+                        runtime_state.add_codex_start_retry_note(
+                            unchanged, parent_session_id=parent
+                        ),
+                        unchanged,
+                    )
+
+    def test_restarted_judge_gets_the_full_cycle_evidence(self) -> None:
+        records = self._judge_cycle_records()
+        labels = [
+            label
+            for label, _text in cursor_lifecycle._stage_packets(
+                "codex_judge", "judge-retry-1-1", records
+            )
+        ]
+        self.assertEqual(
+            labels,
+            [
+                "cursor_workhorse cursor-cycle-1 (current-cycle Stage 1 packet)",
+                "opus_auditor audit-cycle-1 (final audit)",
+            ],
+        )
+        malformed = "the restarted judge wrote no JSON object"
+        with mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_VOICE_PROFILE": "", "TRIPLE_STAMP_VOICE_PROFILE_SHA256": ""},
+            clear=False,
+        ):
+            repair = cursor_lifecycle._codex_runtime_handoff(
+                {
+                    "agent": "codex_judge",
+                    "title": "judge-format-repair-1",
+                    "args": {"input": "FORMAT REPAIR ONLY"},
+                },
+                title="judge-format-repair-1",
+                parent_session_id="parent",
+                read_attempt_collections=lambda **_kwargs: [
+                    *records,
+                    _route_packet("codex_judge", "judge-retry-1-1", malformed),
+                ],
+            )
+        self.assertIn(malformed, repair["args"]["input"])
+
+    def _refused_supervisor(
+        self,
+        parent: str,
+        attempts: list[str],
+    ) -> tuple[list[object], list[float], int, list[str]]:
+        """Drive the guarded supervisor through scripted model attempts.
+
+        Each attempt is ``"refuse"`` (the gateway's 403 before any tool call),
+        ``"send-then-refuse"``, or ``"dispatch"`` (sends cursor-cycle-1).
+        Returns the events, the waits, the model attempts, and the session keys
+        whose Claude CLI the guard closed.
+        """
+
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import (
+            ExecutorError,
+            ToolCallRequest,
+            TurnComplete,
+        )
+
+        original_run_turn = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        original_sleep = supervisor_runtime._provider_refusal_sleep
+        refusal = (
+            "Claude SDK provider authentication failed (authentication_failed, "
+            "status=403). Check your Claude CLI login status (`claude /status`) "
+            "or API key configuration."
+        )
+        turns = 0
+        waits: list[float] = []
+
+        async def scripted(*_args: object, **_kwargs: object):
+            nonlocal turns
+            step = attempts[min(turns, len(attempts) - 1)]
+            turns += 1
+            if step in {"dispatch", "send-then-refuse"}:
+                yield ToolCallRequest(
+                    name="mcp__omnigent__sys_session_send",
+                    args={"agent": "cursor_workhorse", "title": "cursor-cycle-1"},
+                )
+                runtime_state.append_dispatch(
+                    {
+                        "parent_session_id": parent,
+                        "child_session_id": "cursor-child",
+                        "work_id": "cursor-work",
+                        "agent": "cursor_workhorse",
+                        "title": "cursor-cycle-1",
+                    }
+                )
+            if step == "dispatch":
+                yield TurnComplete(response="")
+                return
+            yield ExecutorError(message=refusal)
+
+        async def no_wait(seconds: float) -> None:
+            waits.append(seconds)
+
+        closed: list[str] = []
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+            # Omnigent's ClaudeSDKExecutor keys its live CLI by session id.
+            def _session_key(self, messages: list[dict[str, object]]) -> str:
+                return str(messages[-1]["session_id"])
+
+            async def close_session(self, session_key: str) -> None:
+                closed.append(session_key)
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    [{"role": "user", "content": "2+2=?", "session_id": parent}],
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
+        supervisor_runtime._provider_refusal_sleep = no_wait
+        try:
+            supervisor_runtime.install_supervisor_continuation_guard()
+            events = asyncio.run(collect())
+        finally:
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = original_run_turn
+            supervisor_runtime._provider_refusal_sleep = original_sleep
+        return events, waits, turns, closed
+
+    def test_gateway_refusal_repeats_the_supervisor_turn_until_it_works(
+        self,
+    ) -> None:
+        from omnigent.inner.executor import ExecutorError
+
+        parent = "gateway-refusal-recovers-parent"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            events, waits, turns, closed = self._refused_supervisor(
+                parent, ["refuse", "refuse", "dispatch"]
+            )
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                runtime_state.read_dispatches(parent)[-1]["title"], "cursor-cycle-1"
+            )
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+        self.assertEqual(turns, 3)
+        self.assertEqual(waits, [30.0, 60.0])
+        self.assertEqual(actions.count("provider_refusal_retried"), 2)
+        # 2026-10-03: repeating a turn on the refused CLI only read its next
+        # stale refusal, so every repeat starts from a closed CLI.
+        self.assertEqual(closed, [parent, parent])
+        self.assertFalse(any(isinstance(event, ExecutorError) for event in events))
+
+    def test_gateway_refusal_that_lasts_ends_the_question_visibly(self) -> None:
+        from omnigent.inner.executor import ExecutorError, TextChunk
+
+        parent = "gateway-refusal-exhausted-parent"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            events, waits, turns, closed = self._refused_supervisor(
+                parent, ["refuse"]
+            )
+            failure = runtime_state.read_terminal_failure(parent)
+        self.assertEqual(turns, 5)
+        self.assertEqual(waits, [30.0, 60.0, 120.0, 240.0])
+        self.assertEqual(closed, [parent] * 5)
+        self.assertIn("kept refusing the supervisor", failure)
+        self.assertIn(
+            supervisor_runtime._customer_safe_terminal_failure(),
+            "".join(event.text for event in events if isinstance(event, TextChunk)),
+        )
+        self.assertFalse(any(isinstance(event, ExecutorError) for event in events))
+
+    def test_lasting_gateway_refusal_spares_a_stage_that_is_still_running(
+        self,
+    ) -> None:
+        """The review's case: an Opus audit is mid-run when the refusals run out."""
+
+        from types import SimpleNamespace
+
+        from omnigent.inner.executor import ExecutorError, TextChunk
+
+        parent = "gateway-refusal-running-stage-parent"
+        running = SimpleNamespace(status="running")
+        finished = SimpleNamespace(status="completed")
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": "opus-child",
+                    "work_id": "opus-work",
+                    "agent": "opus_auditor",
+                    "title": "audit-cycle-1",
+                }
+            )
+            dispatch_route = SimpleNamespace(status="dispatch")
+            with mock.patch(
+                "omnigent.runner.app.get_subagent_work", return_value=finished
+            ):
+                self.assertEqual(
+                    supervisor_runtime._refusal_outcome(dispatch_route, parent),
+                    "terminal",
+                )
+            for status in ("success", "best_effort"):
+                self.assertEqual(
+                    supervisor_runtime._refusal_outcome(
+                        SimpleNamespace(status=status), parent
+                    ),
+                    "relay",
+                )
+            with mock.patch(
+                "omnigent.runner.app.get_subagent_work", return_value=running
+            ):
+                self.assertEqual(
+                    supervisor_runtime._refusal_outcome(dispatch_route, parent),
+                    "abstain",
+                )
+                events, waits, turns, closed = self._refused_supervisor(
+                    parent, ["refuse"]
+                )
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+        self.assertEqual((turns, waits), (5, [30.0, 60.0, 120.0, 240.0]))
+        self.assertEqual(actions[-1], "provider_refusal_abstained")
+        self.assertNotIn(
+            supervisor_runtime._customer_safe_terminal_failure(),
+            "".join(event.text for event in events if isinstance(event, TextChunk)),
+        )
+        self.assertFalse(any(isinstance(event, ExecutorError) for event in events))
+
+    def test_gateway_refusal_after_a_send_is_not_repeated(self) -> None:
+        from omnigent.inner.executor import ExecutorError
+
+        parent = "gateway-refusal-after-send-parent"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            events, waits, turns, closed = self._refused_supervisor(
+                parent, ["send-then-refuse"]
+            )
+        self.assertEqual((turns, waits, closed), (1, [], []))
+        self.assertTrue(any(isinstance(event, ExecutorError) for event in events))
+
+    def test_omnigent_executor_can_still_restart_a_sessions_cli(self) -> None:
+        """Tripwire: the refusal retry closes the CLI through these two names."""
+
+        from omnigent.inner import claude_sdk_executor
+
+        executor = claude_sdk_executor.ClaudeSDKExecutor
+        self.assertTrue(callable(getattr(executor, "close_session", None)))
+        self.assertEqual(
+            executor._session_key(
+                None, [{"role": "user", "content": "2+2=?", "session_id": "chat-1"}]
+            ),
+            "chat-1",
+        )
+
+    def test_supervisor_failure_prose_cannot_cancel_codex_restart(self) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, ToolCallRequest, TurnComplete
+
+        parent = "codex-restart-continuation-parent"
+        original_run_turn = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        model_turns = 0
+        failure = (
+            "PIPELINE_INFRASTRUCTURE_ERROR: judge-cycle-1 failed: Codex "
+            "app-server never started a thread"
+        )
+
+        async def scripted(
+            _self: object,
+            _messages: object,
+            _tools: object,
+            _system_prompt: object,
+            _config: object = None,
+        ):
+            nonlocal model_turns
+            model_turns += 1
+            if model_turns == 1:
+                yield TextChunk(failure)
+                yield TurnComplete(response=failure)
+                return
+            yield ToolCallRequest(
+                name="mcp__omnigent__sys_session_send",
+                args={"agent": "codex_judge", "title": "judge-retry-1-1"},
+            )
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": "codex-restart-child",
+                    "work_id": "codex-restart-work",
+                    "agent": "codex_judge",
+                    "title": "judge-retry-1-1",
+                }
+            )
+            yield TurnComplete(response="")
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        messages = [{"role": "user", "content": "2+2=?", "session_id": parent}]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(),
+                    messages,
+                    [],
+                    "route",
+                    None,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(parent, "request")
+            for record in self._judge_cycle_records():
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": parent}
+                )
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = scripted
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original_run_turn
+
+            self.assertEqual(runtime_state.read_terminal_failure(parent), "")
+            self.assertEqual(
+                runtime_state.read_dispatches(parent)[-1]["title"],
+                "judge-retry-1-1",
             )
 
         self.assertEqual(model_turns, 2)
@@ -2419,6 +3093,9 @@ print("exact temp boundary: PASS")
             "Never begin a line with a number and a period unless it is a numbered-list",
             # A customer email must not carry internal links, plans, or CRM data.
             "goes to a customer, partner, or anyone else outside Databricks",
+            # 2026-10-03: an internal account question got a customer-safe
+            # answer with its Salesforce citations left out.
+            "A question about a customer or account is otherwise for the requester.",
             "only internal evidence supports",
             "must not go outside Databricks",
             "limited to Salesforce records (`salescloud` or `servicecloud`)",
@@ -4284,8 +4961,12 @@ print("exact temp boundary: PASS")
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
                 "DISABLE_TELEMETRY",
                 "DBEXEC_NO_CERT_REFRESH",
+                "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
             ):
                 self.assertIn(name, passthrough)
+            # A renewed login token must reach running Claude processes within
+            # a minute, not after Claude Code's five-minute default.
+            self.assertEqual(env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "60000")
             for name in (
                 "OMNIGENT_CLAUDE_LAUNCHER",
                 "ISAAC_BIN",
@@ -7958,6 +8639,42 @@ print("exact temp boundary: PASS")
         self.assertEqual(exhausted.status, "infrastructure_failed")
         self.assertIn("retries exhausted", exhausted.reason)
 
+    def test_audit_the_gateway_never_answered_gets_one_fresh_retry(self) -> None:
+        """2026-10-03: no reply for 68 minutes, then "Request timed out"."""
+
+        base = [
+            _route_packet("cursor_workhorse", "cursor-cycle-1", "CURSOR-1"),
+            _route_packet("opus_auditor", "audit-cycle-1", _audit("PASS")),
+            _route_packet(
+                "codex_judge", "judge-cycle-1", _judgment("NEEDS_INTERNAL")
+            ),
+        ]
+        stalled = {
+            **_route_packet(
+                "opus_auditor", "audit-internal-1-1", "Request timed out"
+            ),
+            "status": "failed",
+        }
+        with mock.patch.object(
+            plugin, "configured_internal_systems", return_value=["glean"]
+        ):
+            route = plugin._next_route([*base, stalled])
+            self.assertEqual(
+                (route.status, route.agent, route.title),
+                ("dispatch", "opus_auditor", "audit-retry-1-1"),
+            )
+            again = plugin._next_route(
+                [*base, stalled, {**stalled, "title": "audit-retry-1-1"}]
+            )
+            self.assertEqual(again.status, "infrastructure_failed")
+            # A completed audit that merely discusses a timeout is evidence.
+            prose = _route_packet(
+                "opus_auditor",
+                "audit-internal-1-1",
+                _audit("PASS", attack="one Glean request timed out, then worked"),
+            )
+            self.assertFalse(plugin._is_transient_opus_stream_error(prose))
+
     def test_completed_retry_audit_routes_like_normal_audit(self) -> None:
         """A completed retry audit judges normally and completes the stage chain."""
 
@@ -9948,6 +10665,7 @@ print("exact temp boundary: PASS")
                 True,
             ),
             ("judge-cycle-{cycle}", "judge", "codex", False),
+            ("judge-retry-{cycle}-{hop}", "judge_retry", "codex", True),
             (
                 "judge-convergence-{cycle}",
                 "judge_convergence",
@@ -10003,7 +10721,7 @@ print("exact temp boundary: PASS")
             for form, stage_id, requester, has_hop in forms:
                 boundaries = (
                     ((1, 1), (4, 1))
-                    if stage_id in {"audit_retry", "cursor_retry"}
+                    if stage_id in {"audit_retry", "cursor_retry", "judge_retry"}
                     else ((1, 1), (4, 2))
                 )
                 for cycle, hop in boundaries:
@@ -10050,7 +10768,7 @@ print("exact temp boundary: PASS")
                             form.format(cycle=1, hop=3),
                         }
                     )
-                    if _stage_id in {"audit_retry", "cursor_retry"}:
+                    if _stage_id in {"audit_retry", "cursor_retry", "judge_retry"}:
                         malformed.add(form.format(cycle=1, hop=2))
             for title in sorted(malformed):
                 with self.subTest(malformed=title):

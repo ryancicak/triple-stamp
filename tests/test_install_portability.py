@@ -281,6 +281,20 @@ class InstallPortabilityTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("theme: dark", config)
+            # 2026-10-03: a 68-minute gateway stall outlasted the runner's
+            # one-hour idle exit and the chat closed with no message. The
+            # runner itself must read the run's longer limit.
+            from omnigent.runner import _entry
+
+            with mock.patch.dict(
+                os.environ,
+                {"OMNIGENT_CONFIG_HOME": str(isolated_home / ".omnigent")},
+            ):
+                self.assertEqual(
+                    _entry._load_runner_idle_timeout_s_from_config(),
+                    float(launcher.RUNNER_IDLE_TIMEOUT_S),
+                )
+            self.assertGreaterEqual(launcher.RUNNER_IDLE_TIMEOUT_S, 2 * 60 * 60)
 
     def test_public_only_run_gets_no_mcp_servers(self) -> None:
         """``TRIPLE_STAMP_INTERNAL_SOURCES=off`` matches a Mac outside Databricks."""

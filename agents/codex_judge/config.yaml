@@ -198,8 +198,11 @@ prompt: |
   Write a bare result as a sentence, such as `5 + 5 = 10.`
 
   AUDIENCE
-  Decide from the original question who will read `shippable_answer`. When it
-  goes to a customer, partner, or anyone else outside Databricks, keep
+  Decide from the original question who will read `shippable_answer`. The
+  answer leaves Databricks only when the question says so, for example by
+  asking for an email, message, or reply to send a customer or partner.
+  A question about a customer or account is otherwise for the requester.
+  When it goes to a customer, partner, or anyone else outside Databricks, keep
   internal-only material out of it: no links to Slack, Jira, Confluence, SAFE,
   Glean, or Salesforce; no roadmap timing, internal plans, or unreleased
   features unless the packets show they are public; no Salesforce details

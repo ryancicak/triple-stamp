@@ -24,6 +24,13 @@ _OMNIGENT_HEADLESS_EXTRA_TURN_LIMIT = 30
 # ``LOAD_SMALL_INT`` instruction.
 _HEADLESS_PIPELINE_EXTRA_TURN_LIMIT = 255
 _CONTINUATION_PREFIX = "TRIPLE_STAMP_NONTERMINAL_CONTINUATION"
+# Omnigent ends a supervisor turn at the first 401/403 retry notice. On
+# 2026-10-03 the gateway answered a valid login with 403 for at least two
+# minutes; the turn carrying an Opus audit's completion wake failed, nothing woke
+# the chat again, and it sat idle. A turn that sent no work is safe to repeat,
+# so it is repeated after these waits, which span about seven minutes.
+_PROVIDER_REFUSAL_WAITS_S = (30.0, 60.0, 120.0, 240.0)
+_PROVIDER_REFUSAL = "claude sdk provider authentication failed"
 _FRAMEWORK_WAKE = re.compile(
     r"^\[System: sub-agent "
     r"(?:cursor_workhorse|opus_auditor|codex_judge)/[^\s\]]+ finished "
@@ -404,14 +411,14 @@ def _raw_stamp_fallback_answer(
     for index in range(len(records) - 1, -1, -1):
         record = records[index]
         title = str(record.get("title") or "")
-        match = re.fullmatch(r"judge-cycle-([1-4])", title)
+        match = re.fullmatch(r"judge-(?:cycle-([1-4])|retry-([1-4])-1)", title)
         if (
             match is None
             or record.get("agent") != "codex_judge"
             or record.get("status") != "completed"
         ):
             continue
-        cycle = int(match.group(1))
+        cycle = int(match.group(1) or match.group(2))
         if not _has_required_stage_chain(records, cycle):
             continue
         for payload in _mapping_candidates(str(record.get("output") or "")):
@@ -473,6 +480,7 @@ def _deterministic_cursor_cycle_handoff(
         and record.get("title")
         in {
             f"judge-cycle-{previous_cycle}",
+            f"judge-retry-{previous_cycle}-1",
             f"judge-format-repair-{previous_cycle}",
         }
         and str(record.get("output") or "").strip()
@@ -568,6 +576,59 @@ def _terminal_already_relayed(parent_session_id: str) -> bool:
             parent_session_id=parent_session_id
         )
     )
+
+
+async def _provider_refusal_sleep(seconds: float) -> None:
+    """Wait out a model gateway refusal before repeating the turn."""
+
+    import asyncio
+
+    await asyncio.sleep(seconds)
+
+
+def _refusal_outcome(route: object, parent_session_id: str) -> str:
+    """Decide how a turn ends once the gateway refusals are used up.
+
+    ``relay`` when the answer is already decided, ``abstain`` while a dispatched
+    stage is still running (its completion wakes the chat again), and
+    ``terminal`` when nothing else would ever wake the chat.
+    """
+
+    if str(getattr(route, "status", "") or "") in {"success", "best_effort"}:
+        return "relay"
+    try:
+        from omnigent.runner import app as runner_app
+        from triple_stamp_runtime_state import read_attempt_dispatches
+
+        for dispatch in read_attempt_dispatches(parent_session_id=parent_session_id):
+            child = str(dispatch.get("child_session_id") or "")
+            work = runner_app.get_subagent_work(child) if child else None
+            if getattr(work, "status", "") in {"launching", "running", "waiting"}:
+                return "abstain"
+    except Exception as exc:  # noqa: BLE001 - unknown work state ends visibly
+        _LOGGER.warning("could not read sub-agent work state: %s", type(exc).__name__)
+    return "terminal"
+
+
+async def _restart_supervisor_cli(executor: object, messages: list[dict[str, Any]]) -> None:
+    """Close this chat's Claude CLI so the repeated turn starts a fresh one.
+
+    The CLI that was refused keeps retrying its old request with the token it
+    cached, and repeating the turn on it only read that CLI's next stale refusal
+    (2026-10-03). A fresh CLI reruns the login helper and replays the
+    conversation, as Omnigent does for a client restarted mid-session.
+    """
+
+    close_session = getattr(executor, "close_session", None)
+    session_key = getattr(executor, "_session_key", None)
+    if not callable(close_session) or not callable(session_key):
+        return
+    try:
+        await close_session(session_key(messages))
+    except Exception as exc:  # noqa: BLE001 - a fresh client is best effort
+        _LOGGER.warning(
+            "could not restart the supervisor's Claude CLI: %s", type(exc).__name__
+        )
 
 
 def _customer_safe_terminal_failure() -> str:
@@ -734,6 +795,7 @@ def install_supervisor_continuation_guard() -> None:
         )
     from omnigent.inner import claude_sdk_executor
     from omnigent.inner.executor import (
+        ExecutorError,
         TextChunk,
         ToolCallComplete,
         ToolCallRequest,
@@ -825,6 +887,7 @@ def install_supervisor_continuation_guard() -> None:
             ),
             set(),
         )
+        refusal_retries = 0
         while True:
             attest_latest_codex_stamp(session_id)
             # Fail closed on the delivery ledger first. Artifact readability is
@@ -943,6 +1006,7 @@ def install_supervisor_continuation_guard() -> None:
                 return
             buffered_text: list[TextChunk] = []
             completed: TurnComplete | None = None
+            provider_refusal = ""
             send_attempted = False
             terminal_dispatch_suppressed = False
             sent_titles: list[str] = []
@@ -1019,8 +1083,80 @@ def install_supervisor_continuation_guard() -> None:
                 if isinstance(event, TurnComplete):
                     completed = event
                     continue
+                if (
+                    isinstance(event, ExecutorError)
+                    and not send_attempted
+                    and _PROVIDER_REFUSAL
+                    in str(getattr(event, "message", "") or "").lower()
+                ):
+                    provider_refusal = str(getattr(event, "message", "") or "")
+                    continue
                 yield event
 
+            if provider_refusal:
+                route = _next_route(
+                    read_attempt_collections(parent_session_id=session_id),
+                    parent_session_id=session_id,
+                )
+                if refusal_retries < len(_PROVIDER_REFUSAL_WAITS_S):
+                    wait = _PROVIDER_REFUSAL_WAITS_S[refusal_retries]
+                    refusal_retries += 1
+                    _record(
+                        "provider_refusal_retried",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "the model gateway refused the supervisor turn "
+                            f"({provider_refusal[:160]}); repeating it in "
+                            f"{wait:g} s, try {refusal_retries} of "
+                            f"{len(_PROVIDER_REFUSAL_WAITS_S)}"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    await _restart_supervisor_cli(self, current_messages)
+                    await _provider_refusal_sleep(wait)
+                    continue
+                await _restart_supervisor_cli(self, current_messages)
+                outcome = _refusal_outcome(route, session_id)
+                if outcome == "relay":
+                    # The deterministic relays below need no model call.
+                    completed = TurnComplete(response="")
+                elif outcome == "abstain":
+                    _record(
+                        "provider_refusal_abstained",
+                        route,
+                        attempt=continuation_attempt,
+                        reason=(
+                            "the model gateway kept refusing the supervisor while "
+                            "a dispatched stage is still running; its completion "
+                            "wakes the chat again"
+                        ),
+                        parent_session_id=session_id,
+                    )
+                    yield TurnComplete(response="", modified_by_policy=True)
+                    return
+                else:
+                    record_terminal_failure(
+                        "PIPELINE_INFRASTRUCTURE_ERROR",
+                        (
+                            "the model gateway kept refusing the supervisor for "
+                            f"about seven minutes: {provider_refusal[:300]}"
+                        ),
+                        stage=str(getattr(route, "title", "") or route.status),
+                        cycle=int(getattr(route, "cycle", 0) or 0),
+                        parent_session_id=session_id,
+                    )
+                    _record(
+                        "supervisor_failure_terminalized",
+                        route,
+                        attempt=continuation_attempt,
+                        reason="the model gateway kept refusing the supervisor",
+                        parent_session_id=session_id,
+                    )
+                    safe_failure = _customer_safe_terminal_failure()
+                    yield TextChunk(text=safe_failure)
+                    yield TurnComplete(response=safe_failure, modified_by_policy=True)
+                    return
             if completed is None:
                 return
             if terminal_dispatch_suppressed:
@@ -1139,7 +1275,7 @@ def install_supervisor_continuation_guard() -> None:
                     and not genuine_native_failure
                 ):
                     if str(getattr(route, "title", "") or "").startswith(
-                        "cursor-retry-"
+                        ("cursor-retry-", "judge-retry-")
                     ):
                         # The model's generic "required child failed" rule is
                         # stale for this one mechanically retryable transport

@@ -245,6 +245,141 @@ class ManagedLoginHelperTests(unittest.TestCase):
                     self.assertEqual(_lines(home / "isaac-calls"), ["auth refresh"])
 
 
+class LoginRenewalTests(unittest.TestCase):
+    """A live run's gateway and usage logins are renewed from the real home."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        self.home = base / "Home Folder"
+        self.run = base / "run-test"
+        self.run_copy = self.run / "home/.databricks/model-serving-token.json"
+        self.real = self.home / ".databricks/model-serving-token.json"
+        self.isaac = _script(self.home / "isaac", FAKE_ISAAC)
+        for patcher in (
+            mock.patch.object(launcher, "ISAAC", self.isaac),
+            mock.patch.object(
+                launcher, "_managed_api_key_helper", return_value=MANAGED_ISAAC_HELPER
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def renew(self) -> None:
+        launcher._renew_gateway_login(self.run, self.home, _host(self.home))
+
+    def run_token(self) -> str:
+        return json.loads(self.run_copy.read_text(encoding="utf-8"))["access_token"]
+
+    def test_a_fresher_real_login_replaces_the_runs_copy(self) -> None:
+        stale, fresh = _jwt(20), _jwt(600)
+        _token_file(self.run_copy, stale)
+        _token_file(self.real, fresh)
+        self.renew()
+        self.assertEqual(self.run_token(), fresh)
+        self.assertEqual(_mode(self.run_copy), 0o600)
+        self.assertEqual(_lines(self.home / "isaac-calls"), [])
+        self.assertIn(
+            "model gateway login renewed",
+            (self.run / "login-renewals.log").read_text(encoding="utf-8"),
+        )
+
+    def test_a_login_near_expiry_is_renewed_through_isaac(self) -> None:
+        stale, fresh = _jwt(20), _jwt(600)
+        _token_file(self.run_copy, stale)
+        _token_file(self.real, stale)
+        _token_file(self.home / "isaac-fresh", fresh)
+        self.renew()
+        self.assertEqual(_lines(self.home / "isaac-calls"), ["auth refresh"])
+        self.assertEqual(self.run_token(), fresh)
+
+    def test_a_login_with_time_left_or_no_isaac_helper_is_left_alone(self) -> None:
+        ample = _jwt(600)
+        _token_file(self.run_copy, ample)
+        _token_file(self.real, ample)
+        _token_file(self.home / "isaac-fresh", _jwt(1200))
+        self.renew()
+        self.assertEqual(self.run_token(), ample)
+        self.assertEqual(_lines(self.home / "isaac-calls"), [])
+        stale = _jwt(20)
+        _token_file(self.run_copy, stale)
+        _token_file(self.real, _jwt(600))
+        with mock.patch.object(launcher, "_managed_api_key_helper", return_value=""):
+            self.renew()
+        self.assertEqual(self.run_token(), stale)
+
+    def _usage(self, minutes_left: float) -> Path:
+        usage = self.run / "usage.json"
+        usage.parent.mkdir(parents=True, exist_ok=True)
+        usage.write_text(
+            json.dumps(
+                {
+                    "host": "https://usage.example.test",
+                    "token": "old-usage-token-value",
+                    "expires_at": time.time() + minutes_left * 60,
+                    "addon": {"databricks_profile": "example-usage"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        _script(self.home / ".local/bin/databricks", "exit 0\n")
+        return usage
+
+    def test_the_usage_login_is_reminted_before_it_expires(self) -> None:
+        usage = self._usage(5)
+        fresh_expiry = time.time() + 3600
+        with mock.patch.object(
+            launcher,
+            "_databricks_token",
+            return_value=("new-usage-token-value", fresh_expiry),
+        ) as mint:
+            launcher._renew_usage_login(self.run, _host(self.home))
+        self.assertEqual(mint.call_args.args[1], "example-usage")
+        config = json.loads(usage.read_text(encoding="utf-8"))
+        self.assertEqual(config["token"], "new-usage-token-value")
+        self.assertEqual(config["expires_at"], fresh_expiry)
+        self.assertEqual(config["host"], "https://usage.example.test")
+        self.assertEqual(_mode(usage), 0o600)
+
+    def test_a_usage_login_with_time_left_is_not_reminted(self) -> None:
+        usage = self._usage(50)
+        before = usage.read_bytes()
+        with mock.patch.object(launcher, "_databricks_token") as mint:
+            launcher._renew_usage_login(self.run, _host(self.home))
+        mint.assert_not_called()
+        self.assertEqual(usage.read_bytes(), before)
+
+    def test_a_failing_renewal_never_stops_the_renewer(self) -> None:
+        calls: list[str] = []
+
+        def broken(*_args: object) -> None:
+            calls.append("gateway")
+            raise OSError("disk full")
+
+        with (
+            mock.patch.object(launcher, "_LOGIN_RENEW_INTERVAL_S", 0.01),
+            mock.patch.object(launcher, "_renew_gateway_login", side_effect=broken),
+            mock.patch.object(
+                launcher,
+                "_renew_usage_login",
+                side_effect=lambda *_args: calls.append("usage"),
+            ),
+        ):
+            renewer = launcher._start_login_renewer(self.run, self.home, _host(self.home))
+            self.assertIsNotNone(renewer)
+            deadline = time.time() + 5
+            while calls.count("usage") < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            renewer.stop()
+        self.assertGreaterEqual(calls.count("gateway"), 2)
+        self.assertGreaterEqual(calls.count("usage"), 2)
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
 class ModelResolutionTests(unittest.TestCase):
     def test_explicit_environment_wins_for_all_three_models(self) -> None:
         environment = {

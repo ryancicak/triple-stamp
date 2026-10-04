@@ -262,11 +262,16 @@ class AutomaticInstallTests(unittest.TestCase):
                         status.call_args.args[0],
                         [str(executable), *expected_status[tool.key]],
                     )
-                with mock.patch.object(
-                    preflight,
-                    "_run_bounded",
-                    return_value=preflight.subprocess.CompletedProcess([], 0),
-                ) as login:
+                with (
+                    mock.patch.object(
+                        preflight,
+                        "_run_bounded",
+                        return_value=preflight.subprocess.CompletedProcess([], 0),
+                    ) as login,
+                    mock.patch.object(
+                        preflight, "ISAAC", home / "no-isaac-here"
+                    ),
+                ):
                     preflight._login(
                         tool, executable, stream=io.StringIO(), home=home
                     )
@@ -408,6 +413,152 @@ class AutomaticInstallTests(unittest.TestCase):
             )
         self.assertEqual(code, preflight.EXIT_MISSING_TOOL)
         self.assertIn("still unavailable", stream.getvalue())
+
+    def _isaac(self, home: Path) -> Path:
+        isaac = home / "bin/isaac"
+        isaac.parent.mkdir(parents=True, exist_ok=True)
+        isaac.write_text("#!/bin/sh\n", encoding="utf-8")
+        isaac.chmod(0o755)
+        return isaac
+
+    def _codex(self, home: Path) -> tuple["preflight.Tool", Path]:
+        tool = next(tool for tool in preflight.tools(home) if tool.key == "codex")
+        return tool, home / ".local/bin/codex"
+
+    def test_isaac_sets_up_codex_instead_of_an_openai_sign_in(self) -> None:
+        # The 2026-10-02 report: Isaac was installed, but `codex` had never
+        # been launched through it, so setup opened OpenAI's email sign-in.
+        with tempfile.TemporaryDirectory() as value:
+            home = Path(value)
+            isaac = self._isaac(home)
+            tool, executable = self._codex(home)
+            launched: list[tuple[list[str], dict[str, str]]] = []
+
+            def run_bounded(argv, *, env, timeout):
+                launched.append((list(argv), dict(env)))
+                if argv[0] == str(isaac):
+                    config = home / ".codex/config.toml"
+                    config.parent.mkdir(parents=True, exist_ok=True)
+                    config.write_text(
+                        'model_provider = "Databricks"\n', encoding="utf-8"
+                    )
+                return preflight.subprocess.CompletedProcess(argv, 0)
+
+            logged_out = preflight.subprocess.CompletedProcess(
+                [], 1, stdout="Not logged in\n"
+            )
+            stream = io.StringIO()
+            with (
+                mock.patch.object(preflight, "ISAAC", isaac),
+                mock.patch.object(preflight, "tools", return_value=[tool]),
+                mock.patch.object(preflight, "_resolved_tool", return_value=executable),
+                mock.patch.object(preflight.subprocess, "run", return_value=logged_out),
+                mock.patch.object(preflight, "_run_bounded", side_effect=run_bounded),
+                mock.patch.dict(os.environ, {}, clear=False) as environment,
+            ):
+                environment.pop("OPENAI_API_KEY", None)
+                environment.pop("CODEX_API_KEY", None)
+                environment.pop("TRIPLE_STAMP_BOOTSTRAP_SKIP_LOGIN", None)
+                code = preflight.ensure_logins(home, stream=stream)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [argv for argv, _env in launched],
+            [[str(isaac), "codex", "--no-omni", "--", "--version"]],
+        )
+        env = launched[0][1]
+        self.assertEqual(env["HOME"], str(home))
+        self.assertEqual(env["ISAAC_DEFAULT_UCODE"], "0")
+        self.assertEqual(env["ISAAC_DISABLE_MAC_MANAGED_SETTINGS_UPDATE"], "1")
+        self.assertIn("setting up Codex through Isaac", stream.getvalue())
+        self.assertIn("Codex is set up through Isaac.", stream.getvalue())
+        self.assertNotIn("sign in to Codex", stream.getvalue())
+
+    def test_codex_sign_in_still_opens_when_isaac_does_not_set_it_up(self) -> None:
+        for isaac_exit in (0, 1):
+            with self.subTest(isaac_exit=isaac_exit), tempfile.TemporaryDirectory() as value:
+                home = Path(value)
+                isaac = self._isaac(home)
+                tool, executable = self._codex(home)
+                launched: list[list[str]] = []
+
+                def run_bounded(argv, **_kwargs):
+                    launched.append(list(argv))
+                    code = isaac_exit if argv[0] == str(isaac) else 0
+                    return preflight.subprocess.CompletedProcess(argv, code)
+
+                stream = io.StringIO()
+                with (
+                    mock.patch.object(preflight, "ISAAC", isaac),
+                    mock.patch.object(preflight, "_run_bounded", side_effect=run_bounded),
+                    mock.patch.object(preflight, "auth_ready", return_value=False),
+                    mock.patch.dict(os.environ, {}, clear=False) as environment,
+                ):
+                    environment.pop("TRIPLE_STAMP_BOOTSTRAP_SKIP_LOGIN", None)
+                    preflight._login(tool, executable, stream, home=home)
+                self.assertEqual(
+                    launched,
+                    [
+                        [str(isaac), "codex", "--no-omni", "--", "--version"],
+                        [str(executable), "login"],
+                    ],
+                )
+                self.assertIn("sign in to Codex", stream.getvalue())
+                self.assertEqual(
+                    "Isaac could not set up Codex (exit 1)" in stream.getvalue(),
+                    isaac_exit == 1,
+                )
+
+    def test_no_isaac_means_the_public_codex_sign_in(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = Path(value)
+            tool, executable = self._codex(home)
+            with (
+                mock.patch.object(preflight, "ISAAC", home / "missing/isaac"),
+                mock.patch.object(
+                    preflight,
+                    "_run_bounded",
+                    return_value=preflight.subprocess.CompletedProcess([], 0),
+                ) as launched,
+                mock.patch.dict(os.environ, {}, clear=False) as environment,
+            ):
+                environment.pop("TRIPLE_STAMP_BOOTSTRAP_SKIP_LOGIN", None)
+                preflight._login(tool, executable, io.StringIO(), home=home)
+        launched.assert_called_once()
+        self.assertEqual(launched.call_args.args[0], [str(executable), "login"])
+
+    def test_cursor_status_that_says_not_logged_in_opens_its_sign_in(self) -> None:
+        # `cursor-agent status` exits 0 even when it prints "Not logged in".
+        cursor = preflight.tools(Path("/tmp/bootstrap-home"))[0]
+        executable = Path("/tmp/bootstrap-home/.local/bin/cursor-agent")
+        for stdout, expected in (
+            ("Not logged in\n", False),
+            ("✓ Logged in as someone@example.com\n", True),
+        ):
+            with self.subTest(stdout=stdout):
+                with mock.patch.object(
+                    preflight.subprocess,
+                    "run",
+                    return_value=preflight.subprocess.CompletedProcess(
+                        [], 0, stdout=stdout
+                    ),
+                ):
+                    self.assertIs(
+                        preflight.auth_ready(cursor, executable, Path("/tmp/bootstrap-home")),
+                        expected,
+                    )
+
+    def test_slow_status_check_never_opens_a_surprise_sign_in(self) -> None:
+        home = Path("/tmp/bootstrap-home")
+        for tool in preflight.tools(home):
+            with self.subTest(tool=tool.key):
+                with mock.patch.object(
+                    preflight.subprocess,
+                    "run",
+                    side_effect=preflight.subprocess.TimeoutExpired(["status"], 30),
+                ):
+                    self.assertTrue(
+                        preflight.auth_ready(tool, home / ".local/bin" / tool.binary, home)
+                    )
 
     def test_external_codex_provider_counts_as_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as value:
