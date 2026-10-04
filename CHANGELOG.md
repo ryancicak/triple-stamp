@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.2.5 (2026-10-03)
+
+A first start no longer sends a managed Codex to OpenAI's sign-in page, a judge whose Codex does not start gets a fresh one, and a long session keeps its logins.
+
+### Fixes
+
+- **A managed Codex starts without an OpenAI sign-in.** On a Mac where Codex reaches its model through a managed launcher, a first `./triple-stamp` opened OpenAI's email sign-in page if that launcher had never been run there. Setup now runs the launcher's Codex setup once, the way its own `codex` command does, and opens Codex's own sign-in only if Codex still has no login afterwards. v1.2.4 has this bug.
+- **A signed-out Cursor gets its sign-in at setup.** `cursor-agent status` prints "Not logged in" and still reports success, so setup treated a signed-out Cursor as signed in and the launch stopped later with a command to run by hand. Setup now reads the answer. A status check that takes longer than 30 seconds no longer opens a sign-in page either; the launcher's own login check decides instead. v1.2.4 has this bug.
+- **A judge whose Codex does not start gets one fresh start.** On a busy Mac, the judge's Codex can take longer than Omnigent's 30-second startup window, and the question ended there even though research and the audit had finished. That judge did no work, so it now gets one fresh Codex with the same evidence, and the rest of the cycle continues with it. A second start failure in the same cycle still ends the question. v1.2.4 has this bug.
+- **A model gateway refusal no longer leaves the chat idle.** When the gateway answered the coordinator's valid login with 403, the turn that carried a finished audit failed, nothing woke the chat again, and it sat idle. A turn that has not sent any work is now repeated after 30, 60, 120, and 240 seconds, each time on a fresh Claude process that reads the login again. If the gateway still refuses after that, a stage that is still running keeps the question going, and otherwise the question ends with a message to ask again. v1.2.4 has this bug.
+- **A long session keeps its logins.** A run kept the model gateway login and the usage login it started with, so a long session could lose them mid-question. While a run is open, the launcher now checks both every five minutes and renews them from your own logins before they expire, without opening a browser. v1.2.4 has this bug.
+- **An audit the gateway never answers gets its retry, and the chat no longer closes silently.** A request that went unanswered for 68 minutes ended its audit with "Request timed out", which is now treated like the other transient model-service failures: the audit gets its one fresh retry. Omnigent's runner also stopped after an hour without activity, which closed the chat with no message during such a stall; a run now allows three hours. v1.2.4 has this bug.
+- **A question about a customer is answered for you.** The judge wrote one answer about an internal account question as if it were going to the customer, so it left out the Salesforce records you asked about. It now writes for a customer only when the question asks for something to send them. v1.2.4 has this bug.
+
+### Verification
+
+- **Setup:** in a home folder whose Codex had never been set up through its managed launcher, setup set Codex up through the launcher, opened no OpenAI sign-in, and Codex then answered through it.
+- **Live runs, recovery paths:** both faults were injected on purpose in test clones.
+  - **Judge restart:** the first judge's Codex was held past its 30-second start window. The judge restarted once, and the account question, with a voice profile and the usage add-on, stamped and passed 17 of 17 checks in 24 minutes.
+  - **Gateway refusal and login renewal:** the run's gateway login was spoiled before the question. The first two such runs ended after four refusals, because each repeat reused the refused Claude process. With every repeat on a fresh process, the renewer replaced the login five minutes in and the question stamped in 32 minutes, passing 15 of 16 checks. The one miss is the eval's check for unusual routing, which the four deliberate refusals trip.
+- **Live runs, normal paths:** public-only, a question the public documentation answers stamped and passed 13 of 13 checks in 41 minutes, after two cycles. With a voice profile, the internal-plans question ended with the bounded answer and its single public-only gap line in 15 minutes, as in v1.2.4; it passed 12 of 13 checks, all but the stamp. The four completed runs cost about $108.
+- **Regression suite:** 515 tests pass on Omnigent 0.14.0 and 0.12.0, with and without a voice profile set, and public-only. Each new test was shown to fail when its fix is undone.
+- **Fresh install:** `./triple-stamp --self-test` passes from a plain Terminal environment on a new clone that installed its own private runtime and on a clone in a folder whose path has a space, each with and without a voice profile and public-only.
+
+### Known limitations
+
+- A question whose web research is still running after 20 minutes ends without an answer instead of retrying. Ask it again.
+- An audit gets one retry per cycle, and so does a judge whose Codex does not start. If either fails twice, the question ends. Ask it again.
+- Logins renew only through a login tool that can renew them without a browser. If the model gateway login cannot be renewed, a long question can still stop when it expires.
+
+### For maintainers
+
+- The judge restart is the stage `judge-retry-N-1` (`judge_retry`). It is routed only when a `judge-cycle-N` record failed with Omnigent's "Codex app-server never started a thread (" or "Codex native bridge state is missing" error, never for a Codex that is not signed in or for a cancelled judge. A runtime `[System-required next dispatch: ...]` line names it, `supervisor_contract` reserves it once per cycle and refuses `judge-cycle-N` while it is due, and after a web hop or an internal re-audit the cycle's judge continues as `judge-retry-N-1`. A stamp or a bounded answer from it is attested and accepted at exit like any other judgment.
+- The coordinator retry repeats only a turn that sent nothing and failed with Omnigent's "Claude SDK provider authentication failed" error. Before each repeat it closes the session's Claude CLI with `close_session`, because the refused CLI keeps retrying its old request with the token it cached, and a repeat on it only reads that CLI's next stale refusal. The continuation ledger records each try as `provider_refusal_retried`. When the tries run out, a decided stamp or bounded answer is relayed, a stage that is still running is left to wake the chat (`provider_refusal_abstained`), and only otherwise is the question ended.
+- The login renewer writes the run's copies of the gateway token file and `usage.json` with an atomic rename, logs each renewal to `login-renewals.log` in the run folder, and prints nothing while the run's terminal UI is live.
+- `tools/triple_stamp_eval.py` now waits 150 minutes by default.
+
 ## v1.2.4 (2026-10-03)
 
 A public-only run stays public: Opus no longer reaches for internal tools it does not have, a question that needs internal evidence ends without an extra audit, and the judge's Codex starts no MCP servers.
