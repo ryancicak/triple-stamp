@@ -21,6 +21,12 @@ OPUS_STARTUP_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "DISABLE_TELEMETRY": "1",
     "DBEXEC_NO_CERT_REFRESH": "1",
+    # Claude Code moves an MCP call that runs past 120 s to the background and
+    # delivers its result later as a new message. When that came after Opus had
+    # written its audit, it started a second turn, and the pipeline collected
+    # that empty turn instead of the audit. Slow calls here finish on their own
+    # (Slack in about 100 s, the usage tool by 150 s), so Opus waits for them.
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
 }
 OPUS_THINKING_DISPLAY = "summarized"
 if os.environ.get("TRIPLE_STAMP_PROVIDER", "direct") == "databricks":

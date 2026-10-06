@@ -453,6 +453,11 @@ class OpusLaunchTests(unittest.TestCase):
         self.assertEqual(configured["DBEXEC_NO_CERT_REFRESH"], "1")
         # A hung gateway request is retried after two quiet minutes, not five.
         self.assertEqual(configured["CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"], "120000")
+        # A slow MCP call must return inside its round: a backgrounded result
+        # that lands after the audit starts an empty turn the pipeline collects.
+        self.assertEqual(configured["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"], "0")
+        databricks = _load_opus_module("databricks")
+        self.assertEqual(databricks.OPUS_STARTUP_ENV["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"], "0")
 
 
 if __name__ == "__main__":
