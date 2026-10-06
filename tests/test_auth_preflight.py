@@ -92,6 +92,43 @@ class AuthPreflightTests(unittest.TestCase):
         )
         self.assertEqual(startup.kwargs["timeout"], 240)
 
+    def test_preflight_launches_opus_with_the_audit_settings(self) -> None:
+        def module(name: str, path: str):
+            spec = importlib.util.spec_from_file_location(name, ROOT / path)
+            assert spec is not None and spec.loader is not None
+            loaded = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(loaded)
+            return loaded
+
+        runtime_state = module(
+            "runtime_state_for_preflight",
+            ".omnigent/isaac-launcher/triple_stamp_runtime_state.py",
+        )
+        opus_mcp = module(
+            "opus_mcp_for_preflight",
+            ".omnigent/isaac-launcher/triple_stamp_opus_mcp.py",
+        )
+        self.assertEqual(preflight.EXPECTED_OPUS_EFFORT, runtime_state.OPUS_EFFORT)
+        self.assertEqual(
+            preflight.EXPECTED_OPUS_THINKING_DISPLAY,
+            opus_mcp.OPUS_THINKING_DISPLAY,
+        )
+
+    def test_old_claude_code_is_told_to_update(self) -> None:
+        rejected = preflight.subprocess.CompletedProcess(
+            [], 1, "", "error: unknown option '--thinking-display'\n"
+        )
+        with (
+            mock.patch.object(preflight.shutil, "which", return_value="/plain/claude"),
+            mock.patch.object(preflight.os.path, "isfile", return_value=True),
+            mock.patch.object(preflight.os, "access", return_value=True),
+            mock.patch.object(preflight, "_run", return_value=rejected),
+            self.assertRaises(preflight.PreflightError) as raised,
+        ):
+            preflight._direct_round_trip(ROOT)
+        self.assertIn("unknown option '--thinking-display'", raised.exception.detail)
+        self.assertIn("claude update", raised.exception.remediation)
+
     def test_direct_preflight_uses_plain_binary_round_trips(self) -> None:
         claude = preflight.subprocess.CompletedProcess(
             [], 0, "DIRECT_CLAUDE_OK\n", ""
@@ -118,7 +155,11 @@ class AuthPreflightTests(unittest.TestCase):
         self.assertIn(preflight.EXPECTED_OPUS, claude_argv)
         self.assertEqual(
             claude_argv[claude_argv.index("--effort") + 1],
-            "max",
+            "xhigh",
+        )
+        self.assertEqual(
+            claude_argv[claude_argv.index("--thinking-display") + 1],
+            "summarized",
         )
         self.assertEqual(claude_argv[claude_argv.index("--tools") + 1], "")
         self.assertEqual(

@@ -111,6 +111,8 @@ def _expected_models(
             }
         else:
             raise RuntimeError(f"unsupported model profile: {models!r}")
+    from triple_stamp_runtime_state import OPUS_EFFORT
+
     return {
         "triple-stamp": (models["supervisor"], "low", "claude-sdk"),
         "cursor_workhorse": (
@@ -118,7 +120,7 @@ def _expected_models(
             None,
             "cursor-native",
         ),
-        "opus_auditor": (models["opus_auditor"], "max", "claude-native"),
+        "opus_auditor": (models["opus_auditor"], OPUS_EFFORT, "claude-native"),
         "codex_judge": (models["codex_judge"], "ultra", "codex-native"),
     }
 
@@ -508,6 +510,12 @@ def validate_spec(
                 )
             if "TRIPLE_STAMP_OUTER_SANDBOX" not in set(sandbox.env_passthrough or []):
                 fail(f"{name} does not preserve the outer-sandbox marker")
+            if name == "opus_auditor":
+                from triple_stamp_opus_mcp import OPUS_STARTUP_ENV
+
+                controls = {key for key in OPUS_STARTUP_ENV if key.startswith("CLAUDE_")}
+                if dropped := sorted(controls - set(sandbox.env_passthrough or [])):
+                    fail("Opus sandbox drops its Claude Code controls: " + ", ".join(dropped))
             checked = validate(agent)
             if not checked.valid:
                 errors = "; ".join(
@@ -602,7 +610,7 @@ def validate_spec(
             "never STAMP",
             "Do no research yourself",
             "opus_effort_observation",
-            "Only observed non-max effort blocks STAMP",
+            "Only observed below-expected effort blocks STAMP",
             "You have no tool catalog",
             "SUBSTANCE VS FORM",
             "gap_materiality",
@@ -696,6 +704,7 @@ def validate_launchers(
 ) -> None:
     selected_provider = _provider(provider)
     expected_models = _expected_models(_runtime_models())
+    opus_effort = str(expected_models["opus_auditor"][1])
     launcher_source = (root / ".omnigent/launcher.py").read_text(encoding="utf-8")
     opus_launch_source = (
         root / ".omnigent/isaac-launcher/triple_stamp_opus_mcp.py"
@@ -897,7 +906,7 @@ def validate_launchers(
         "--model",
         str(expected_models["opus_auditor"][0]),
         "--effort",
-        "max",
+        opus_effort,
         "--probe",
     ]
     if selected_provider == "databricks":
@@ -940,6 +949,7 @@ def validate_launchers(
         USAGE_LOGIN,
         USAGE_SERVER,
         OPUS_STARTUP_ENV,
+        OPUS_THINKING_DISPLAY,
         WRITE_TOOLS_DENIED,
         configure_opus_startup_environment,
     )
@@ -964,7 +974,7 @@ def validate_launchers(
         "--model",
         str(expected_models["opus_auditor"][0]),
         "--effort",
-        "max",
+        opus_effort,
         "--append-system-prompt",
         _OPUS_AUDITOR_PROMPT_MARKER,
     ]
@@ -982,8 +992,10 @@ def validate_launchers(
         expected_models["opus_auditor"][0]
     ):
         fail("Opus model selector was not preserved as one argv value")
-    if _option_after(auditor_args, "--effort") != "max":
-        fail("Opus static --effort max launch pin drifted")
+    if _option_after(auditor_args, "--effort") != opus_effort:
+        fail(f"Opus static --effort {opus_effort} launch pin drifted")
+    if _option_after(auditor_args, "--thinking-display") != OPUS_THINKING_DISPLAY:
+        fail("Opus native launch does not stream thinking progress")
     if _option_after(auditor_args, "--permission-mode") != "dontAsk":
         fail("Opus native launch is not mechanically unattended")
     if _option_after(auditor_args, "--tools") != "ToolSearch":

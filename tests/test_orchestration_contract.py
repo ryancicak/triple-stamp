@@ -407,7 +407,7 @@ class OrchestrationContractTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     expected["opus_auditor"],
-                    (opus, "max", "claude-native"),
+                    (opus, "xhigh", "claude-native"),
                 )
                 self.assertEqual(
                     expected["codex_judge"],
@@ -3787,11 +3787,14 @@ print("exact temp boundary: PASS")
         )
         self.assertFalse(advisory["audit_validation"]["tool_claims_validated"])
 
-    def test_opus_effort_observation_all_max_mixed_and_low(self) -> None:
+    def test_opus_effort_observation_expected_higher_mixed_and_low(self) -> None:
         cases = (
-            (["max", "max"], "all_max", True, ["max"]),
-            (["max", "low", "max"], "non_max", False, ["max", "low"]),
-            (["low"], "non_max", False, ["low"]),
+            (["xhigh", "xhigh"], "all_expected", True, ["xhigh"]),
+            # Running above the expected level is still compliant.
+            (["xhigh", "max"], "all_expected", True, ["xhigh", "max"]),
+            (["xhigh", "high", "xhigh"], "below_expected", False, ["xhigh", "high"]),
+            (["low"], "below_expected", False, ["low"]),
+            (["unknown"], "below_expected", False, ["unknown"]),
         )
         for efforts, outcome, compliant, values in cases:
             with self.subTest(efforts=efforts):
@@ -3800,7 +3803,7 @@ print("exact temp boundary: PASS")
                 self.assertEqual(observation["status"], "observed")
                 self.assertEqual(observation["outcome"], outcome)
                 self.assertIs(observation["compliant"], compliant)
-                self.assertEqual(observation["expected"], "max")
+                self.assertEqual(observation["expected"], "xhigh")
                 self.assertEqual(observation["values"], values)
                 self.assertEqual(observation["assistant_rows"], len(efforts))
                 self.assertIn(
@@ -3815,6 +3818,12 @@ print("exact temp boundary: PASS")
                     self.assertNotIn("must not STAMP", packet["output"])
                 else:
                     self.assertIn("must not STAMP", packet["output"])
+                    # An Opus effort defect needs a fresh audit, as the judge
+                    # prompt says, never a Cursor rework.
+                    self.assertIn(
+                        "Codex must return NEEDS_INTERNAL for a fresh Opus audit",
+                        packet["output"],
+                    )
 
     def test_opus_effort_missing_unreadable_and_wrong_child_are_advisory(
         self,
@@ -3857,21 +3866,22 @@ print("exact temp boundary: PASS")
             for title in titles:
                 with self.subTest(provider=provider, title=title):
                     packet = _opus_effort_fixture(
-                        ["max"],
+                        ["xhigh"],
                         title=title,
                         provider=provider,
                     )
                     observation = packet["opus_effort_observation"]
                     self.assertEqual(observation["title"], title)
-                    self.assertEqual(observation["outcome"], "all_max")
+                    self.assertEqual(observation["outcome"], "all_expected")
                     self.assertTrue(observation["compliant"])
 
-    def test_codex_refuses_only_observed_nonmax_opus_effort(self) -> None:
+    def test_codex_refuses_only_observed_below_expected_opus_effort(self) -> None:
         prompt = yaml.safe_load(
             (ROOT / "agents/codex_judge/config.yaml").read_text(encoding="utf-8")
         )["prompt"]
         self.assertIn("opus_effort_observation", prompt)
-        self.assertIn("Only observed non-max effort blocks STAMP", prompt)
+        self.assertIn("Only observed below-expected effort blocks STAMP", prompt)
+        self.assertNotIn("non-max", prompt)
         self.assertIn("missing or unreadable effort evidence must never", prompt)
         supervisor_prompt = yaml.safe_load(
             (ROOT / "config.yaml").read_text(encoding="utf-8")
@@ -3880,6 +3890,8 @@ print("exact temp boundary: PASS")
             "every runtime-appended `opus_effort_observation`",
             supervisor_prompt,
         )
+        self.assertIn("sends back for a fresh Opus audit", supervisor_prompt)
+        self.assertNotIn("material REWORK signal", supervisor_prompt)
 
         cursor = _route_packet(
             "cursor_workhorse",

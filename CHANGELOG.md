@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.2.6 (2026-10-06)
+
+The audit takes a third of the time it did, with the same findings, and you can watch it think. A model request that stalls is retried after two minutes instead of five.
+
+### Fixes
+
+- **The audit runs at Opus 5.5's xhigh effort instead of max.** Opus 5.5 thinks more per turn than Opus 5 did at the same setting, and its max effort has no ceiling, so after the switch to Opus 5.5 audits took two to three times as long, even on simple questions. One audit took 41 minutes. Replaying the same audit input at both settings, max took 20 to 21 minutes and xhigh 8 to 10, at half the cost, with the same material findings. Anthropic reserves max for work where it measurably helps. The effort check now passes xhigh or higher, and an audit that ran lower still gets a fresh one.
+- **The audit researches in a few wide rounds.** Opus plans its internal research first, sends each round's independent searches together, reads only the records that decide a claim, and stops once every claim is settled. Coverage is unchanged: every system the audit must try is still tried. A native Slack search takes about a minute and a half, so Opus makes one narrow one and reads the rest of Slack through Glean. Replayed audits took 6 minutes instead of 8 to 10, with the same findings. A public-only run, which has no tools, is unaffected.
+- **You can see what Opus is thinking.** Opus streams short summaries of its thinking, so its terminal shows what it is working on instead of a long silent pause. Thinking and cost are unchanged. Without the summaries, a long final write carried only keep-alive signals, which Claude Code stops trusting after about five minutes, so a write that ran past about ten minutes was cancelled and started over.
+- **A stalled model request is retried after two minutes.** A request the model gateway never answered waited five minutes of silence before Claude Code retried it, and one request took 16 minutes that way. Because the thinking summaries keep a healthy stream busy every few seconds, two quiet minutes now mean a stalled request.
+- **An audit that ran below the expected effort goes back for a fresh audit.** The note added to such an audit asked the judge for a rework by the researcher, while the judge's own rules ask for a fresh audit. Both now ask for a fresh audit.
+- **Setup checks the audit's launch settings.** The startup check now launches Opus at the audit's effort and with its thinking summaries, so a Claude Code that rejects either stops at setup instead of at every audit.
+
+### Verification
+
+- **Replays:** two past questions, each audited from the same input at each setting.
+  - At max: 21.0 and 20.1 minutes, $3.69 and $3.41.
+  - At xhigh: 8.2 and 9.8 minutes, $1.83 and $1.71.
+  - At xhigh with the new research rounds: 6.0 and 5.9 minutes, $1.43 and $1.18.
+  - Every replay found the same material internal evidence.
+- **Live runs, internal sources:**
+  - An account usage question with a voice profile and the usage add-on stamped and passed 18 of 18 checks in 24.1 minutes, against a median of 49.3 minutes across five earlier runs at max. That includes a second audit the judge asked for.
+  - An account Lakebase question stamped and passed 17 of 17 checks in 28.8 minutes, with a 7.1-minute audit against an earlier median of 19.1.
+- **Live runs, public-only, no voice profile:**
+  - The limits question stamped and passed 14 of 14 checks in 27.8 minutes. Its two audits took 5.7 minutes together. The first audit found contradictions in the public docs, so the judge sent the research back once.
+  - The internal-plans question ended with its bounded answer in 12.6 minutes, against an earlier median of 14.9.
+- **On the wire:** the live Opus ran at xhigh with thinking summaries, its transcripts carry the summaries, and no request was retried.
+- **Regression suite:** 520 tests pass on Omnigent 0.14.0 and 0.12.0. Each new test was shown to fail when its fix is undone.
+
+### Known limitations
+
+- The databricks launcher profile keeps Claude Code's five-minute wait for a stalled request, because its gateway path can drop the thinking summaries.
+- A judge can still ask for a second audit when internal evidence is incomplete, and a second research cycle when public sources conflict. Each adds a few minutes, now that every audit is shorter.
+
+### For maintainers
+
+- `OPUS_EFFORT` (`xhigh`) and `EFFORT_LEVELS` in `triple_stamp_runtime_state.py` set the audit effort. The validator, the effort observation, and the dossier labels read them, and `auth_preflight.py` keeps matching copies that a test compares. An observation is compliant when every assistant row ran at that level or higher. Its outcomes are now `all_expected` and `below_expected`.
+- Opus launches with `--thinking-display summarized` (`OPUS_THINKING_DISPLAY`), which replaces any caller value. In the direct profile, `OPUS_STARTUP_ENV` adds `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=120000`, and the validator fails if the Opus sandbox does not pass every `CLAUDE_*` control through.
+- Claude Code 2.1.281 counts at most 30 consecutive keep-alive pings toward its stream watchdog, and its stream idle timeout cannot go below five minutes. On a gateway base URL it skips its first-byte watchdog, so the byte idle timeout is the control that works there.
+
 ## v1.2.5 (2026-10-03)
 
 A first start no longer sends a managed Codex to OpenAI's sign-in page, a judge whose Codex does not start gets a fresh one, and a long session keeps its logins.

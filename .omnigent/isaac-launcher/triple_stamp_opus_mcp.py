@@ -22,6 +22,7 @@ OPUS_STARTUP_ENV = {
     "DISABLE_TELEMETRY": "1",
     "DBEXEC_NO_CERT_REFRESH": "1",
 }
+OPUS_THINKING_DISPLAY = "summarized"
 if os.environ.get("TRIPLE_STAMP_PROVIDER", "direct") == "databricks":
     OPUS_STARTUP_ENV.update(
         {
@@ -30,6 +31,14 @@ if os.environ.get("TRIPLE_STAMP_PROVIDER", "direct") == "databricks":
             "ISAAC_LAUNCH_MODE": "omni",
         }
     )
+else:
+    # A gateway request that hung sent nothing, and Claude Code waited 5
+    # minutes for a silent stream before retrying (one request took 16). The
+    # thinking summaries keep a healthy stream busy every few seconds, so two
+    # quiet minutes mean a hung request. The databricks profile keeps the
+    # default: Isaac's gateway path can drop the summaries, and a long silent
+    # thought must not be cut off.
+    OPUS_STARTUP_ENV["CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"] = "120000"
 
 # `dontAsk` denies anything not pre-approved. ToolSearch is required for deferred
 # schemas, and managed settings omit these three read-only research tools. Writes

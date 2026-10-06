@@ -113,7 +113,7 @@ This is the only command you run. It opens the same run in two places:
 
 Ask your question in either one. Type `/quit` to stop the run and clean up.
 
-<sub>A real run takes about 15 minutes to an hour. Opus's internal audit is slow on purpose. Each stage shows one plain progress line as it starts, such as `Step 2 of 3: auditing the research against internal sources (audit-cycle-1)`.</sub>
+<sub>A real run takes about 15 to 30 minutes, longer when the judge sends work back for another pass. Each stage shows one plain progress line as it starts, such as `Step 2 of 3: auditing the research against internal sources (audit-cycle-1)`.</sub>
 
 ## Make it sound like you
 

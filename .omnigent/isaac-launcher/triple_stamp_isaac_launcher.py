@@ -16,6 +16,7 @@ import yaml
 from omnigent.claude_launcher import ClaudeLauncher
 from triple_stamp_opus_mcp import (
     OPUS_MCP_NAMES,
+    OPUS_THINKING_DISPLAY,
     READ_ONLY_ALLOWED_TOOLS,
     WRITE_TOOLS_DENIED,
     OpusConfigurationError,
@@ -396,6 +397,7 @@ def _triple_stamp_claude_args(
                 "--allowed-tools",
                 "--disallowedTools",
                 "--disallowed-tools",
+                "--thinking-display",
             ),
             flag_options=("--strict-mcp-config", "--disable-slash-commands"),
         )
@@ -415,6 +417,14 @@ def _triple_stamp_claude_args(
                 "--disallowedTools",
                 ",".join(_OPUS_DENIED_TOOLS),
                 "--disable-slash-commands",
+                # Opus thinks for minutes before its final audit. Under the
+                # default "omitted" display that stream carries only keep-alive
+                # pings, Claude Code trusts at most 30 of them, and a long write
+                # was cancelled and redone after about 10 minutes. Summaries keep
+                # real events flowing and show what Opus is doing; thinking and
+                # billing are unchanged.
+                "--thinking-display",
+                OPUS_THINKING_DISPLAY,
             )
         )
     elif not _has_option(hardened, "--permission-mode"):

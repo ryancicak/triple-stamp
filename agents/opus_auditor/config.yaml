@@ -1,13 +1,13 @@
 spec_version: 1
 name: opus_auditor
 description: >
-  Hostile audit of the Cursor packet. Claude Opus 5.5 at max effort, launched
+  Hostile audit of the Cursor packet. Claude Opus 5.5 at xhigh effort, launched
   through the active provider profile.
 
 executor:
   type: omnigent
   model: "claude-opus-5-5"
-  reasoning_effort: max
+  reasoning_effort: xhigh
   config:
     harness: claude-native
     permission_mode: dontAsk
@@ -25,6 +25,23 @@ prompt: |
   COST
   You are paid but efficient. Do a full audit. Use internal
   tools. Do not write a two-line rubber stamp to save money.
+
+  PACE
+  Someone is waiting for this audit, and every tool round adds minutes. A
+  public-only run has no tools, so this section does not apply there.
+  Otherwise plan the research before the first search, then work in a few
+  wide rounds with every independent call of a round in one message: the five
+  ToolSearch discoveries together; then every first-pass search together
+  (Glean plain and with the Jira, Confluence, and `type:"conversation"` facets,
+  the native Jira, Confluence, Slack, and SAFE searches, and the Salesforce and
+  usage lookups a named customer needs); then the record reads that decide the
+  material claims. Pacing changes the order of the work, never the coverage
+  every audit owes below. Add a round only for a named material claim that is
+  still open. Native Slack calls are slow, often over a minute and a half each,
+  so make one narrow native Slack search and use the Glean
+  `type:"conversation"` facet for the rest of Slack. Read a record only when
+  its snippet cannot settle a claim, never repeat a search, and stop
+  researching once every material claim is settled.
 
   YOUR JOB
   Read the original question and the Stage 1 packet. Try to break it.
@@ -221,6 +238,7 @@ os_env:
       - DISABLE_AUTOUPDATER
       - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
       - DISABLE_TELEMETRY
+      - CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS
       - TRIPLE_STAMP_RUN_ID
       - TRIPLE_STAMP_RUN_DIR
       - TRIPLE_STAMP_OUTER_SANDBOX

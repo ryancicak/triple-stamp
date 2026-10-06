@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / ".omnigent/isaac-launcher/triple_stamp_opus_mcp.py"
 
@@ -368,6 +370,62 @@ class OpusLaunchTests(unittest.TestCase):
         self.assertIn("mcp__jira__jira_write_api_call", denied)
         self.assertIn("mcp__confluence__create_confluence_page", denied)
         self.assertIn("mcp__safe__safe_write_api_call", denied)
+        self.assertEqual(args[args.index("--thinking-display") + 1], "summarized")
+
+    def test_opus_thinking_progress_replaces_any_caller_display(self) -> None:
+        launcher = self.import_launcher()
+        with mock.patch.dict(os.environ, {"TRIPLE_STAMP_RUN_ID": "test-run"}, clear=False):
+            args = launcher._triple_stamp_claude_args(
+                [
+                    "--model",
+                    launcher._OPUS_MODEL,
+                    "--thinking-display",
+                    "omitted",
+                    "--thinking-display=omitted",
+                ],
+                opus_mcp_config=str(self.run_dir / "opus-mcp.json"),
+            )
+        displays = [
+            args[index + 1]
+            for index, arg in enumerate(args)
+            if arg == "--thinking-display"
+        ]
+        self.assertEqual(displays, ["summarized"])
+        self.assertFalse(any(arg.startswith("--thinking-display=") for arg in args))
+
+    def test_audit_prompt_paces_research_except_public_only(self) -> None:
+        prompt = yaml.safe_load(
+            (ROOT / "agents/opus_auditor/config.yaml").read_text(encoding="utf-8")
+        )["prompt"]
+        pace = prompt.split("\nPACE\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("public-only run has no tools", pace)
+        self.assertIn("every independent call of a round in one message", pace)
+        self.assertIn("one narrow native Slack search", pace)
+        # Pacing never drops a system the coverage contract requires.
+        self.assertIn("Slack, and SAFE searches", pace)
+        self.assertIn("never the coverage", pace)
+
+    def test_opus_sandbox_passes_every_claude_code_control(self) -> None:
+        opus = yaml.safe_load(
+            (ROOT / "agents/opus_auditor/config.yaml").read_text(encoding="utf-8")
+        )
+        passthrough = set(opus["os_env"]["sandbox"]["env_passthrough"])
+        controls = {name for name in mcp.OPUS_STARTUP_ENV if name.startswith("CLAUDE_")}
+        self.assertIn("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS", controls)
+        self.assertLessEqual(controls, passthrough)
+
+    def test_quiet_stream_retry_is_direct_profile_only(self) -> None:
+        # Isaac's gateway path can drop the thinking summaries, and a long
+        # silent thought must keep Claude Code's default stream watchdog.
+        direct = _load_opus_module("direct")
+        databricks = _load_opus_module("databricks")
+        self.assertEqual(
+            direct.OPUS_STARTUP_ENV["CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"], "120000"
+        )
+        self.assertNotIn("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS", databricks.OPUS_STARTUP_ENV)
+        # Claude Code skips its first-byte watchdog on a gateway, so it is unset.
+        for module in (direct, databricks):
+            self.assertNotIn("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", module.OPUS_STARTUP_ENV)
 
     def test_current_failure_fixture_proves_stale_terminal_resume(self) -> None:
         fixture = json.loads(
@@ -393,6 +451,8 @@ class OpusLaunchTests(unittest.TestCase):
         )
         self.assertEqual(configured["DISABLE_TELEMETRY"], "1")
         self.assertEqual(configured["DBEXEC_NO_CERT_REFRESH"], "1")
+        # A hung gateway request is retried after two quiet minutes, not five.
+        self.assertEqual(configured["CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"], "120000")
 
 
 if __name__ == "__main__":

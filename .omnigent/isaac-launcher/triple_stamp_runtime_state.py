@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+# Opus 5.5 thinks more per turn than Opus 5 did at the same level, and its max
+# is uncapped. Replaying the same audits at max took about 2.5 times as long
+# as at xhigh, for twice the cost and the same findings, and Anthropic
+# reserves max for measured gains. Lower levels fail the effort check.
+OPUS_EFFORT = "xhigh"
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 _LOGGER = logging.getLogger(__name__)
 _DISPATCH_TITLE_PATTERNS = (
     (r"cursor-cycle-([1-4])", "cursor_grunt", ""),
@@ -1316,7 +1323,7 @@ def _opus_effort_not_observed(
         "child_session_id": child_session_id,
         "claude_session_id": claude_session_id,
         "title": title,
-        "expected": "max",
+        "expected": OPUS_EFFORT,
         "status": "not_observed",
         "outcome": "not_observed",
         "compliant": None,
@@ -1453,14 +1460,18 @@ def observe_opus_effort(
         )
 
     values = list(dict.fromkeys(efforts))
-    compliant = all(value == "max" for value in efforts)
+    floor = EFFORT_LEVELS.index(OPUS_EFFORT)
+    compliant = all(
+        value in EFFORT_LEVELS and EFFORT_LEVELS.index(value) >= floor
+        for value in efforts
+    )
     return {
         "child_session_id": child_session_id,
         "claude_session_id": claude_session_id,
         "title": title,
-        "expected": "max",
+        "expected": OPUS_EFFORT,
         "status": "observed",
-        "outcome": "all_max" if compliant else "non_max",
+        "outcome": "all_expected" if compliant else "below_expected",
         "compliant": compliant,
         "assistant_rows": assistant_rows,
         "values": values,
@@ -1490,21 +1501,21 @@ def add_opus_effort_observation(payload: dict[str, Any]) -> dict[str, Any]:
         return record
     if observation["status"] == "not_observed":
         sentence = (
-            "status=not_observed; expected=max; compliant=unknown; "
+            f"status=not_observed; expected={OPUS_EFFORT}; compliant=unknown; "
             f"reason={observation['reason']}. This is advisory only and must "
             "never be treated as low effort."
         )
     elif observation["compliant"]:
         sentence = (
-            "status=observed; expected=max; "
+            f"status=observed; expected={OPUS_EFFORT}; "
             f"values={','.join(observation['values'])}; compliant=true."
         )
     else:
         sentence = (
-            "status=observed; expected=max; "
+            f"status=observed; expected={OPUS_EFFORT}; "
             f"values={','.join(observation['values'])}; compliant=false. "
             "This is a material runtime effort degradation: Codex must return "
-            "REWORK and must not STAMP."
+            "NEEDS_INTERNAL for a fresh Opus audit and must not STAMP."
         )
     record["output"] = (
         output

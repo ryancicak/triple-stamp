@@ -2952,7 +2952,10 @@ def _inner_validate(root: Path, args: list[str]) -> int:
         print(f"  provider: {provider}")
         print(f"  supervisor: {os.environ['TRIPLE_STAMP_SUPERVISOR_MODEL']}")
         print("  Cursor: cursor-grok-4.6-xhigh (Grok 4.6 Extra High)")
-        print(f"  Opus: {os.environ['TRIPLE_STAMP_OPUS_MODEL']}, max")
+        opus_effort = yaml.safe_load(
+            (root / "agents/opus_auditor/config.yaml").read_text(encoding="utf-8")
+        )["executor"]["reasoning_effort"]
+        print(f"  Opus: {os.environ['TRIPLE_STAMP_OPUS_MODEL']}, {opus_effort}")
         print(f"  Codex: {os.environ['TRIPLE_STAMP_CODEX_MODEL']}, ultra")
         print(
             f"  voice: profile readable and Seatbelt read-only ({VOICE_PROFILE})"

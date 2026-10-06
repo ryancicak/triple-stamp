@@ -31,7 +31,7 @@ _TERMINALS = (
 )
 _WORKERS = {
     "cursor_workhorse": "Cursor (Grok 4.6 Extra High)",
-    "opus_auditor": "Opus 5.5 (max effort)",
+    "opus_auditor": "Opus 5.5 (xhigh effort)",
     "codex_judge": "Codex (GPT-5.6 Sol, ultra)",
 }
 _VERDICT_LINES = {
@@ -170,10 +170,15 @@ def _stage_rows(
             observation = record.get("internal_mcp_observation") or {}
             counts = observation.get("by_system") or {}
             effort = record.get("opus_effort_observation") or {}
+            effort_label = (
+                effort.get("expected", "unknown")
+                if effort.get("compliant")
+                else effort.get("status", "unknown")
+            )
             internal = ", ".join(f"{name} {counts[name]}" for name in counts)
             result = (
                 f"{verdict}; internal calls: {internal or 'not observed'}; "
-                f"effort {'max' if effort.get('compliant') else effort.get('status', 'unknown')}"
+                f"effort {effort_label}"
             )
         else:
             limitations = payload.get("limitations") or []

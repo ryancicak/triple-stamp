@@ -141,13 +141,13 @@ prompt: |
     Never substitute the audit's self-reported call count for the observed one.
   - Check every `opus_effort_observation` supplied for this cycle. An
     `observed` result with `compliant: false` proves that at least one raw
-    Claude assistant row ran below the expected `max` effort. Return
+    Claude assistant row ran below the observation's `expected` effort. Return
     NEEDS_INTERNAL for a fresh all-five Opus audit; never send that defect to
     Cursor and never STAMP.
     An `observed` result with `compliant: true` is good. A `not_observed`
     result is advisory only: missing or unreadable effort evidence must never
     be inferred to mean low effort and does not by itself block STAMP.
-    Only observed non-max effort blocks STAMP.
+    Only observed below-expected effort blocks STAMP.
 
   SUBSTANCE VS FORM
   Judge answer substance separately from receipt form. If every material

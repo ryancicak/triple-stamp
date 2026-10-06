@@ -18,6 +18,10 @@ EXPECTED_SUPERVISOR = os.environ.get(
     "TRIPLE_STAMP_SUPERVISOR_MODEL", "claude-sonnet-4-6"
 )
 EXPECTED_OPUS = os.environ.get("TRIPLE_STAMP_OPUS_MODEL", "claude-opus-5-5")
+# The audit's launch settings, so a Claude Code that rejects them fails here
+# rather than at every audit. They match OPUS_EFFORT and OPUS_THINKING_DISPLAY.
+EXPECTED_OPUS_EFFORT = "xhigh"
+EXPECTED_OPUS_THINKING_DISPLAY = "summarized"
 EXPECTED_CODEX = os.environ.get("TRIPLE_STAMP_CODEX_MODEL", "gpt-5.6-sol")
 EXPECTED_OPUS_STARTUP_ENV = {
     "DISABLE_AUTOUPDATER": "1",
@@ -251,7 +255,9 @@ def _preflight_opus(isaac: str) -> None:
             "--model",
             EXPECTED_OPUS,
             "--effort",
-            "max",
+            EXPECTED_OPUS_EFFORT,
+            "--thinking-display",
+            EXPECTED_OPUS_THINKING_DISPLAY,
             "--version",
         ],
         timeout=90,
@@ -394,7 +400,9 @@ def _direct_round_trip(root: Path) -> None:
             "--model",
             EXPECTED_OPUS,
             "--effort",
-            "max",
+            EXPECTED_OPUS_EFFORT,
+            "--thinking-display",
+            EXPECTED_OPUS_THINKING_DISPLAY,
             "--tools",
             "",
             "--setting-sources",
@@ -412,10 +420,20 @@ def _direct_round_trip(root: Path) -> None:
         claude_result.returncode
         or claude_result.stdout.strip() != "DIRECT_CLAUDE_OK"
     ):
+        detail = _result_detail(claude_result)
+        # A Claude Code too old for the audit's flags rejects them as unknown
+        # options; signing in again would not help.
+        if "unknown option" in detail:
+            raise PreflightError(
+                "Claude",
+                "this Claude Code does not accept the audit's launch settings: "
+                + detail,
+                "update Claude Code (run `claude update`), then start Triple-stamp again",
+            )
         raise _claude_model_failure(
             stage="Claude",
             model=EXPECTED_OPUS,
-            detail="plain Claude round trip failed: " + _result_detail(claude_result),
+            detail="plain Claude round trip failed: " + detail,
             default_remediation=(
                 "authenticate Claude Code for the resolved model namespace"
             ),

@@ -1,5 +1,5 @@
 # Deterministic three-stage pipeline:
-# Grok 4.6 Extra High -> Claude Opus 5.5 Max
+# Grok 4.6 Extra High -> Claude Opus 5.5 xhigh
 # -> Codex GPT-5.6 Sol Ultra.
 spec_version: 1
 name: triple-stamp
@@ -213,8 +213,9 @@ prompt: |
   authoritative current sources.
   Preserve and include every runtime-appended `opus_effort_observation` from
   the current cycle, including observations from earlier audits, re-audits,
-  internal audits, and format repairs. Observed non-max effort is a material
-  REWORK signal to Codex, not a launch crash. A `not_observed` effort result is
+  internal audits, and format repairs. Observed below-expected effort is a
+  material defect that Codex sends back for a fresh Opus audit
+  (NEEDS_INTERNAL), not a launch crash. A `not_observed` effort result is
   advisory and must never be inferred as low.
   Codex has no tool catalog and may not reject an audit by asserting that a
   tool name does not exist. It must rely on runtime-observed exact-child names,
