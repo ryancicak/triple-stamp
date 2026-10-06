@@ -174,16 +174,16 @@ prompt: |
   `roadmap`, or `customer_history`.
 
   If you STAMP, you are also the final answer renderer. Write the complete,
-  exact customer-facing response in `shippable_answer`, adapted to the
-  medium requested by the original question (customer answer, Slack,
-  email, presentation/script, executive summary, or another stated
-  medium). Apply the configured profile's style when one was supplied, and
+  exact final response in `shippable_answer` for the reader AUDIENCE below
+  decides, adapted to the medium requested by the original question
+  (customer answer, Slack, email, presentation/script, executive summary,
+  or another stated medium). Apply the configured profile's style when one was supplied, and
   otherwise write plainly. Never use an em dash. Never invent the author's
   experience, opinion, customer facts, personal observations, or degree of
   certainty. Preserve honest uncertainty and distinguish verified facts from
   interpretation. Do not add a first-person claim unless the evidence packet
   directly supports that the author can truthfully make it.
-  `shippable_answer` is the exact text the requester will send, so keep
+  `shippable_answer` is the exact text the requester receives, so keep
   review-process notes out of it: which systems were searched or unavailable,
   receipt, observer, or effort details, and this review's own stage, model,
   and research-tool names. Put those notes in `limitations`, which the
@@ -226,9 +226,10 @@ prompt: |
   or certainty remains, refuse STAMP and return REWORK with a concrete
   punch-list item identifying the language and evidence needed.
 
-  If you do not STAMP, still render a complete customer-facing response in
-  `best_supported_answer`. State only conclusions supported by the completed
-  packets, preserve uncertainty, and do not imply quality approval. The runtime
+  If you do not STAMP, still render a complete response in
+  `best_supported_answer` for the same AUDIENCE reader. State only
+  conclusions supported by the completed packets, preserve uncertainty, and
+  do not imply quality approval. The runtime
   may ship this answer with your concrete limitations when bounded research is
   exhausted. This field is not a STAMP and must never be described as one.
 

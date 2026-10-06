@@ -3086,7 +3086,12 @@ print("exact temp boundary: PASS")
             "SUBSTANCE VS FORM",
             "gap_materiality",
             "`limitations` must name every unavailable system",
-            "`shippable_answer` is the exact text the requester will send",
+            "`shippable_answer` is the exact text the requester receives",
+            # 2026-10-06: "customer-facing response" here outweighed AUDIENCE, and
+            # a question the requester asked for themselves lost its internal
+            # caveats. Both renderers now write for the AUDIENCE reader.
+            "for the reader AUDIENCE below",
+            "`best_supported_answer` for the same AUDIENCE reader",
             "Make every citation a clickable Markdown link",
             "never write a link the packets do not contain",
             # A stamped "10." rendered as a blank line in the terminal REPL.
@@ -3113,6 +3118,7 @@ print("exact temp boundary: PASS")
         # Review-process caveats belong to the requester's notes, never to the
         # text they send (a 2026-09-26 Slack draft ended "SAFE was unavailable").
         self.assertNotIn("shipped answer must explicitly caveat", codex_prompt)
+        self.assertNotIn("customer-facing response", codex_prompt)
         self.assertNotIn("tools", codex_config)
 
         with (
