@@ -3113,6 +3113,10 @@ print("exact temp boundary: PASS")
             "never request a usage lookup and never count missing usage figures as a gap.",
             # Without an add-on, a judge's notes once said that it was missing.
             "With `usage=none`, also never mention the usage tool or a usage add-on, or",
+            # 2026-10-06: two fresh audits were requested for a quarterly product
+            # split, even SQL, that the usage tool's fixed report cannot return.
+            "The usage tool returns one fixed report",
+            "NEEDS_INTERNAL for a usage breakdown the report does not contain",
         ):
             self.assertIn(marker, codex_prompt)
         # Review-process caveats belong to the requester's notes, never to the

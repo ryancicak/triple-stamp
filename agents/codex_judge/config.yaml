@@ -121,6 +121,11 @@ prompt: |
     With `usage=none`, also never mention the usage tool or a usage add-on, or
     that one is missing, in the answer or `limitations`, even when a packet
     does.
+    The usage tool returns one fixed report: the sections its add-on defines,
+    such as monthly totals and a product comparison over the add-on's window.
+    No audit can run any other usage query or SQL, so never return
+    NEEDS_INTERNAL for a usage breakdown the report does not contain. Name that
+    gap in `limitations` and judge the answer on the figures the report has.
   - You have no tool catalog. You may NOT reject an audit merely by asserting
     that a tool name does not exist. Rely only on the runtime's exact-child
     observed names/counts and mechanically validated audit status. For
