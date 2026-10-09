@@ -6,11 +6,19 @@ Web research that is still working gets 30 minutes instead of 20.
 
 ### Fixes
 
-- **Web research gets 30 minutes instead of 20.** In a seven-question batch on 2026-10-09, one Cursor research stage was still writing when its 20-minute limit cut it off, which ended its question with the retry message. Across the 31 research stages in the answer library, the median took 7.7 minutes, and one other took 17. Research that goes quiet is still stopped after 5 minutes without output.
+- **Web research gets 30 minutes instead of 20.** In a seven-question batch on 2026-10-09, one Cursor research stage was still writing when its 20-minute limit cut it off, which ended its question with the retry message. Across the 31 research stages in the answer library, the median took 7.7 minutes, and the next longest took 17. Research that goes quiet is still stopped after 5 minutes without output.
+
+### Verification
+
+- **Live runs of the release code,** from two fresh clones, one with a space in its path:
+  - **Internal sources and a voice profile:** the batch question that the 20-minute limit had cut off stamped and passed 15 of 15 checks in 12.1 minutes. Its research took 4 minutes this time. A second question stamped and passed 15 of 15 checks in 15.3 minutes.
+  - **Public-only, no voice profile:** the limits question stamped and passed 15 of 15 checks in 11.9 minutes. The internal-plans question ended with its bounded answer in 8.3 minutes and passed 14 of 15, missing only `stamped`, as designed.
+  - No research stage ran past 20 minutes, so these runs show that nothing else changed, not the longer limit at work.
+- **Regression suite:** 533 tests pass on Omnigent 0.14.0 and 0.12.0, also with a voice profile and public-only. Putting the 20-minute limit back made the lifecycle test and the bundle validator fail.
 
 ### For maintainers
 
-- `_CURSOR_STAGE_ABSOLUTE_S` in `triple_stamp_cursor_lifecycle.py` is 30 minutes, and `validate_bundle.py` and the lifecycle tests pin it. A stage stopped by this limit still does not retry (`_retryable_cursor_failure`), and `_CURSOR_CLAIM_WINDOW_NS` stays 15 minutes.
+- `_CURSOR_STAGE_ABSOLUTE_S` in `triple_stamp_cursor_lifecycle.py` is 30 minutes, and `validate_bundle.py` and `test_cursor_lifecycle.py` pin it. A stage stopped by this limit still does not retry (`_retryable_cursor_failure`), and `_CURSOR_CLAIM_WINDOW_NS` stays 15 minutes.
 
 ## v1.2.7 (2026-10-09)
 
