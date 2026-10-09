@@ -1479,7 +1479,7 @@ class CursorLifecycleTests(unittest.TestCase):
 
     def test_inbox_time_contract_is_far_below_transport_timeout(self) -> None:
         self.assertEqual(lifecycle._CURSOR_STAGE_INACTIVITY_S, 5 * 60)
-        self.assertEqual(lifecycle._CURSOR_STAGE_ABSOLUTE_S, 20 * 60)
+        self.assertEqual(lifecycle._CURSOR_STAGE_ABSOLUTE_S, 30 * 60)
         contract_seconds = (
             tool_dispatch._drain_inbox.__triple_stamp_inbox_time_contract_s__
         )

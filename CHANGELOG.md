@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.8 (2026-10-09)
+
+Web research that is still working gets 30 minutes instead of 20.
+
+### Fixes
+
+- **Web research gets 30 minutes instead of 20.** In a seven-question batch on 2026-10-09, one Cursor research stage was still writing when its 20-minute limit cut it off, which ended its question with the retry message. Across the 31 research stages in the answer library, the median took 7.7 minutes, and one other took 17. Research that goes quiet is still stopped after 5 minutes without output.
+
+### For maintainers
+
+- `_CURSOR_STAGE_ABSOLUTE_S` in `triple_stamp_cursor_lifecycle.py` is 30 minutes, and `validate_bundle.py` and the lifecycle tests pin it. A stage stopped by this limit still does not retry (`_retryable_cursor_failure`), and `_CURSOR_CLAIM_WINDOW_NS` stays 15 minutes.
+
 ## v1.2.7 (2026-10-09)
 
 A judge's Codex no longer stops on Codex's new "Meet GPT-6 Sol" screen, and a batch of questions no longer overloads the Mac: three questions run at once and the rest wait their turn. A failed question shows its retry message instead of policy text.

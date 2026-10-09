@@ -23,7 +23,10 @@ from urllib.parse import unquote
 
 _CURSOR_COMPLETION_STABLE_S = 2.0
 _CURSOR_STAGE_INACTIVITY_S = 5 * 60
-_CURSOR_STAGE_ABSOLUTE_S = 20 * 60
+# Research that keeps writing gets 30 minutes. Most stages finish within 10,
+# and on 2026-10-09 one still writing at 20 minutes was cut off, which ended
+# its question. Research that goes quiet still stops after 5 minutes.
+_CURSOR_STAGE_ABSOLUTE_S = 30 * 60
 _CURSOR_POST_CLAIM_S = 30.0
 _INBOX_TIME_CONTRACT_S = 5.0
 # Longest a read may park on a live dispatch; must stay below the client's

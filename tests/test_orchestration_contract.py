@@ -7193,7 +7193,7 @@ print("exact temp boundary: PASS")
         self.assertEqual(runtime_guard._CURSOR_STAGE_INACTIVITY_S, 5 * 60)
         self.assertEqual(
             runtime_guard._CURSOR_STAGE_ABSOLUTE_S,
-            20 * 60,
+            30 * 60,
         )
         runtime_guard._install_parent_inbox_guard()
         parent = "9522f82bb0cc4b14bfe8f8e6ee0ea527"
