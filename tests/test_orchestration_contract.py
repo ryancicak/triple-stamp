@@ -1823,6 +1823,650 @@ class OrchestrationContractTests(unittest.TestCase):
             ),
         )
 
+    def _saved_as(self, parent: str, text: str) -> dict[str, object]:
+        """Omnigent's response check on text the guard relayed to the reader."""
+
+        return plugin.supervisor_contract(enabled=True)(
+            {
+                "type": "response",
+                "context": {
+                    "conversation_id": parent,
+                    "root_conversation_id": parent,
+                },
+                "data": text,
+            }
+        )
+
+    def test_failure_message_the_guard_relays_is_saved_as_written(self) -> None:
+        """2026-10-09: six failed chats were saved as the policy's own words.
+
+        Omnigent checks the text of every reply against the response rule
+        before saving it and stores ``[Denied by policy: <reason>]`` in its
+        place on a DENY. The rule allowed only the raw infrastructure prefix,
+        so each question that ended with the guard's customer-safe retry
+        message showed "Supervisor output is forbidden until a persisted
+        Codex STAMP proves the byte-exact shippable_answer." after a reload.
+        """
+
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import TextChunk, TurnComplete
+
+        safe = supervisor_runtime._customer_safe_terminal_failure()
+        original_run_turn = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        failure = (
+            "PIPELINE_INFRASTRUCTURE_ERROR: judge-retry-1-1 failed: Codex "
+            "app-server never started a thread"
+        )
+        model_turns = 0
+
+        async def reports_failure(*_args: object, **_kwargs: object):
+            nonlocal model_turns
+            model_turns += 1
+            yield TextChunk(failure)
+            yield TurnComplete(response=failure)
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        def question(parent: str) -> list[dict[str, str]]:
+            return [{"role": "user", "content": "2+2=?", "session_id": parent}]
+
+        def relayed(parent: str) -> str:
+            async def collect() -> list[object]:
+                return [
+                    event
+                    async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                        Supervisor(),
+                        question(parent),
+                        [],
+                        "route",
+                        None,
+                    )
+                ]
+
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = reports_failure
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original_run_turn
+            return "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            )
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ):
+            # The supervisor reports the failure: the restarted judge's Codex
+            # did not start either, the 2026-10-09 batch's five judge chats.
+            restart = "restart-failed-parent"
+            runtime_state.activate_parent_attempt(restart, "request")
+            for record in [
+                *self._judge_cycle_records(),
+                {
+                    **self._judge_cycle_records()[-1],
+                    "title": "judge-retry-1-1",
+                    "child_session_id": "child-judge-retry-1-1",
+                },
+            ]:
+                runtime_state.append_collection(
+                    {**record, "parent_session_id": restart}
+                )
+            self.assertEqual(self._saved_as(restart, safe)["result"], "DENY")
+            text = relayed(restart)
+            self.assertEqual(text, safe)
+            self.assertEqual(self._saved_as(restart, text), {"result": "ALLOW"})
+            self.assertIn(
+                "supervisor_failure_terminalized",
+                [
+                    row["action"]
+                    for row in runtime_state.read_supervisor_continuations(restart)
+                ],
+            )
+
+            # A stage already recorded the failure, so the next wake of the same
+            # question relays it without asking the model: the batch's Cursor
+            # timeout chat.
+            recorded = "recorded-failure-parent"
+            runtime_state.activate_parent_attempt(
+                recorded,
+                supervisor_runtime._attempt_request_identity(question(recorded)),
+            )
+            runtime_state.append_collection(
+                {
+                    **_route_packet(
+                        "cursor_workhorse", "cursor-cycle-1", "cursor evidence"
+                    ),
+                    "parent_session_id": recorded,
+                }
+            )
+            runtime_state.record_terminal_failure(
+                "PIPELINE_INFRASTRUCTURE_ERROR",
+                "cursor-cycle-1 timed out",
+                stage="cursor-cycle-1",
+                cycle=1,
+                parent_session_id=recorded,
+            )
+            turns_before = model_turns
+            text = relayed(recorded)
+            self.assertEqual(model_turns, turns_before)
+            self.assertEqual(text, safe)
+            self.assertEqual(self._saved_as(recorded, text), {"result": "ALLOW"})
+
+            # Only a recorded failure lets the message through: a healthy
+            # question cannot be ended with it, and it never passes for a
+            # chat other than the one that failed.
+            healthy = "healthy-parent"
+            runtime_state.activate_parent_attempt(healthy, "request")
+            runtime_state.append_collection(
+                {
+                    **_route_packet(
+                        "cursor_workhorse", "cursor-cycle-1", "cursor evidence"
+                    ),
+                    "parent_session_id": healthy,
+                }
+            )
+            self.assertEqual(self._saved_as(healthy, safe)["result"], "DENY")
+            self.assertEqual(
+                self._saved_as(recorded, safe + " ")["result"], "DENY"
+            )
+
+        # The gateway refused the supervisor until the retries ran out.
+        refused = "refusal-exhausted-saved-parent"
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value, "TRIPLE_STAMP_RUN_ID": "fixture"},
+            clear=False,
+        ):
+            runtime_state.activate_parent_attempt(refused, "request")
+            events, _waits, _turns, _closed = self._refused_supervisor(
+                refused, ["refuse"]
+            )
+            text = "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            )
+            self.assertEqual(text, safe)
+            self.assertEqual(self._saved_as(refused, text), {"result": "ALLOW"})
+
+    @staticmethod
+    def _codex_forwarder() -> object:
+        try:
+            from omnigent.harnesses.codex_native import forwarder
+        except ImportError:  # Omnigent 0.12
+            from omnigent import codex_native_forwarder as forwarder
+        return forwarder
+
+    def test_omnigent_still_starts_codex_through_the_patched_names(self) -> None:
+        """Tripwire: the three-minute start wait patches these exact names."""
+
+        import inspect
+
+        from omnigent.inner import codex_native_executor
+        from omnigent.runner.native import orchestration
+
+        forwarder = self._codex_forwarder()
+        wait = getattr(
+            forwarder.wait_for_thread_started,
+            "__triple_stamp_original__",
+            forwarder.wait_for_thread_started,
+        )
+        self.assertEqual(
+            inspect.signature(wait).parameters["timeout"].default, 30.0
+        )
+        # The runner's call takes the default and imports the name at call time.
+        source = inspect.getsource(orchestration._codex_discover_thread_and_forward)
+        self.assertIn("wait_for_thread_started(event_client)\n", source)
+        self.assertIn("import (", source)
+        executor_source = inspect.getsource(
+            getattr(
+                codex_native_executor.CodexNativeExecutor.run_turn,
+                "__triple_stamp_original__",
+                codex_native_executor.CodexNativeExecutor.run_turn,
+            )
+        )
+        self.assertIn("for _ in range(60):", executor_source)
+        self.assertIn("read_bridge_state(self._bridge_dir)", executor_source)
+        self.assertTrue(callable(codex_native_executor.read_bridge_startup_error))
+
+    def test_judge_codex_gets_three_minutes_to_start(self) -> None:
+        """2026-10-09: five judges' Codex took longer than Omnigent's 30 s."""
+
+        from omnigent.inner import codex_native_executor
+
+        forwarder = self._codex_forwarder()
+        executor = codex_native_executor.CodexNativeExecutor
+        saved = (forwarder.wait_for_thread_started, executor.run_turn)
+        timeouts: list[object] = []
+        turns: list[int] = []
+
+        async def omnigent_wait(_client: object, *, timeout: object = 30.0) -> str:
+            timeouts.append(timeout)
+            return "thread"
+
+        async def omnigent_turn(_self: object, *_args: object, **_kwargs: object):
+            turns.append(polls)
+            yield "turn"
+
+        states: list[object] = []
+        errors: list[object] = []
+        polls = 0
+
+        def read_state(_bridge_dir: object) -> object:
+            nonlocal polls
+            polls += 1
+            return states.pop(0) if states else None
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        class Judge:
+            _bridge_dir = Path("/nonexistent/bridge")
+
+        async def turn() -> list[object]:
+            return [event async for event in executor.run_turn(Judge(), [], [], "")]
+
+        forwarder.wait_for_thread_started = omnigent_wait
+        executor.run_turn = omnigent_turn
+        try:
+            runtime_guard._install_codex_start_patience()
+            runtime_guard._install_codex_start_patience()
+            for given in ({}, {"timeout": None}, {"timeout": 5.0}):
+                asyncio.run(forwarder.wait_for_thread_started(object(), **given))
+            self.assertEqual(timeouts, [180.0, None, 5.0])
+
+            with mock.patch.object(
+                codex_native_executor, "read_bridge_state", read_state
+            ), mock.patch.object(
+                codex_native_executor,
+                "read_bridge_startup_error",
+                lambda _bridge_dir: errors[0] if errors else None,
+            ), mock.patch("asyncio.sleep", no_sleep):
+                # The executor's own 60 s poll starts only once Codex is up.
+                states.extend([None, None, None, object()])
+                self.assertEqual(asyncio.run(turn()), ["turn"])
+                self.assertEqual(turns, [4])
+                # A recorded startup failure ends the wait at once.
+                polls = 0
+                errors.append("Codex app-server never started a thread")
+                asyncio.run(turn())
+                self.assertEqual(turns[-1], 1)
+                # A Codex that never starts is left to Omnigent's own check
+                # once the wait is over.
+                errors.clear()
+                self.assertEqual(runtime_guard._CODEX_BRIDGE_WAIT_S, 240.0)
+                with mock.patch.object(runtime_guard, "_CODEX_BRIDGE_WAIT_S", 0.05):
+                    polls = 0
+                    self.assertEqual(asyncio.run(turn()), ["turn"])
+                self.assertGreater(turns[-1], 1)
+                self.assertEqual(runtime_guard._CODEX_THREAD_START_S, 180.0)
+        finally:
+            forwarder.wait_for_thread_started, executor.run_turn = saved
+
+    def test_judges_start_codex_one_at_a_time_across_chats(self) -> None:
+        """Each judge launches once the run's other judges have started Codex."""
+
+        bridge = cursor_lifecycle._codex_bridge_module()
+        now = time.time_ns()
+
+        def judge(child: str, **changed: object) -> dict[str, object]:
+            return {
+                "agent": "codex_judge",
+                "title": "judge-cycle-1",
+                "parent_session_id": f"{child}-chat",
+                "child_session_id": child,
+                "work_id": f"{child}-work",
+                "dispatched_at_ns": now,
+                **changed,
+            }
+
+        dispatches = [
+            judge("judge-a"),
+            judge("judge-finished"),
+            judge("judge-old", dispatched_at_ns=now - 11 * 60 * 10**9),
+            {**judge("cursor"), "agent": "cursor_workhorse"},
+        ]
+        collections = [{"work_id": "judge-finished-work"}]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ), mock.patch.object(
+            bridge, "_BRIDGE_ROOT", Path(value) / "codex-native"
+        ), mock.patch.object(cursor_lifecycle, "_CODEX_LAUNCH_POLL_S", 0.01):
+            self.assertEqual(
+                cursor_lifecycle._starting_codex_judges(dispatches, collections),
+                ["judge-a"],
+            )
+            started = bridge.bridge_dir_for_bridge_id("judge-a")
+            started.mkdir(parents=True)
+
+            async def launch_after_judge_a_starts() -> list[str]:
+                order: list[str] = []
+
+                async def judge_a_starts() -> None:
+                    await asyncio.sleep(0.1)
+                    bridge.write_bridge_state(
+                        started,
+                        bridge.CodexNativeBridgeState(
+                            session_id="judge-a",
+                            socket_path="ws://127.0.0.1:1",
+                            thread_id="thread-a",
+                            codex_home=value,
+                        ),
+                    )
+                    order.append("judge-a started")
+
+                async def judge_b_launches() -> None:
+                    async with cursor_lifecycle._codex_launch_turn(
+                        lambda: dispatches, lambda: collections
+                    ):
+                        order.append("judge-b launched")
+
+                await asyncio.gather(judge_a_starts(), judge_b_launches())
+                return order
+
+            self.assertEqual(
+                asyncio.run(launch_after_judge_a_starts()),
+                ["judge-a started", "judge-b launched"],
+            )
+            (started / "state.json").unlink()
+            bridge.write_bridge_startup_error(started, "never started a thread")
+            self.assertEqual(
+                cursor_lifecycle._starting_codex_judges(dispatches, collections), []
+            )
+
+            # A judge that never starts holds a launch for four minutes at most,
+            # and an unreadable ledger never holds one.
+            (started / "startup_error.json").unlink()
+
+            async def launch() -> float:
+                began = time.monotonic()
+                async with cursor_lifecycle._codex_launch_turn(
+                    lambda: dispatches, lambda: collections
+                ):
+                    return time.monotonic() - began
+
+            with mock.patch.object(cursor_lifecycle, "_CODEX_START_WAIT_S", 0.2):
+                self.assertGreaterEqual(asyncio.run(launch()), 0.2)
+
+            def unreadable() -> list[dict[str, object]]:
+                raise OSError("ledger busy")
+
+            async def launch_unreadable() -> str:
+                async with cursor_lifecycle._codex_launch_turn(
+                    unreadable, lambda: collections
+                ):
+                    return "launched"
+
+            self.assertEqual(asyncio.run(launch_unreadable()), "launched")
+
+    def test_only_a_few_questions_run_at_once(self) -> None:
+        """2026-10-09: ten questions ran every stage at once and six failed."""
+
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait()
+        claim = runtime_state.claim_question_slot
+
+        @contextlib.contextmanager
+        def run(limit: int | None = 2):
+            with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+                os.environ,
+                {"TRIPLE_STAMP_RUN_DIR": value},
+                clear=False,
+            ):
+                if limit is not None:
+                    (Path(value) / "question-pacing.json").write_text(
+                        json.dumps({"max_parallel_questions": limit}),
+                        encoding="utf-8",
+                    )
+                for parent in "abcdef":
+                    runtime_state.activate_parent_attempt(parent, "request")
+                yield Path(value)
+
+        def edit_slots(folder: Path, change: object) -> None:
+            path = folder / "question-slots.json"
+            slots = json.loads(path.read_text(encoding="utf-8"))
+            change(slots)
+            path.write_text(json.dumps(slots), encoding="utf-8")
+
+        with run(limit=None):
+            self.assertEqual(runtime_state.max_parallel_questions(), 3)
+        for broken in ("", "{}", '{"max_parallel_questions": 0}', "[1]"):
+            with run(limit=None) as folder:
+                (folder / "question-pacing.json").write_text(broken, encoding="utf-8")
+                self.assertEqual(runtime_state.max_parallel_questions(), 3)
+
+        with run() as folder:
+            self.assertEqual([claim(p, 1) for p in "abcd"], [True, True, False, False])
+            self.assertTrue(claim("a", 1))
+            # A finished question frees its slot for the first one in line.
+            runtime_state.record_terminal_failure(
+                "PIPELINE_INFRASTRUCTURE_ERROR",
+                "worker failed",
+                stage="cursor-cycle-1",
+                cycle=1,
+                parent_session_id="a",
+            )
+            self.assertFalse(claim("d", 1))
+            self.assertTrue(claim("c", 1))
+            # So does a question whose runner process is gone.
+            edit_slots(
+                folder,
+                lambda slots: slots["admitted"]["b"].update(pid=exited.pid),
+            )
+            self.assertTrue(claim("d", 1))
+            # A waiter that stopped asking leaves the line.
+            self.assertFalse(claim("e", 1))
+            self.assertFalse(claim("f", 1))
+            edit_slots(
+                folder,
+                lambda slots: slots["waiting"]["e"].update(
+                    seen_ns=time.time_ns() - 91 * 10**9
+                ),
+            )
+            runtime_state.record_terminal_failure(
+                "PIPELINE_INFRASTRUCTURE_ERROR",
+                "worker failed",
+                stage="cursor-cycle-1",
+                cycle=1,
+                parent_session_id="c",
+            )
+            self.assertTrue(claim("f", 1))
+            # A question past the limit can still be let in after a long wait.
+            self.assertTrue(claim("e", 1, force=True))
+
+        with run() as folder:
+            self.assertEqual([claim(p, 1) for p in "abc"], [True, True, False])
+            # A question running a stage keeps its slot however long it runs.
+            now = time.time_ns()
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": "a",
+                    "child_session_id": "opus-child",
+                    "work_id": "opus-work",
+                    "agent": "opus_auditor",
+                    "title": "audit-cycle-1",
+                    "dispatched_at_ns": now - 40 * 60 * 10**9,
+                }
+            )
+            edit_slots(
+                folder,
+                lambda slots: [
+                    slots["admitted"][parent].update(at_ns=now - 41 * 60 * 10**9)
+                    for parent in "ab"
+                ],
+            )
+            # One with nothing running for ten minutes has stopped.
+            self.assertTrue(claim("c", 1))
+            self.assertEqual(
+                sorted(
+                    json.loads(
+                        (folder / "question-slots.json").read_text(encoding="utf-8")
+                    )["admitted"]
+                ),
+                ["a", "c"],
+            )
+            # A new question in the same chat replaces the earlier one.
+            runtime_state.record_terminal_failure(
+                "PIPELINE_INFRASTRUCTURE_ERROR",
+                "worker failed",
+                stage="audit-cycle-1",
+                cycle=1,
+                parent_session_id="a",
+            )
+            again = runtime_state.activate_parent_attempt("a", "another request")
+            self.assertEqual(again, 2)
+            self.assertTrue(claim("a", 2))
+
+    def test_queued_question_shows_one_note_and_starts_when_a_slot_frees(
+        self,
+    ) -> None:
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.executor import (
+            TextChunk,
+            ToolCallRequest,
+            TurnComplete,
+        )
+
+        parent = "queued-question-parent"
+        original_run_turn = claude_sdk_executor.ClaudeSDKExecutor.run_turn
+        waits: list[float] = []
+
+        async def first_turn(*_args: object, **_kwargs: object):
+            yield ToolCallRequest(
+                name="mcp__omnigent__sys_session_send",
+                args={"agent": "cursor_workhorse", "title": "cursor-cycle-1"},
+            )
+            runtime_state.append_dispatch(
+                {
+                    "parent_session_id": parent,
+                    "child_session_id": "queued-cursor-child",
+                    "work_id": "queued-cursor-work",
+                    "agent": "cursor_workhorse",
+                    "title": "cursor-cycle-1",
+                }
+            )
+            yield TurnComplete(response="")
+
+        async def other_question_finishes(seconds: float) -> None:
+            waits.append(seconds)
+            if len(waits) == 2:
+                runtime_state.record_terminal_failure(
+                    "PIPELINE_INFRASTRUCTURE_ERROR",
+                    "worker failed",
+                    stage="cursor-cycle-1",
+                    cycle=1,
+                    parent_session_id="running-parent",
+                )
+
+        class Supervisor:
+            _agent_name = "triple-stamp"
+
+        messages = [{"role": "user", "content": "2+2=?", "session_id": parent}]
+
+        async def collect() -> list[object]:
+            return [
+                event
+                async for event in claude_sdk_executor.ClaudeSDKExecutor.run_turn(
+                    Supervisor(), messages, [], "route", None
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {
+                "TRIPLE_STAMP_RUN_DIR": value,
+                "TRIPLE_STAMP_RUN_ID": "fixture",
+                "TRIPLE_STAMP_VOICE_PROFILE": "",
+                "TRIPLE_STAMP_VOICE_PROFILE_SHA256": "",
+            },
+            clear=False,
+        ), mock.patch.object(
+            supervisor_runtime, "_question_queue_sleep", other_question_finishes
+        ):
+            (Path(value) / "question-pacing.json").write_text(
+                json.dumps({"max_parallel_questions": 1}), encoding="utf-8"
+            )
+            runtime_state.activate_parent_attempt("running-parent", "request")
+            self.assertTrue(runtime_state.claim_question_slot("running-parent", 1))
+            runtime_state.activate_parent_attempt(parent, "request")
+            claude_sdk_executor.ClaudeSDKExecutor.run_turn = first_turn
+            try:
+                supervisor_runtime.install_supervisor_continuation_guard()
+                events = asyncio.run(collect())
+                # A later wake of the started question never queues again.
+                waits_before = len(waits)
+                asyncio.run(collect())
+            finally:
+                claude_sdk_executor.ClaudeSDKExecutor.run_turn = original_run_turn
+            self.assertEqual(len(waits), waits_before)
+
+            send = next(
+                index
+                for index, event in enumerate(events)
+                if isinstance(event, ToolCallRequest)
+            )
+            saved = "".join(
+                event.text for event in events[:send] if isinstance(event, TextChunk)
+            )
+            self.assertEqual(
+                saved,
+                plugin._QUEUE_NOTE
+                + "Step 1 of 3: researching public sources (cursor-cycle-1)",
+            )
+            self.assertEqual(self._saved_as(parent, saved), {"result": "ALLOW"})
+            eval_spec = importlib.util.spec_from_file_location(
+                "triple_stamp_eval_for_queue", ROOT / "tools/triple_stamp_eval.py"
+            )
+            assert eval_spec is not None and eval_spec.loader is not None
+            evaluation = importlib.util.module_from_spec(eval_spec)
+            sys.modules[eval_spec.name] = evaluation
+            eval_spec.loader.exec_module(evaluation)
+            self.assertTrue(evaluation._progress_readable([saved]))
+            self.assertEqual(
+                self._saved_as(parent, plugin._QUEUE_NOTE), {"result": "ALLOW"}
+            )
+            self.assertEqual(
+                self._saved_as(parent, plugin._QUEUE_NOTE + "Unchecked answer.")[
+                    "result"
+                ],
+                "DENY",
+            )
+            actions = [
+                row["action"]
+                for row in runtime_state.read_supervisor_continuations(parent)
+            ]
+        self.assertEqual(waits, [10.0, 10.0])
+        self.assertEqual(actions[:2], ["question_queued", "question_admitted"])
+
+    def test_launcher_writes_the_question_limit_for_the_run(self) -> None:
+        name = launcher.MAX_PARALLEL_QUESTIONS_ENV
+        self.assertEqual(name, "TRIPLE_STAMP_MAX_PARALLEL_QUESTIONS")
+        with mock.patch.dict(os.environ, {name: ""}, clear=False):
+            self.assertEqual(launcher._max_parallel_questions(), 3)
+        with mock.patch.dict(os.environ, {name: " 5 "}, clear=False):
+            self.assertEqual(launcher._max_parallel_questions(), 5)
+        self.assertEqual(launcher._max_parallel_questions(20), 20)
+        for invalid in ("0", "21", "-1", "3.0", "two", "²"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(launcher.LaunchError):
+                    launcher._max_parallel_questions(invalid)
+        launcher_source = (ROOT / ".omnigent/launcher.py").read_text(encoding="utf-8")
+        self.assertIn('"question-pacing.json"', launcher_source)
+        self.assertIn('{"max_parallel_questions": _max_parallel_questions()}', launcher_source)
+        self.assertEqual(
+            launcher.DEFAULT_MAX_PARALLEL_QUESTIONS,
+            runtime_state.DEFAULT_MAX_PARALLEL_QUESTIONS,
+        )
+
     def test_voice_profile_digest_propagates_current_bytes(self) -> None:
         required = (
             "# Example Voice Profile\n"
@@ -10161,8 +10805,11 @@ print("exact temp boundary: PASS")
                 row["action"]
                 for row in runtime_state.read_supervisor_continuations(parent)
             ]
+            rendered = "".join(
+                event.text for event in events if isinstance(event, TextChunk)
+            )
+            self.assertEqual(self._saved_as(parent, rendered), {"result": "ALLOW"})
 
-        rendered = "".join(event.text for event in events if isinstance(event, TextChunk))
         self.assertEqual(rendered, persisted)
         self.assertTrue(rendered.endswith(f"- {plugin._PUBLIC_ONLY_GAP}"))
         self.assertNotIn("PIPELINE_", rendered)
@@ -13323,6 +13970,7 @@ print("exact temp boundary: PASS")
                 row["action"]
                 for row in runtime_state.read_supervisor_continuations(parent)
             ]
+            self.assertEqual(self._saved_as(parent, answer), {"result": "ALLOW"})
 
         self.assertEqual(model_turns, 0)
         self.assertEqual(
@@ -13862,6 +14510,7 @@ print("exact temp boundary: PASS")
                 row["action"]
                 for row in runtime_state.read_supervisor_continuations(parent)
             ]
+            self.assertEqual(self._saved_as(parent, answer), {"result": "ALLOW"})
 
         self.assertEqual(model_turns, 3)
         self.assertEqual(
@@ -14058,6 +14707,7 @@ print("exact temp boundary: PASS")
                     parent,
                 ).read_text(encoding="utf-8")
             )
+            self.assertEqual(self._saved_as(parent, answer), {"result": "ALLOW"})
 
         self.assertEqual(model_turns, 3)
         self.assertEqual(persisted, answer)

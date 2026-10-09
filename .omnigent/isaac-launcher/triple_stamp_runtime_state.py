@@ -2648,6 +2648,172 @@ def read_supervisor_continuations(
     )
 
 
+# Only a few questions run their stages at once; the rest wait their turn. On
+# 2026-10-09 ten questions sent within three minutes ran every stage at the
+# same time, swap filled, and six of the ten failed. The launcher writes the
+# limit from TRIPLE_STAMP_MAX_PARALLEL_QUESTIONS into the run folder.
+DEFAULT_MAX_PARALLEL_QUESTIONS = 3
+_QUESTION_PACING_FILE = "question-pacing.json"
+_QUESTION_SLOTS_FILE = "question-slots.json"
+# A waiter that stopped polling has left the queue. A question with nothing in
+# flight and no new dispatch for ten minutes has stopped, so its slot goes to
+# the next question, and no slot is held longer than four hours.
+_QUESTION_WAITER_STALE_NS = 90 * 10**9
+_QUESTION_IDLE_NS = 10 * 60 * 10**9
+_QUESTION_SLOT_MAX_AGE_NS = 4 * 60 * 60 * 10**9
+
+
+def max_parallel_questions() -> int:
+    """Return the run's limit on questions running at once."""
+
+    run_dir = _run_dir()
+    if run_dir is None:
+        return DEFAULT_MAX_PARALLEL_QUESTIONS
+    try:
+        value = json.loads(
+            (run_dir / _QUESTION_PACING_FILE).read_text(encoding="utf-8")
+        ).get("max_parallel_questions")
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_MAX_PARALLEL_QUESTIONS
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return DEFAULT_MAX_PARALLEL_QUESTIONS
+    return value
+
+
+def _process_alive(pid: object) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _question_done(parent_session_id: str, generation: int) -> bool:
+    return current_attempt_generation(parent_session_id) != generation or bool(
+        read_attested_answer(parent_session_id)
+        or read_best_effort_answer(parent_session_id)
+        or read_terminal_failure(parent_session_id)
+    )
+
+
+def _question_idle(parent_session_id: str, admitted_at_ns: int, now_ns: int) -> bool:
+    dispatches = _scope_parent_records(
+        _read("routing-dispatches.jsonl"), parent_session_id
+    )
+    collections = _scope_parent_records(
+        _read("routing-collections.jsonl"), parent_session_id
+    )
+    collected = {str(record.get("work_id") or "") for record in collections}
+    if any(str(record.get("work_id") or "") not in collected for record in dispatches):
+        return False
+    latest = max(
+        [admitted_at_ns]
+        + [int(record.get("dispatched_at_ns") or 0) for record in dispatches]
+        + [int(record.get("collected_at_ns") or 0) for record in collections]
+    )
+    return now_ns - latest > _QUESTION_IDLE_NS
+
+
+def claim_question_slot(
+    parent_session_id: str,
+    generation: int,
+    *,
+    force: bool = False,
+) -> bool:
+    """Admit one question to the run's running set, or queue it in arrival order.
+
+    Returns whether the question may start. A queued question calls again
+    until it is admitted; ``force`` admits it past the limit.
+    """
+
+    run_dir = _run_dir()
+    if run_dir is None or not parent_session_id:
+        return True
+    path = run_dir / _QUESTION_SLOTS_FILE
+    lock_fd = os.open(
+        run_dir / ".question-slots.lock", os.O_RDWR | os.O_CREAT, 0o600
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        admitted = state.get("admitted")
+        waiting = state.get("waiting")
+        admitted = admitted if isinstance(admitted, dict) else {}
+        waiting = waiting if isinstance(waiting, dict) else {}
+        now = time.time_ns()
+        for parent, entry in list(admitted.items()):
+            if (
+                not isinstance(entry, dict)
+                or not _process_alive(entry.get("pid"))
+                or now - int(entry.get("at_ns") or 0) > _QUESTION_SLOT_MAX_AGE_NS
+                or _question_done(parent, int(entry.get("generation") or 0))
+            ):
+                del admitted[parent]
+        for parent, entry in list(waiting.items()):
+            if (
+                not isinstance(entry, dict)
+                or not _process_alive(entry.get("pid"))
+                or now - int(entry.get("seen_ns") or 0) > _QUESTION_WAITER_STALE_NS
+            ):
+                del waiting[parent]
+        mine = admitted.get(parent_session_id)
+        if isinstance(mine, dict) and int(mine.get("generation") or 0) == generation:
+            granted = True
+        else:
+            admitted.pop(parent_session_id, None)
+            entry = waiting.get(parent_session_id)
+            if not isinstance(entry, dict) or entry.get("generation") != generation:
+                entry = {"generation": generation, "since_ns": now}
+            entry.update(pid=os.getpid(), seen_ns=now)
+            waiting[parent_session_id] = entry
+            limit = max_parallel_questions()
+            if len(admitted) >= limit:
+                # Only a full set is worth the ledger reads that find a
+                # question that has stopped without finishing.
+                for parent, other in list(admitted.items()):
+                    if _question_idle(parent, int(other.get("at_ns") or 0), now):
+                        del admitted[parent]
+            first = min(
+                waiting,
+                key=lambda parent: (int(waiting[parent].get("since_ns") or 0), parent),
+            )
+            granted = force or (
+                len(admitted) < limit and first == parent_session_id
+            )
+            if granted:
+                del waiting[parent_session_id]
+                admitted[parent_session_id] = {
+                    "generation": generation,
+                    "pid": os.getpid(),
+                    "at_ns": now,
+                }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {"admitted": admitted, "waiting": waiting},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        return granted
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def write_budget_state(
     cost: float,
     maximum: float,

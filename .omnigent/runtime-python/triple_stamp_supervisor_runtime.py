@@ -631,13 +631,80 @@ async def _restart_supervisor_cli(executor: object, messages: list[dict[str, Any
         )
 
 
+_QUESTION_QUEUE_POLL_S = 10.0
+# A queued question starts anyway after four hours rather than never.
+_QUESTION_QUEUE_MAX_S = 4 * 60 * 60.0
+
+
+async def _question_queue_sleep(seconds: float) -> None:
+    import asyncio
+
+    await asyncio.sleep(seconds)
+
+
+async def _wait_for_question_slot(
+    session_id: str,
+    generation: int,
+) -> AsyncIterator[object]:
+    """Hold a new question, before its first model turn, until a slot frees."""
+
+    from omnigent.inner.executor import TextChunk
+    from triple_stamp_isaac_launcher import _QUEUE_NOTE, _next_route
+    from triple_stamp_runtime_state import (
+        claim_question_slot,
+        max_parallel_questions,
+        read_attempt_collections,
+    )
+
+    try:
+        if claim_question_slot(session_id, generation):
+            return
+    except Exception as exc:  # noqa: BLE001 - pacing must never stop a question
+        _LOGGER.warning("question pacing unavailable: %s", type(exc).__name__)
+        return
+    route = _next_route(
+        read_attempt_collections(parent_session_id=session_id),
+        parent_session_id=session_id,
+    )
+    _record(
+        "question_queued",
+        route,
+        attempt=0,
+        reason=(
+            f"{max_parallel_questions()} questions are already running; "
+            "waiting for a free slot"
+        ),
+        parent_session_id=session_id,
+    )
+    yield TextChunk(text=_QUEUE_NOTE)
+    give_up = time.monotonic() + _QUESTION_QUEUE_MAX_S
+    while True:
+        await _question_queue_sleep(_QUESTION_QUEUE_POLL_S)
+        try:
+            if claim_question_slot(
+                session_id,
+                generation,
+                force=time.monotonic() >= give_up,
+            ):
+                break
+        except Exception as exc:  # noqa: BLE001 - pacing must never stop a question
+            _LOGGER.warning("question pacing unavailable: %s", type(exc).__name__)
+            break
+    _record(
+        "question_admitted",
+        route,
+        attempt=0,
+        reason="a slot freed up",
+        parent_session_id=session_id,
+    )
+
+
 def _customer_safe_terminal_failure() -> str:
     """Return a retryable reader-facing failure without policy internals."""
 
-    return (
-        "I couldn't complete this request because the research run ended "
-        "unexpectedly. Please ask again to start a fresh attempt."
-    )
+    from triple_stamp_isaac_launcher import _CUSTOMER_SAFE_FAILURE
+
+    return _CUSTOMER_SAFE_FAILURE
 
 
 def _record(
@@ -887,6 +954,16 @@ def install_supervisor_continuation_guard() -> None:
             ),
             set(),
         )
+        if not (
+            read_attempt_dispatches(parent_session_id=session_id)
+            or read_terminal_failure(parent_session_id=session_id)
+            or read_attested_answer(parent_session_id=session_id)
+            or read_best_effort_answer(parent_session_id=session_id)
+        ):
+            # A question that has not started any stage waits here for one of
+            # the run's few slots. Later wakes of a running question never do.
+            async for event in _wait_for_question_slot(session_id, attempt_generation):
+                yield event
         refusal_retries = 0
         while True:
             attest_latest_codex_stamp(session_id)

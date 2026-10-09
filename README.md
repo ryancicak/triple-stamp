@@ -115,6 +115,8 @@ Ask your question in either one. Type `/quit` to stop the run and clean up.
 
 <sub>A real run takes about 15 to 30 minutes, longer when the judge sends work back for another pass. Each stage shows one plain progress line as it starts, such as `Step 2 of 3: auditing the research against internal sources (audit-cycle-1)`.</sub>
 
+You can ask several questions at once, each in its own chat. Three run at a time, and the others show `Waiting for a free slot` until one finishes, because every question runs three heavy agents and a batch of ten at once filled a 48 GB Mac's swap. To change the limit, start the run with `TRIPLE_STAMP_MAX_PARALLEL_QUESTIONS=<1 to 20> ./triple-stamp`.
+
 ## Make it sound like you
 
 The answer does not have to sound like generic AI prose. Triple-stamp can render it in your saved voice profile: your cadence, level of detail, and preferred phrasing.

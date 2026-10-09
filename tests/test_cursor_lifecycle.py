@@ -981,6 +981,110 @@ class CursorLifecycleTests(unittest.TestCase):
                 runner_app.unregister_subagent_work(child)
                 runner_app._session_inboxes_ref.pop(parent, None)
 
+    def test_reply_that_only_announces_research_gets_the_cycle_retry(
+        self,
+    ) -> None:
+        """2026-10-09: a Cursor turn ended after 14 s with one sentence.
+
+        The sentence said which tools it would check first. It was delivered
+        as the cycle's research, so the audit and the judge worked from an
+        empty packet.
+        """
+
+        parent = "announcement-parent"
+        announcement = (
+            "I'll research the account's renewal risk, starting by checking "
+            "which internal search tools are available in this session."
+        )
+        short_packet = (
+            "- question_restated: what is 2+2?\n"
+            "- findings: 4, printed by Python\n"
+            "- suggested_customer_answer_draft: 4"
+        )
+
+        def settle(title: str, output: str, key: str = "") -> dict[str, object]:
+            name = key or title
+            dispatch = {
+                "parent_session_id": parent,
+                "child_session_id": f"{name}-child",
+                "work_id": f"{name}-work",
+                "agent": "cursor_workhorse",
+                "title": title,
+            }
+            runtime_state.append_dispatch(dispatch)
+            runtime_state.begin_cursor_lifecycle(dispatch)
+            snapshot = {
+                "output": output,
+                "complete": True,
+                "turn_id": f"{name}-turn",
+                "fingerprint": f"{name}-fingerprint",
+                "diagnostic": f"assistant_chars={len(output)}",
+            }
+            # The first sighting arms the candidate; the next one settles it.
+            lifecycle._observe_cursor_lifecycle(dispatch, snapshot)
+            return lifecycle._observe_cursor_lifecycle(dispatch, snapshot)
+
+        with tempfile.TemporaryDirectory() as value, mock.patch.dict(
+            os.environ,
+            {"TRIPLE_STAMP_RUN_DIR": value},
+            clear=False,
+        ), mock.patch.object(lifecycle, "_CURSOR_COMPLETION_STABLE_S", 0.0):
+            first = settle("cursor-cycle-1", announcement)
+            self.assertEqual(first["terminal_status"], "failed")
+            self.assertEqual(first["terminal_phase"], "ready")
+            self.assertIn(announcement, first["terminal_output"])
+            self.assertIn("title cursor-retry-1-1.", first["terminal_output"])
+            record = {
+                "agent": "cursor_workhorse",
+                "title": "cursor-cycle-1",
+                "status": "failed",
+                "output": first["terminal_output"],
+            }
+            self.assertTrue(contract._retryable_cursor_failure(record))
+            self.assertFalse(
+                lifecycle._cursor_failure_requires_terminal_latch(
+                    "cursor-cycle-1", "failed", str(first["terminal_output"])
+                )
+            )
+            route = contract._next_route([{**record, "parent_session_id": parent}])
+            self.assertEqual(
+                (route.status, route.agent, route.title),
+                ("dispatch", "cursor_workhorse", "cursor-retry-1-1"),
+            )
+
+            # The retry is not failed again: a second announcement goes on to
+            # the audit, which still does its own research.
+            retried = settle("cursor-retry-1-1", announcement)
+            self.assertEqual(
+                (retried["terminal_status"], retried["terminal_output"]),
+                ("completed", announcement),
+            )
+            # A packet with any field, heading, list, or link passes however
+            # short it is, and so does a reply too long to be an announcement.
+            for index, output in enumerate(
+                (
+                    short_packet,
+                    "## Findings\n4, printed by Python.",
+                    "**Answer**\n4, printed by Python.",
+                    "- 4, printed by Python",
+                    "4, per https://docs.python.org/3/library/stdtypes.html",
+                    "Evidence was checked line by line. " * 20,
+                )
+            ):
+                with self.subTest(output=output[:30]):
+                    self.assertEqual(
+                        settle(
+                            "cursor-cycle-2", output, key=f"structured-{index}"
+                        )["terminal_status"],
+                        "completed",
+                    )
+            self.assertEqual(
+                settle("cursor-cycle-2", announcement, key="announced")[
+                    "terminal_status"
+                ],
+                "failed",
+            )
+
     def test_failed_cursor_without_collection_terminalizes_parent_attempt(
         self,
     ) -> None:

@@ -97,6 +97,20 @@ _SUBAGENT_OVERRIDE_KEYS = frozenset(
     {"cost_budget", "file_ids", "harness", "model", "reasoning_effort"}
 )
 _CURSOR_PACKET_STAGES = frozenset({"cursor_grunt", "cursor_retry"})
+# A finished Cursor reply that is a few lines of plain prose, with no field,
+# heading, list, or link, only announced its research. On 2026-10-09 a Cursor
+# turn ended after 14 s with one sentence saying which tools it would check
+# first, and the audit and judge then worked from an empty packet. The smallest
+# real packet in the answer library is 1,680 characters with 7 headings and 12
+# bullets. The first attempt of a cycle gets the cycle's one fresh retry.
+_CURSOR_ANNOUNCEMENT_MAX_CHARS = 600
+_CURSOR_PACKET_STRUCTURE = re.compile(
+    r"(?im)\b(?:question_restated|purpose_run|current_date_used|findings|"
+    r"web_sources|unverified|suggested_customer_answer_draft|weakest_part)\b"
+    r"[\"'*`]*\s*:"
+    r"|^\s*#{1,6}\s|^\s*\*\*[^*\n]+\*\*\s*:?\s*$|^\s*(?:[-*+]|\d+[.)])\s"
+    r"|https?://"
+)
 _OPUS_PACKET_STAGES = frozenset(
     {
         "audit",
@@ -348,6 +362,16 @@ def _cursor_retry_note(title: str) -> str:
         f"as one fresh child with title cursor-retry-{cycle}-1. Keep cycle "
         f"{cycle}; do not resume the failed child. This retry is separate "
         "from the Opus transient-retry budget.]"
+    )
+
+
+def _cursor_reply_has_no_research(output: str) -> bool:
+    """Whether a finished Cursor turn returned an announcement, not a packet."""
+
+    text = output.strip()
+    return (
+        len(text) < _CURSOR_ANNOUNCEMENT_MAX_CHARS
+        and _CURSOR_PACKET_STRUCTURE.search(text) is None
     )
 
 
@@ -1258,6 +1282,108 @@ async def _cursor_launch_turn(read_dispatches: Any, read_collections: Any) -> An
             os.close(lock_fd)
 
 
+# Judges' Codex starts one at a time across the run's chats, each once the one
+# before has started its thread or failed to. On 2026-10-09 the judges of a
+# ten-question batch started while the rest of the batch was still running,
+# and five of them timed out at startup.
+_CODEX_LAUNCH_LOCK = "codex-launch.lock"
+_CODEX_START_WAIT_S = 240.0
+_CODEX_START_WINDOW_NS = 10 * 60 * 10**9
+# Each poll rereads the ledgers, which hold whole packets.
+_CODEX_LAUNCH_POLL_S = 1.0
+
+
+def _codex_bridge_module() -> Any:
+    try:
+        from omnigent.harnesses.codex_native import bridge
+    except ImportError:  # Omnigent 0.12 keeps the bridge at its old path
+        from omnigent import codex_native_bridge as bridge
+    return bridge
+
+
+def _starting_codex_judges(
+    dispatches: list[dict[str, Any]],
+    collections: list[dict[str, Any]],
+) -> list[str]:
+    """Return recent, unfinished judges whose Codex has neither started nor failed."""
+
+    bridge = _codex_bridge_module()
+    finished = {
+        work_id
+        for work_id in (str(record.get("work_id") or "") for record in collections)
+        if work_id
+    }
+    oldest_ns = time.time_ns() - _CODEX_START_WINDOW_NS
+    starting = []
+    for record in dispatches:
+        child = str(record.get("child_session_id") or "")
+        if (
+            record.get("agent") != "codex_judge"
+            or not child
+            or str(record.get("work_id") or "") in finished
+            or int(record.get("dispatched_at_ns") or 0) < oldest_ns
+        ):
+            continue
+        bridge_dir = bridge.bridge_dir_for_bridge_id(child)
+        if (
+            bridge.read_bridge_state(bridge_dir) is None
+            and bridge.read_bridge_startup_error(bridge_dir) is None
+        ):
+            starting.append(child)
+    return starting
+
+
+@contextlib.asynccontextmanager
+async def _codex_launch_turn(read_dispatches: Any, read_collections: Any) -> Any:
+    """Launch judges one at a time, each after the run's other judges start.
+
+    Fails open like the Cursor launch turn: an error, or a judge still starting
+    after ``_CODEX_START_WAIT_S``, lets the launch proceed exactly as before.
+    """
+
+    raw_run_dir = os.environ.get("TRIPLE_STAMP_RUN_DIR", "")
+    if not raw_run_dir:
+        yield
+        return
+    lock_fd = None
+    with contextlib.suppress(OSError):
+        lock_fd = os.open(
+            Path(raw_run_dir) / _CODEX_LAUNCH_LOCK,
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+    try:
+        give_up = time.monotonic() + _CODEX_START_WAIT_S
+        if lock_fd is not None:
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= give_up:
+                        break
+                    await asyncio.sleep(_CODEX_LAUNCH_POLL_S)
+                except OSError:
+                    break
+        while time.monotonic() < give_up:
+            try:
+                starting = _starting_codex_judges(
+                    read_dispatches(),
+                    read_collections(),
+                )
+            except Exception:  # noqa: BLE001 - ordering must never block a launch
+                break
+            if not starting:
+                break
+            await asyncio.sleep(_CODEX_LAUNCH_POLL_S)
+        yield
+    finally:
+        if lock_fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
 def _startup_state(bridge_dir: Path) -> tuple[str, str, str]:
     startup = bridge_dir / "triple-stamp-startup.json"
     try:
@@ -1575,6 +1701,25 @@ def _observe_cursor_lifecycle(
                 return
             stable_ns = int(_CURSOR_COMPLETION_STABLE_S * 1_000_000_000)
             if now_ns - int(generation.get("candidate_since_ns") or 0) >= stable_ns:
+                output = str(snapshot["output"])
+                title = str(generation.get("title") or dispatch.get("title") or "")
+                if re.fullmatch(
+                    r"cursor-cycle-[1-4]", title
+                ) and _cursor_reply_has_no_research(output):
+                    # Recorded as the retryable failure the retry note names.
+                    # A retry that also only announces goes on to the audit.
+                    generation["terminal_status"] = "failed"
+                    generation["terminal_output"] = (
+                        "CURSOR_WORKER_FAILED: Cursor turn ended with status "
+                        "success before a complete packet; the reply had "
+                        f"{len(output.strip())} characters and none of the "
+                        "packet's fields; "
+                        f"recovered_assistant_output={json.dumps(output[:4000])}; "
+                        f"{snapshot['diagnostic']}"
+                        f"{_cursor_retry_note(title)}"
+                    )
+                    generation["terminal_phase"] = "ready"
+                    return
                 generation["completed_turn_id"] = turn_id
                 generation["terminal_status"] = "completed"
                 generation["terminal_output"] = str(snapshot["output"])
@@ -2428,10 +2573,16 @@ def install_parent_inbox_guard() -> None:
             **kwargs: Any,
         ) -> str:
             # The launch turn spans the send and its dispatch record, so the
-            # next Cursor worker sees this one and waits for its chat claim.
-            if not isinstance(args, dict) or args.get("agent") != "cursor_workhorse":
+            # next Cursor worker sees this one and waits for its chat claim,
+            # and the next judge waits for this one's Codex to start.
+            agent = args.get("agent") if isinstance(args, dict) else None
+            launch_turn = {
+                "cursor_workhorse": _cursor_launch_turn,
+                "codex_judge": _codex_launch_turn,
+            }.get(str(agent or ""))
+            if launch_turn is None:
                 return await guarded_execute_subagent_tool(args, **kwargs)
-            async with _cursor_launch_turn(read_dispatches, read_collections):
+            async with launch_turn(read_dispatches, read_collections):
                 return await guarded_execute_subagent_tool(args, **kwargs)
 
         cursor_ordered_execute_subagent_tool.__triple_stamp_inbox_guard__ = True

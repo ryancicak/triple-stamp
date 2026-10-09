@@ -407,6 +407,107 @@ class InstallPortabilityTests(unittest.TestCase):
                     launcher._drop_codex_mcp_servers(config)
             self.assertIn("could not remove the MCP servers", str(raised.exception))
 
+    def test_judge_codex_never_stops_on_a_new_model_screen(self) -> None:
+        """2026-10-09: judges' Codex waited on "Meet GPT-6 Sol" until they timed out.
+
+        Codex keeps a new TUI on that screen until someone picks a model,
+        unless the upgrade is already recorded as seen, which is what picking
+        "Use existing model" records.
+        """
+
+        catalog = {
+            "models": [
+                {"slug": "gpt-5.6-sol", "upgrade": {"model": "gpt-7-sol"}},
+                {"slug": "gpt-5.6-luna", "upgrade": {"model": "gpt-6-luna"}},
+                {"slug": "gpt-6-sol", "upgrade": None},
+                {"slug": "broken", "upgrade": {"model": ""}},
+                "not a model",
+            ]
+        }
+        user_config = (
+            '# kept comment\nmodel = "gpt-5.6-sol"\n\n'
+            "[notice]\nhide_full_access_warning = true\n\n"
+            '[mcp_servers.demo]\ncommand = "demo"\n'
+        )
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            codex = base / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                '[ "$1 $2" = "debug models" ] || exit 2\n'
+                '[ -n "$CODEX_HOME" ] && [ "$CODEX_HOME" != "$HOME/.codex" ] || exit 3\n'
+                f"printf '%s' '{json.dumps(catalog)}'\n",
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            broken = base / "broken-codex"
+            broken.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            broken.chmod(0o755)
+            config = base / "home/.codex/config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(user_config, encoding="utf-8")
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(base / "home")}
+
+            launcher._acknowledge_codex_upgrades(config, [broken, codex], env)
+            seeded = config.read_text(encoding="utf-8")
+            settings = launcher.tomllib.loads(seeded)
+            self.assertIn("# kept comment\n", seeded)
+            self.assertEqual(settings["model"], "gpt-5.6-sol")
+            self.assertEqual(settings["mcp_servers"], {"demo": {"command": "demo"}})
+            self.assertEqual(
+                settings["notice"],
+                {
+                    "hide_full_access_warning": True,
+                    "model_migrations": {
+                        # A listed upgrade replaces the built-in default.
+                        "gpt-5.5": "gpt-6-sol",
+                        "gpt-5.6-luna": "gpt-6-luna",
+                        "gpt-5.6-sol": "gpt-7-sol",
+                        "gpt-5.6-terra": "gpt-6-sol",
+                    },
+                },
+            )
+            # Run again: the table is updated in place, not added twice.
+            launcher._acknowledge_codex_upgrades(config, [codex], env)
+            self.assertEqual(launcher.tomllib.loads(config.read_text(encoding="utf-8")), settings)
+
+            # No Codex config yet, and no Codex that can list its models.
+            fresh = base / "fresh/config.toml"
+            launcher._acknowledge_codex_upgrades(fresh, [broken], env)
+            self.assertEqual(
+                launcher.tomllib.loads(fresh.read_text(encoding="utf-8")),
+                {"notice": {"model_migrations": launcher._KNOWN_CODEX_UPGRADES}},
+            )
+
+            # A config that does not parse is left alone with a warning.
+            bad = base / "bad.toml"
+            bad.write_text("model = [\n", encoding="utf-8")
+            with mock.patch.object(launcher, "_eprint") as warned:
+                launcher._acknowledge_codex_upgrades(bad, [], env)
+            self.assertEqual(bad.read_text(encoding="utf-8"), "model = [\n")
+            self.assertIn("'Meet <model>' screen", warned.call_args.args[0])
+
+        # The run's Codex, then the one on the run's PATH, whose list wins.
+        with tempfile.TemporaryDirectory() as root:
+            first, second = Path(root) / "a/codex", Path(root) / "b/codex"
+            for path in (first, second):
+                path.parent.mkdir()
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+                path.chmod(0o755)
+            self.assertEqual(
+                launcher._codex_binaries(first, {"PATH": str(second.parent)}),
+                [first.resolve(), second.resolve()],
+            )
+            self.assertEqual(
+                launcher._codex_binaries(first, {"PATH": str(first.parent)}),
+                [first.resolve()],
+            )
+        source = (ROOT / ".omnigent/launcher.py").read_text(encoding="utf-8")
+        self.assertIn(
+            '_acknowledge_codex_upgrades(\n            run_dir / "home/.codex/config.toml",',
+            source,
+        )
+
     def test_shell_launcher_uses_bootstrapped_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = Path(value)

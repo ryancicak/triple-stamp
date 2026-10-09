@@ -52,7 +52,22 @@ _EXPECTED_ACTIONS = {
     "terminal_stamp_suppressed",
     "deterministic_best_effort_relay",
     "ordinary_response_suppressed",
+    "question_queued",
+    "question_admitted",
 }
+# A question that waited for a free slot shows this line before its first step.
+_QUEUE_NOTE = re.compile(r"\AWaiting for a free slot:[^\n]*\n\n")
+
+
+def _progress_readable(shown: list[str]) -> bool:
+    return any(
+        _QUEUE_NOTE.sub("", text).startswith("Step 1 of 3: ") for text in shown
+    ) and not any("TRIPLE_STAMP_PROGRESS" in text for text in shown)
+
+
+def _no_policy_text(shown: list[str]) -> bool:
+    # Omnigent saves a denied reply as "[Denied by policy: <reason>]".
+    return not any("[Denied by policy" in text for text in shown)
 
 
 def _api(base: str, method: str, path: str, body: object | None = None) -> dict:
@@ -461,8 +476,8 @@ def _score(
         ),
         "no_route_anomalies": continuations <= _EXPECTED_ACTIONS,
         "send_ready": _PROCESS_NOTE.search(answer) is None,
-        "progress_readable": any(text.startswith("Step 1 of 3: ") for text in shown)
-        and not any("TRIPLE_STAMP_PROGRESS" in text for text in shown),
+        "progress_readable": _progress_readable(shown),
+        "no_policy_text": _no_policy_text(shown),
         "answer_shown_exactly": bool(answer) and answer in shown,
     }
     research = "\n".join(

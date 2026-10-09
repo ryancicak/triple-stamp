@@ -187,6 +187,20 @@ _NO_OUTPUT = re.compile(
 )
 _INFRA_PREFIX = "PIPELINE_INFRASTRUCTURE_ERROR:"
 _VALIDATION_PREFIX = "PIPELINE_VALIDATION_FAILED:"
+# The one message a reader sees when a question ends in failure. The guard
+# relays it in place of the raw failure, and the response rule allows exactly
+# these bytes once the failure is recorded.
+_CUSTOMER_SAFE_FAILURE = (
+    "I couldn't complete this request because the research run ended "
+    "unexpectedly. Please ask again to start a fresh attempt."
+)
+# Shown while a new question waits for a free slot. Omnigent saves it together
+# with whatever the turn shows next, so the response rule allows it alone or in
+# front of any reply the rule allows by itself.
+_QUEUE_NOTE = (
+    "Waiting for a free slot: other questions are running, and this one "
+    "starts as soon as one of them finishes.\n\n"
+)
 # A public-only run, as on a Mac outside Databricks, ends a Codex
 # NEEDS_INTERNAL with this route reason and this one gap line.
 _NO_INTERNAL_SYSTEMS_REASON = "no internal system is configured for this run"
@@ -3138,6 +3152,11 @@ def supervisor_contract(
         response = event.get("data")
         if not isinstance(response, str):
             return {"result": "DENY", "reason": "supervisor response is not text"}
+        if response.startswith(_QUEUE_NOTE):
+            remainder = response[len(_QUEUE_NOTE) :]
+            if not remainder:
+                return {"result": "ALLOW"}
+            return evaluate({**event, "data": remainder})
         if (
             not parent_session_id
             and any(
@@ -3154,6 +3173,17 @@ def supervisor_contract(
                     "conversation id; cross-parent ledger reduction is forbidden."
                 ),
             }
+        if parent_session_id and (
+            (
+                response == _CUSTOMER_SAFE_FAILURE
+                and read_terminal_failure(parent_session_id)
+            )
+            or (response and response == read_best_effort_answer(parent_session_id))
+        ):
+            # The guard records a failure or a bounded answer before relaying
+            # it. Omnigent saves a denied reply as "[Denied by policy: <reason>]",
+            # which is what six failed chats showed on 2026-10-09.
+            return {"result": "ALLOW"}
         collections = read_attempt_collections(
             parent_session_id=parent_session_id
         )

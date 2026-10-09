@@ -139,6 +139,26 @@ class AudienceCheckTests(unittest.TestCase):
         self.assertIsNotNone(harness._PROCESS_NOTE.search("SAFE was unavailable during validation."))
         self.assertIsNotNone(harness._PROCESS_NOTE.search("Checked during the review stage."))
 
+    def test_progress_may_follow_the_wait_for_a_free_slot(self) -> None:
+        step = "Step 1 of 3: researching public sources (cursor-cycle-1)"
+        waited = "Waiting for a free slot: other questions are running.\n\n" + step
+        self.assertTrue(harness._progress_readable([waited, "5 + 5 = 10."]))
+        self.assertTrue(harness._progress_readable([step]))
+        self.assertFalse(harness._progress_readable(["Waiting for a free slot: x.\n\n"]))
+        self.assertFalse(harness._progress_readable(["Researching. " + step]))
+        self.assertTrue(
+            {"question_queued", "question_admitted"} <= harness._EXPECTED_ACTIONS
+        )
+
+    def test_policy_text_shown_to_the_reader_fails_the_round(self) -> None:
+        # 2026-10-09: failed chats were saved as the response rule's own words.
+        denied = (
+            "[Denied by policy: Supervisor output is forbidden until a "
+            "persisted Codex STAMP proves the byte-exact shippable_answer.]"
+        )
+        self.assertFalse(harness._no_policy_text(["Step 1 of 3: x", denied]))
+        self.assertTrue(harness._no_policy_text(["Step 1 of 3: x", "5 + 5 = 10."]))
+
     def test_ordinary_questions_get_no_extra_checks(self) -> None:
         self.assertEqual(harness._audience_checks(_question(), "5 + 5 = 10.", []), {})
         # A phrase such as "go/no-go" in prose is not an internal link.

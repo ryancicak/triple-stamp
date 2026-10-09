@@ -177,6 +177,66 @@ def _install_opus_harness_args_guard() -> None:
     harness_startup_config.resolve_harness_args = guarded
 
 
+# Omnigent gives a fresh Codex TUI 30 s to start its thread, and the judge's
+# executor polls 60 s for the bridge. On 2026-10-09 a batch of ten questions
+# filled swap, and five judges' Codex took longer than 30 s, as did each one's
+# restart. Three minutes covers that load; the executor waits a minute past
+# it, so a Codex that never starts still fails with the runner's own reason.
+_CODEX_THREAD_START_S = 180.0
+_CODEX_BRIDGE_WAIT_S = 240.0
+
+
+def _install_codex_start_patience() -> None:
+    """Wait three minutes, not 30 s, for a judge's Codex to start its thread."""
+
+    import asyncio
+    import time
+
+    try:
+        from omnigent.harnesses.codex_native import forwarder
+    except ImportError:  # Omnigent 0.12 keeps the forwarder at its old path
+        from omnigent import codex_native_forwarder as forwarder
+    from omnigent.inner import codex_native_executor
+
+    original_wait = forwarder.wait_for_thread_started
+    if not getattr(original_wait, "__triple_stamp_codex_patience__", False):
+
+        async def patient_wait(
+            client: object,
+            *,
+            timeout: float | None = _CODEX_THREAD_START_S,
+        ) -> str:
+            # An explicit timeout, including None for a sign-in wait, stands.
+            return await original_wait(client, timeout=timeout)
+
+        patient_wait.__triple_stamp_codex_patience__ = True
+        patient_wait.__triple_stamp_original__ = original_wait
+        forwarder.wait_for_thread_started = patient_wait
+
+    executor = codex_native_executor.CodexNativeExecutor
+    original_run_turn = executor.run_turn
+    if getattr(original_run_turn, "__triple_stamp_codex_patience__", False):
+        return
+
+    async def patient_run_turn(self: object, *args: object, **kwargs: object):
+        bridge_dir = getattr(self, "_bridge_dir", None)
+        if bridge_dir is not None:
+            give_up = time.monotonic() + _CODEX_BRIDGE_WAIT_S
+            while (
+                codex_native_executor.read_bridge_state(bridge_dir) is None
+                and codex_native_executor.read_bridge_startup_error(bridge_dir)
+                is None
+                and time.monotonic() < give_up
+            ):
+                await asyncio.sleep(1.0)
+        async for event in original_run_turn(self, *args, **kwargs):
+            yield event
+
+    patient_run_turn.__triple_stamp_codex_patience__ = True
+    patient_run_turn.__triple_stamp_original__ = original_run_turn
+    executor.run_turn = patient_run_turn
+
+
 def _install_minimal_supervisor_tool_surface() -> None:
     """Expose only send/read MCP tools plus Claude SDK ToolSearch."""
 
@@ -402,6 +462,15 @@ if (
             flush=True,
         )
         os._exit(78)
+    try:
+        _install_codex_start_patience()
+    except Exception as exc:  # noqa: BLE001 - judges then keep Omnigent's 30 s
+        print(
+            "triple-stamp: Codex start patience unavailable: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     _original = _permissions._yolo_auto_accept
     if not getattr(_original, "__triple_stamp_guard__", False):

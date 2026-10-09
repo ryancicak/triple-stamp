@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import configparser
 import contextlib
 import fcntl
@@ -45,6 +46,9 @@ BROWSER_REQUIRED_PATH_ENV = "TRIPLE_STAMP_BROWSER_REQUIRED_PATH"
 OPUS_READINESS_SMOKE_ENV = "TRIPLE_STAMP_RUN_OPUS_READINESS_SMOKE"
 PROFILE_MATRIX_ENV = "TRIPLE_STAMP_PROFILE_MATRIX"
 MAX_CYCLES_ENV = "TRIPLE_STAMP_MAX_CYCLES"
+# How many questions run their stages at once; the rest wait for a free slot.
+MAX_PARALLEL_QUESTIONS_ENV = "TRIPLE_STAMP_MAX_PARALLEL_QUESTIONS"
+DEFAULT_MAX_PARALLEL_QUESTIONS = 3
 VOICE_PROFILE_ENV = "TRIPLE_STAMP_VOICE_PROFILE"
 # `off` runs public-only: Opus gets no internal systems and the judge's Codex
 # starts no MCP servers, as on a Mac outside Databricks.
@@ -127,6 +131,21 @@ def _max_cycles(value: object | None = None) -> int:
         _die(f"{MAX_CYCLES_ENV} must be exactly 2 or 4")
     cycles = int(text)
     return cycles
+
+
+def _max_parallel_questions(value: object | None = None) -> int:
+    """Validate how many questions may run their stages at the same time."""
+
+    raw = (
+        os.environ.get(MAX_PARALLEL_QUESTIONS_ENV, "").strip()
+        if value is None
+        else str(value).strip()
+    )
+    if not raw:
+        return DEFAULT_MAX_PARALLEL_QUESTIONS
+    if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= 20:
+        _die(f"{MAX_PARALLEL_QUESTIONS_ENV} must be a whole number from 1 to 20")
+    return int(raw)
 
 
 def _route_call_cap(max_cycles: object | None = None) -> int:
@@ -1729,6 +1748,101 @@ def _drop_codex_mcp_servers(config_toml: Path) -> None:
     config_toml.write_text(stripped, encoding="utf-8")
 
 
+# Codex stops a new TUI on a "Meet <model>" screen, and waits for a key, when
+# its model list offers a newer model than the configured one. A judge's Codex
+# then never starts its session. On 2026-10-09 Codex offered GPT-6 Sol in place
+# of gpt-5.6-sol, and most judges of a ten-question batch timed out on that
+# screen. Recording an upgrade as seen is what answering "Use existing model"
+# records: Codex skips the screen and the judge keeps its pinned model. These
+# are the upgrades Codex 0.159.2 and 0.162.0 offer; each launch adds whatever
+# the installed Codex binaries list themselves.
+_KNOWN_CODEX_UPGRADES = {
+    "gpt-5.5": "gpt-6-sol",
+    "gpt-5.6-luna": "gpt-6-luna",
+    "gpt-5.6-sol": "gpt-6-sol",
+    "gpt-5.6-terra": "gpt-6-sol",
+}
+
+
+def _listed_codex_upgrades(codex: Path, env: dict[str, str]) -> dict[str, str]:
+    """Return the model upgrades one Codex binary's own model list offers."""
+
+    with tempfile.TemporaryDirectory(prefix="ts-codex-models-") as scratch:
+        try:
+            done = subprocess.run(
+                [str(codex), "debug", "models"],
+                env={**env, "CODEX_HOME": scratch},
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            models = json.loads(done.stdout).get("models")
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            return {}
+    upgrades: dict[str, str] = {}
+    for model in models if isinstance(models, list) else []:
+        if not isinstance(model, dict) or not isinstance(model.get("upgrade"), dict):
+            continue
+        slug, target = model.get("slug"), model["upgrade"].get("model")
+        if isinstance(slug, str) and slug and isinstance(target, str) and target:
+            upgrades[slug] = target
+    return upgrades
+
+
+def _acknowledge_codex_upgrades(
+    config_toml: Path,
+    binaries: list[Path],
+    env: dict[str, str],
+) -> None:
+    """Mark every model upgrade Codex would offer as seen in the run's config.
+
+    Only the run's private copy of ``config.toml`` changes. The binaries are
+    listed in parallel, and on a conflict the last binary's target wins.
+    """
+
+    upgrades = dict(_KNOWN_CODEX_UPGRADES)
+    if binaries:
+        with concurrent.futures.ThreadPoolExecutor(len(binaries)) as pool:
+            for listed in pool.map(lambda codex: _listed_codex_upgrades(codex, env), binaries):
+                upgrades.update(listed)
+    try:
+        import tomlkit
+
+        text = config_toml.read_text(encoding="utf-8") if config_toml.exists() else ""
+        settings = tomllib.loads(text)
+        document = tomlkit.parse(text)
+        if "notice" not in document:
+            document["notice"] = tomlkit.table()
+        if "model_migrations" not in document["notice"]:
+            document["notice"]["model_migrations"] = tomlkit.table()
+        for model, target in sorted(upgrades.items()):
+            document["notice"]["model_migrations"][model] = target
+        updated = tomlkit.dumps(document)
+        expected = json.loads(json.dumps(settings, default=str))
+        expected.setdefault("notice", {}).setdefault("model_migrations", {}).update(upgrades)
+        if json.loads(json.dumps(tomllib.loads(updated), default=str)) != expected:
+            raise ValueError("the edited copy does not parse to the intended settings")
+        config_toml.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = config_toml.with_name(f".{config_toml.name}.{os.getpid()}.tmp")
+        temporary.write_text(updated, encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(temporary, config_toml)
+    except Exception as exc:  # noqa: BLE001 - a judge then risks only the prompt
+        _eprint(
+            "triple-stamp: could not mark Codex's model upgrade prompts as seen "
+            f"({type(exc).__name__}); a judge's Codex may wait on its "
+            "'Meet <model>' screen"
+        )
+
+
+def _codex_binaries(codex: Path, env: dict[str, str]) -> list[Path]:
+    """The run's Codex and the one the run's PATH finds, which Omnigent may use."""
+
+    found = shutil.which("codex", path=env.get("PATH", ""))
+    ordered = [codex, *([Path(found)] if found else [])]
+    return list(dict.fromkeys(path.resolve() for path in ordered if path.is_file()))
+
+
 def _seed_isolated_home(
     root: Path,
     real_home: Path,
@@ -2580,6 +2694,12 @@ def _prepare_runtime(
             encoding="utf-8",
         )
         cycle_policy.chmod(0o600)
+        pacing = run_dir / "question-pacing.json"
+        pacing.write_text(
+            json.dumps({"max_parallel_questions": _max_parallel_questions()}) + "\n",
+            encoding="utf-8",
+        )
+        pacing.chmod(0o600)
         (run_dir / "owner-pid").write_text(str(os.getpid()) + "\n", encoding="utf-8")
         (run_dir / "sandbox-token").write_text(sandbox_token + "\n", encoding="utf-8")
         (run_dir / "sandbox-token").chmod(0o600)
@@ -2591,6 +2711,11 @@ def _prepare_runtime(
             real_home,
             run_dir / "home",
             tools.omnigent_python,
+        )
+        _acknowledge_codex_upgrades(
+            run_dir / "home/.codex/config.toml",
+            _codex_binaries(tools.codex, _host_env(real_home)),
+            _host_env(real_home),
         )
         _seed_cursor_home(run_dir, harness_tmp)
         _copy_file(real_home / ".kube/config", run_dir / "kube/config")

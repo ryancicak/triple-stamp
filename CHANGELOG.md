@@ -1,5 +1,39 @@
 # Changelog
 
+## v1.2.7 (2026-10-09)
+
+A judge's Codex no longer stops on Codex's new "Meet GPT-6 Sol" screen, and a batch of questions no longer overloads the Mac: three questions run at once and the rest wait their turn. A failed question shows its retry message instead of policy text.
+
+### Fixes
+
+- **A judge's Codex no longer waits on the "Meet GPT-6 Sol" screen.** Codex's own model list now offers GPT-6 Sol in place of the judge's GPT-5.6 Sol, and a new Codex can stop on a screen that offers the switch and waits for a key. A judge's Codex that stops there never starts its session, so it timed out at startup, and often so did its fresh restart, which ended the question after its research and audit had finished. In a live batch on 2026-10-09, two of three judges stopped on that screen, and five questions of a ten-question batch that morning ended with the same startup failure. Each run now records every upgrade the installed Codex offers as already seen, which is what choosing "Use existing model" records, so the judge keeps its pinned model and skips the screen. Only the run's own copy of the Codex settings changes; your `~/.codex/config.toml` does not.
+- **Three questions run at once; the rest wait their turn.** A question that arrives while three others are running shows `Waiting for a free slot` and starts as soon as one of them finishes. On 2026-10-09, ten questions sent within three minutes ran every stage at the same time and filled a 48 GB Mac's swap, and six of the ten failed. To change the limit, start the run with `TRIPLE_STAMP_MAX_PARALLEL_QUESTIONS` set to a number from 1 to 20. A question that stopped, or whose chat process ended, gives up its slot within ten minutes, and no question waits more than four hours.
+- **A judge's Codex gets three minutes to start, and judges start one at a time.** Omnigent gave a new Codex 30 seconds to start its session, which a Mac short on memory can need longer than. Judges in different chats now also start Codex one after another.
+- **A failed question shows its retry message, not policy text.** When a question fails, Triple-stamp shows "I couldn't complete this request because the research run ended unexpectedly. Please ask again to start a fresh attempt." The rule that guards the final answer did not allow that message, so Omnigent saved "[Denied by policy: Supervisor output is forbidden until a persisted Codex STAMP proves the byte-exact shippable_answer.]" in its place. You saw the retry message while the chat was open and the policy text after a reload. Every failed question since v1.2.0 has this bug. The same rule also denied some bounded answers, the best supported answer with its gaps, including the one a public-only run gives when its extra internal audit is refused. Every message the pipeline shows a reader is now tested against that rule.
+- **Research that only announces itself gets a retry.** In that batch, one Cursor research turn ended after 14 seconds with one sentence saying which tools it would check first, and the audit and judge worked from an empty packet. A first research reply that is a few lines of plain prose, with no heading, list, link, or packet field, now counts as a failed attempt and gets the cycle's one fresh retry. The smallest real research packet in the answer library is 1,680 characters with 7 headings and 12 bullets.
+
+### Verification
+
+- **The Codex screen, live:** before the fix, two of the first three judges in a six-question batch stopped on the "Meet GPT-6 Sol" screen, and one of those questions ended in a startup failure. With the fix, judges' Codex started in about 4 seconds and kept GPT-5.6 Sol.
+- **Slow Codex starts, live:** each judge's Codex was held 45 seconds before it could start, longer than the 30 seconds v1.2.6 allowed. Both questions stamped and passed 15 of 15 checks, in 17.5 and 19.5 minutes, and the second judge started its Codex only after the first one's had started.
+- **Pacing, live:** in a six-question batch, three questions ran and three showed the waiting note. The first two queued questions started in arrival order, each within a second of a slot freeing up.
+- **Regression suite:** 533 tests pass on Omnigent 0.14.0 and 0.12.0, also with a voice profile and public-only. Undoing any one of 25 parts of the fixes in a scratch copy made its tests fail.
+
+### Known limitations
+
+- A finished question's Opus and Codex terminals stay open until Omnigent closes idle terminals after an hour, and its idle chat process keeps using CPU. After the ten-question batch, those terminals held about 6 GB, and the idle chat processes used 2.4 to 3.4 CPU cores.
+- The limit counts questions within one run. Runs started from two different checkouts each run three.
+- A question that waits keeps its chat and its chat process; only its stages wait.
+
+### For maintainers
+
+- Codex's TUI skips its model-upgrade prompt only when `notice.model_migrations[<model>]` equals the target it would offer. At each launch, `_acknowledge_codex_upgrades` in `launcher.py` runs `codex debug models` with a scratch `CODEX_HOME` for the run's Codex and for the one on the run's PATH, whose list wins a conflict because Omnigent builds each session's model catalog from it. It merges their `upgrade` targets over `_KNOWN_CODEX_UPGRADES` and writes them with tomlkit to the run home's `.codex/config.toml`, and saves the file only if it parses to the old settings plus those entries. Omnigent copies that file into every judge's private `CODEX_HOME`.
+- The launcher validates `TRIPLE_STAMP_MAX_PARALLEL_QUESTIONS` (1 to 20, default 3) and writes it to `question-pacing.json` in the run folder. `claim_question_slot` in `triple_stamp_runtime_state.py` keeps `question-slots.json` under `.question-slots.lock`. It admits questions first come, first served, and frees a slot when its question has a terminal artifact or a newer attempt, when the admitting runner's process is gone, when nothing of it has been dispatched, run, or collected for ten minutes (checked only when every slot is taken), or after four hours.
+- The guard waits in `_wait_for_question_slot` before a question's first model turn and records `question_queued` and `question_admitted`. Omnigent saves streamed text as one message at the next tool call, so the waiting note is saved together with the first progress line. The response rule therefore allows `_QUEUE_NOTE` alone or in front of any reply it allows by itself.
+- `sitecustomize.py` makes 180 s the default timeout of the Codex forwarder's `wait_for_thread_started`; an explicit timeout, including `None`, is kept. It also has `CodexNativeExecutor.run_turn` wait up to 240 s for the bridge state or a startup error before Omnigent's own 60 s poll, on Omnigent 0.14 and 0.12. `_codex_launch_turn` in `triple_stamp_cursor_lifecycle.py` holds a judge's dispatch until no other recent judge's Codex is still starting, for up to 240 s, and fails open like the Cursor launch turn.
+- Omnigent saves a reply that the response phase denies as `[Denied by policy: <reason>]`, so every response-phase DENY reaches the reader. The rule now allows `_CUSTOMER_SAFE_FAILURE` once the question's failure is recorded, and a reply equal to the question's saved best-effort answer.
+- The eval scores `no_policy_text` and accepts the waiting note before the first progress line.
+
 ## v1.2.6 (2026-10-06)
 
 The audit takes a third of the time it did, with the same findings, and you can watch it think. A model request that goes silent is retried after two minutes instead of five.

@@ -254,7 +254,10 @@ class GuardOrderingTests(unittest.TestCase):
         return await guarded(  # type: ignore[operator]
             {
                 "agent": agent,
-                "title": "cursor-cycle-1" if agent == "cursor_workhorse" else "audit-cycle-1",
+                "title": {
+                    "cursor_workhorse": "cursor-cycle-1",
+                    "codex_judge": "judge-cycle-1",
+                }.get(agent, "audit-cycle-1"),
                 "args": "Research the original request.",
             },
             server_client=object(),
@@ -290,6 +293,45 @@ class GuardOrderingTests(unittest.TestCase):
 
         self.assertEqual([call[1] for call in calls], ["first", "second"])
         self.assertGreaterEqual(calls[1][2], claimed_at[0])
+
+    def test_two_judges_at_once_start_codex_one_after_the_other(self) -> None:
+        bridge = lifecycle._codex_bridge_module()
+        settled_at: list[float] = []
+
+        async def scenario(guarded: object, run: Path) -> None:
+            async def first_judge_settles() -> None:
+                while not any(
+                    record.get("child_session_id") == "first-child"
+                    for record in runtime_state.read_dispatches()
+                ):
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.3)
+                folder = bridge.bridge_dir_for_bridge_id("first-child")
+                folder.mkdir(parents=True)
+                # A startup failure ends the wait just as a started thread does.
+                bridge.write_bridge_startup_error(folder, "never started a thread")
+                settled_at.append(time.monotonic())
+
+            async def second() -> str:
+                await asyncio.sleep(0.05)
+                return await self._send(guarded, "second", agent="codex_judge")
+
+            await asyncio.gather(
+                self._send(guarded, "first", agent="codex_judge"),
+                second(),
+                first_judge_settles(),
+            )
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+            bridge, "_BRIDGE_ROOT", Path(root)
+        ), mock.patch.object(lifecycle, "_CODEX_LAUNCH_POLL_S", 0.01):
+            calls = self._run_guard(scenario)
+
+        self.assertEqual(
+            [call[:2] for call in calls],
+            [("codex_judge", "first"), ("codex_judge", "second")],
+        )
+        self.assertGreaterEqual(calls[1][2], settled_at[0])
 
     def test_audits_and_judgments_are_never_held_by_cursor_ordering(self) -> None:
         async def scenario(guarded: object, run: Path) -> None:
